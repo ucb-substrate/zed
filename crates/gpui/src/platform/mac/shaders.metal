@@ -1178,12 +1178,13 @@ float4 fill_color(Background background,
         float stripe_angle = M_PI_F / 4.0;
         float pattern_period = pattern_height * sin(stripe_angle);
         float2x2 rotation = rotate2d(stripe_angle);
-        float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
+        // float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
+        float2 relative_position = position;
         float2 rotated_point = rotation * relative_position;
         float pattern = fmod(rotated_point.x, pattern_period);
         float distance = min(pattern, pattern_period - pattern) - pattern_period * (pattern_width / pattern_height) /  2.0f;
         color = solid_color;
-        color.a *= saturate(0.5 - distance);
+        color.a *= saturate(sign(0.5 - distance));
         break;
     }
   }
