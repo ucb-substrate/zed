@@ -1,8 +1,8 @@
 use crate::{
-    App, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, geometry::Negate as _, point, px,
-    radians, size,
+    App, Bounds, DefiniteLength, Element, GlobalElementId, Hitbox, InspectorElementId,
+    InteractiveElement, Interactivity, IntoElement, LayoutId, Length, Pixels, Point, Radians,
+    SharedString, Size, StyleRefinement, Styled, TransformationMatrix, Window,
+    geometry::Negate as _, point, px, radians, size,
 };
 use util::ResultExt;
 
@@ -10,6 +10,7 @@ use util::ResultExt;
 pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<Transformation>,
+    size: Option<Size<f32>>,
     path: Option<SharedString>,
 }
 
@@ -19,6 +20,7 @@ pub fn svg() -> Svg {
     Svg {
         interactivity: Interactivity::new(),
         transformation: None,
+        size: None,
         path: None,
     }
 }
@@ -27,6 +29,7 @@ impl Svg {
     /// Set the path to the SVG file for this element.
     pub fn path(mut self, path: impl Into<SharedString>) -> Self {
         self.path = Some(path.into());
+
         self
     }
 
@@ -62,7 +65,38 @@ impl Element for Svg {
             inspector_id,
             window,
             cx,
-            |style, window, cx| window.request_layout(style, None, cx),
+            |mut style, window, cx| {
+                if self.size.is_none()
+                    && let Some(path) = &self.path
+                    && let Ok(Some(bytes)) = cx.asset_source().load(path)
+                    && let Ok(tree) = usvg::Tree::from_data(&bytes, &cx.svg_renderer().usvg_options)
+                {
+                    self.size = Some(Size::new(tree.size().width(), tree.size().height()));
+                }
+                if let Some(size) = self.size {
+                    let ar = size.width / size.height;
+                    style.aspect_ratio = Some(ar);
+
+                    if let Length::Auto = style.size.width {
+                        style.size.width = match style.size.height {
+                            Length::Definite(DefiniteLength::Absolute(h)) => {
+                                Length::Definite(px(ar * h.to_pixels(window.rem_size()).0).into())
+                            }
+                            _ => Length::Definite(px(size.width).into()),
+                        };
+                    }
+
+                    if let Length::Auto = style.size.height {
+                        style.size.height = match style.size.width {
+                            Length::Definite(DefiniteLength::Absolute(w)) => {
+                                Length::Definite(px(w.to_pixels(window.rem_size()).0 / ar).into())
+                            }
+                            _ => Length::Definite(px(size.height).into()),
+                        };
+                    }
+                }
+                window.request_layout(style, None, cx)
+            },
         );
         (layout_id, ())
     }

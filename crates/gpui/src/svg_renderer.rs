@@ -17,7 +17,7 @@ pub(crate) struct RenderSvgParams {
 #[derive(Clone)]
 pub struct SvgRenderer {
     asset_source: Arc<dyn AssetSource>,
-    usvg_options: Arc<usvg::Options<'static>>,
+    pub(crate) usvg_options: Arc<usvg::Options<'static>>,
 }
 
 pub enum SvgSize {
