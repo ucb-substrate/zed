@@ -1,8 +1,10 @@
-use super::{ExcerptId, MultiBufferSnapshot, ToOffset, ToOffsetUtf16, ToPoint};
-use language::{OffsetUtf16, Point, TextDimension};
+use crate::{MultiBufferDimension, MultiBufferOffset, MultiBufferOffsetUtf16};
+
+use super::{ExcerptId, MultiBufferSnapshot, ToOffset, ToPoint};
+use language::Point;
 use std::{
     cmp::Ordering,
-    ops::{Range, Sub},
+    ops::{AddAssign, Range, Sub},
 };
 use sum_tree::Bias;
 use text::BufferId;
@@ -16,6 +18,13 @@ pub struct Anchor {
 }
 
 impl Anchor {
+    pub fn with_diff_base_anchor(self, diff_base_anchor: text::Anchor) -> Self {
+        Self {
+            diff_base_anchor: Some(diff_base_anchor),
+            ..self
+        }
+    }
+
     pub fn in_buffer(
         excerpt_id: ExcerptId,
         buffer_id: BufferId,
@@ -76,27 +85,26 @@ impl Anchor {
             if text_cmp.is_ne() {
                 return text_cmp;
             }
-            if self.diff_base_anchor.is_some() || other.diff_base_anchor.is_some() {
-                if let Some(base_text) = snapshot
+            if (self.diff_base_anchor.is_some() || other.diff_base_anchor.is_some())
+                && let Some(base_text) = snapshot
                     .diffs
                     .get(&excerpt.buffer_id)
                     .map(|diff| diff.base_text())
-                {
-                    let self_anchor = self.diff_base_anchor.filter(|a| base_text.can_resolve(a));
-                    let other_anchor = other.diff_base_anchor.filter(|a| base_text.can_resolve(a));
-                    return match (self_anchor, other_anchor) {
-                        (Some(a), Some(b)) => a.cmp(&b, base_text),
-                        (Some(_), None) => match other.text_anchor.bias {
-                            Bias::Left => Ordering::Greater,
-                            Bias::Right => Ordering::Less,
-                        },
-                        (None, Some(_)) => match self.text_anchor.bias {
-                            Bias::Left => Ordering::Less,
-                            Bias::Right => Ordering::Greater,
-                        },
-                        (None, None) => Ordering::Equal,
-                    };
-                }
+            {
+                let self_anchor = self.diff_base_anchor.filter(|a| base_text.can_resolve(a));
+                let other_anchor = other.diff_base_anchor.filter(|a| base_text.can_resolve(a));
+                return match (self_anchor, other_anchor) {
+                    (Some(a), Some(b)) => a.cmp(&b, base_text),
+                    (Some(_), None) => match other.text_anchor.bias {
+                        Bias::Left => Ordering::Greater,
+                        Bias::Right => Ordering::Less,
+                    },
+                    (None, Some(_)) => match self.text_anchor.bias {
+                        Bias::Left => Ordering::Less,
+                        Bias::Right => Ordering::Greater,
+                    },
+                    (None, None) => Ordering::Equal,
+                };
             }
         }
         Ordering::Equal
@@ -107,58 +115,60 @@ impl Anchor {
     }
 
     pub fn bias_left(&self, snapshot: &MultiBufferSnapshot) -> Anchor {
-        if self.text_anchor.bias != Bias::Left {
-            if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
-                return Self {
-                    buffer_id: self.buffer_id,
-                    excerpt_id: self.excerpt_id,
-                    text_anchor: self.text_anchor.bias_left(&excerpt.buffer),
-                    diff_base_anchor: self.diff_base_anchor.map(|a| {
-                        if let Some(base_text) = snapshot
-                            .diffs
-                            .get(&excerpt.buffer_id)
-                            .map(|diff| diff.base_text())
-                        {
-                            if a.buffer_id == Some(base_text.remote_id()) {
-                                return a.bias_left(base_text);
-                            }
-                        }
-                        a
-                    }),
-                };
-            }
+        if self.text_anchor.bias != Bias::Left
+            && let Some(excerpt) = snapshot.excerpt(self.excerpt_id)
+        {
+            return Self {
+                buffer_id: self.buffer_id,
+                excerpt_id: self.excerpt_id,
+                text_anchor: self.text_anchor.bias_left(&excerpt.buffer),
+                diff_base_anchor: self.diff_base_anchor.map(|a| {
+                    if let Some(base_text) = snapshot
+                        .diffs
+                        .get(&excerpt.buffer_id)
+                        .map(|diff| diff.base_text())
+                        && a.buffer_id == Some(base_text.remote_id())
+                    {
+                        return a.bias_left(base_text);
+                    }
+                    a
+                }),
+            };
         }
         *self
     }
 
     pub fn bias_right(&self, snapshot: &MultiBufferSnapshot) -> Anchor {
-        if self.text_anchor.bias != Bias::Right {
-            if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
-                return Self {
-                    buffer_id: self.buffer_id,
-                    excerpt_id: self.excerpt_id,
-                    text_anchor: self.text_anchor.bias_right(&excerpt.buffer),
-                    diff_base_anchor: self.diff_base_anchor.map(|a| {
-                        if let Some(base_text) = snapshot
-                            .diffs
-                            .get(&excerpt.buffer_id)
-                            .map(|diff| diff.base_text())
-                        {
-                            if a.buffer_id == Some(base_text.remote_id()) {
-                                return a.bias_right(&base_text);
-                            }
-                        }
-                        a
-                    }),
-                };
-            }
+        if self.text_anchor.bias != Bias::Right
+            && let Some(excerpt) = snapshot.excerpt(self.excerpt_id)
+        {
+            return Self {
+                buffer_id: self.buffer_id,
+                excerpt_id: self.excerpt_id,
+                text_anchor: self.text_anchor.bias_right(&excerpt.buffer),
+                diff_base_anchor: self.diff_base_anchor.map(|a| {
+                    if let Some(base_text) = snapshot
+                        .diffs
+                        .get(&excerpt.buffer_id)
+                        .map(|diff| diff.base_text())
+                        && a.buffer_id == Some(base_text.remote_id())
+                    {
+                        return a.bias_right(base_text);
+                    }
+                    a
+                }),
+            };
         }
         *self
     }
 
     pub fn summary<D>(&self, snapshot: &MultiBufferSnapshot) -> D
     where
-        D: TextDimension + Ord + Sub<D, Output = D>,
+        D: MultiBufferDimension
+            + Ord
+            + Sub<Output = D::TextDimension>
+            + AddAssign<D::TextDimension>,
+        D::TextDimension: Sub<Output = D::TextDimension> + Ord,
     {
         snapshot.summary_for_anchor(self)
     }
@@ -167,10 +177,10 @@ impl Anchor {
         if *self == Anchor::min() || *self == Anchor::max() {
             true
         } else if let Some(excerpt) = snapshot.excerpt(self.excerpt_id) {
-            excerpt.contains(self)
-                && (self.text_anchor == excerpt.range.context.start
-                    || self.text_anchor == excerpt.range.context.end
-                    || self.text_anchor.is_valid(&excerpt.buffer))
+            (self.text_anchor == excerpt.range.context.start
+                || self.text_anchor == excerpt.range.context.end
+                || self.text_anchor.is_valid(&excerpt.buffer))
+                && excerpt.contains(self)
         } else {
             false
         }
@@ -178,13 +188,10 @@ impl Anchor {
 }
 
 impl ToOffset for Anchor {
-    fn to_offset(&self, snapshot: &MultiBufferSnapshot) -> usize {
+    fn to_offset(&self, snapshot: &MultiBufferSnapshot) -> MultiBufferOffset {
         self.summary(snapshot)
     }
-}
-
-impl ToOffsetUtf16 for Anchor {
-    fn to_offset_utf16(&self, snapshot: &MultiBufferSnapshot) -> OffsetUtf16 {
+    fn to_offset_utf16(&self, snapshot: &MultiBufferSnapshot) -> MultiBufferOffsetUtf16 {
         self.summary(snapshot)
     }
 }
@@ -193,13 +200,16 @@ impl ToPoint for Anchor {
     fn to_point<'a>(&self, snapshot: &MultiBufferSnapshot) -> Point {
         self.summary(snapshot)
     }
+    fn to_point_utf16(&self, snapshot: &MultiBufferSnapshot) -> rope::PointUtf16 {
+        self.summary(snapshot)
+    }
 }
 
 pub trait AnchorRangeExt {
     fn cmp(&self, other: &Range<Anchor>, buffer: &MultiBufferSnapshot) -> Ordering;
     fn includes(&self, other: &Range<Anchor>, buffer: &MultiBufferSnapshot) -> bool;
     fn overlaps(&self, other: &Range<Anchor>, buffer: &MultiBufferSnapshot) -> bool;
-    fn to_offset(&self, content: &MultiBufferSnapshot) -> Range<usize>;
+    fn to_offset(&self, content: &MultiBufferSnapshot) -> Range<MultiBufferOffset>;
     fn to_point(&self, content: &MultiBufferSnapshot) -> Range<Point>;
 }
 
@@ -212,14 +222,14 @@ impl AnchorRangeExt for Range<Anchor> {
     }
 
     fn includes(&self, other: &Range<Anchor>, buffer: &MultiBufferSnapshot) -> bool {
-        self.start.cmp(&other.start, &buffer).is_le() && other.end.cmp(&self.end, &buffer).is_le()
+        self.start.cmp(&other.start, buffer).is_le() && other.end.cmp(&self.end, buffer).is_le()
     }
 
     fn overlaps(&self, other: &Range<Anchor>, buffer: &MultiBufferSnapshot) -> bool {
         self.end.cmp(&other.start, buffer).is_ge() && self.start.cmp(&other.end, buffer).is_le()
     }
 
-    fn to_offset(&self, content: &MultiBufferSnapshot) -> Range<usize> {
+    fn to_offset(&self, content: &MultiBufferSnapshot) -> Range<MultiBufferOffset> {
         self.start.to_offset(content)..self.end.to_offset(content)
     }
 
@@ -227,6 +237,3 @@ impl AnchorRangeExt for Range<Anchor> {
         self.start.to_point(content)..self.end.to_point(content)
     }
 }
-
-#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Ord, PartialOrd)]
-pub struct Offset(pub usize);

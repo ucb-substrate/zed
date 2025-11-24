@@ -57,6 +57,7 @@ x11rb::atom_manager! {
         WM_PROTOCOLS,
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,
+        WM_TRANSIENT_FOR,
         _NET_WM_PID,
         _NET_WM_NAME,
         _NET_WM_STATE,
@@ -72,6 +73,7 @@ x11rb::atom_manager! {
         _NET_WM_MOVERESIZE,
         _NET_WM_WINDOW_TYPE,
         _NET_WM_WINDOW_TYPE_NOTIFICATION,
+        _NET_WM_WINDOW_TYPE_DIALOG,
         _NET_WM_SYNC,
         _NET_SUPPORTED,
         _MOTIF_WM_HINTS,
@@ -95,7 +97,7 @@ fn query_render_extent(
 }
 
 impl ResizeEdge {
-    fn to_moveresize(&self) -> u32 {
+    fn to_moveresize(self) -> u32 {
         match self {
             ResizeEdge::TopLeft => 0,
             ResizeEdge::Top => 1,
@@ -284,11 +286,11 @@ pub(crate) struct X11WindowStatePtr {
     pub state: Rc<RefCell<X11WindowState>>,
     pub(crate) callbacks: Rc<RefCell<Callbacks>>,
     xcb: Rc<XCBConnection>,
-    x_window: xproto::Window,
+    pub(crate) x_window: xproto::Window,
 }
 
 impl rwh::HasWindowHandle for RawWindow {
-    fn window_handle(&self) -> Result<rwh::WindowHandle, rwh::HandleError> {
+    fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
         let Some(non_zero) = NonZeroU32::new(self.window_id) else {
             log::error!("RawWindow.window_id zero when getting window handle.");
             return Err(rwh::HandleError::Unavailable);
@@ -299,7 +301,7 @@ impl rwh::HasWindowHandle for RawWindow {
     }
 }
 impl rwh::HasDisplayHandle for RawWindow {
-    fn display_handle(&self) -> Result<rwh::DisplayHandle, rwh::HandleError> {
+    fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
         let Some(non_zero) = NonNull::new(self.connection) else {
             log::error!("Null RawWindow.connection when getting display handle.");
             return Err(rwh::HandleError::Unavailable);
@@ -310,14 +312,21 @@ impl rwh::HasDisplayHandle for RawWindow {
 }
 
 impl rwh::HasWindowHandle for X11Window {
-    fn window_handle(&self) -> Result<rwh::WindowHandle, rwh::HandleError> {
+    fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
         unimplemented!()
     }
 }
 impl rwh::HasDisplayHandle for X11Window {
-    fn display_handle(&self) -> Result<rwh::DisplayHandle, rwh::HandleError> {
+    fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
         unimplemented!()
     }
+}
+
+pub(crate) fn xcb_flush(xcb: &XCBConnection) {
+    xcb.flush()
+        .map_err(handle_connection_error)
+        .context("X11 flush failed")
+        .log_err();
 }
 
 pub(crate) fn check_reply<E, F, C>(
@@ -385,12 +394,13 @@ impl X11WindowState {
         atoms: &XcbAtoms,
         scale_factor: f32,
         appearance: WindowAppearance,
+        parent_window: Option<xproto::Window>,
     ) -> anyhow::Result<Self> {
         let x_screen_index = params
             .display_id
             .map_or(x_main_screen_index, |did| did.0 as usize);
 
-        let visual_set = find_visuals(&xcb, x_screen_index);
+        let visual_set = find_visuals(xcb, x_screen_index);
 
         let visual = match visual_set.transparent {
             Some(visual) => visual,
@@ -508,20 +518,21 @@ impl X11WindowState {
                     xcb.configure_window(x_window, &xproto::ConfigureWindowAux::new().x(x).y(y)),
                 )?;
             }
-            if let Some(titlebar) = params.titlebar {
-                if let Some(title) = titlebar.title {
-                    check_reply(
-                        || "X11 ChangeProperty8 on window title failed.",
-                        xcb.change_property8(
-                            xproto::PropMode::REPLACE,
-                            x_window,
-                            xproto::AtomEnum::WM_NAME,
-                            xproto::AtomEnum::STRING,
-                            title.as_bytes(),
-                        ),
-                    )?;
-                }
+            if let Some(titlebar) = params.titlebar
+                && let Some(title) = titlebar.title
+            {
+                check_reply(
+                    || "X11 ChangeProperty8 on window title failed.",
+                    xcb.change_property8(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        xproto::AtomEnum::WM_NAME,
+                        xproto::AtomEnum::STRING,
+                        title.as_bytes(),
+                    ),
+                )?;
             }
+
             if params.kind == WindowKind::PopUp {
                 check_reply(
                     || "X11 ChangeProperty32 setting window type for pop-up failed.",
@@ -531,6 +542,38 @@ impl X11WindowState {
                         atoms._NET_WM_WINDOW_TYPE,
                         xproto::AtomEnum::ATOM,
                         &[atoms._NET_WM_WINDOW_TYPE_NOTIFICATION],
+                    ),
+                )?;
+            }
+
+            if params.kind == WindowKind::Floating {
+                if let Some(parent_window) = parent_window {
+                    // WM_TRANSIENT_FOR hint indicating the main application window. For floating windows, we set
+                    // a parent window (WM_TRANSIENT_FOR) such that the window manager knows where to
+                    // place the floating window in relation to the main window.
+                    // https://specifications.freedesktop.org/wm-spec/1.4/ar01s05.html
+                    check_reply(
+                        || "X11 ChangeProperty32 setting WM_TRANSIENT_FOR for floating window failed.",
+                        xcb.change_property32(
+                            xproto::PropMode::REPLACE,
+                            x_window,
+                            atoms.WM_TRANSIENT_FOR,
+                            xproto::AtomEnum::WINDOW,
+                            &[parent_window],
+                        ),
+                    )?;
+                }
+
+                // _NET_WM_WINDOW_TYPE_DIALOG indicates that this is a dialog (floating) window
+                // https://specifications.freedesktop.org/wm-spec/1.4/ar01s05.html
+                check_reply(
+                    || "X11 ChangeProperty32 setting window type for floating window failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms._NET_WM_WINDOW_TYPE,
+                        xproto::AtomEnum::ATOM,
+                        &[atoms._NET_WM_WINDOW_TYPE_DIALOG],
                     ),
                 )?;
             }
@@ -597,7 +640,7 @@ impl X11WindowState {
                 ),
             )?;
 
-            xcb.flush()?;
+            xcb_flush(xcb);
 
             let renderer = {
                 let raw_window = RawWindow {
@@ -657,7 +700,7 @@ impl X11WindowState {
                 || "X11 DestroyWindow failed while cleaning it up after setup failure.",
                 xcb.destroy_window(x_window),
             )?;
-            xcb.flush()?;
+            xcb_flush(xcb);
         }
 
         setup_result
@@ -669,26 +712,6 @@ impl X11WindowState {
             width: size.width.into(),
             height: size.height.into(),
         }
-    }
-}
-
-/// A handle to an X11 window which destroys it on Drop.
-pub struct X11WindowHandle {
-    id: xproto::Window,
-    xcb: Rc<XCBConnection>,
-}
-
-impl Drop for X11WindowHandle {
-    fn drop(&mut self) {
-        maybe!({
-            check_reply(
-                || "X11 DestroyWindow failed while dropping X11WindowHandle.",
-                self.xcb.destroy_window(self.id),
-            )?;
-            self.xcb.flush()?;
-            anyhow::Ok(())
-        })
-        .log_err();
     }
 }
 
@@ -704,7 +727,7 @@ impl Drop for X11Window {
                 || "X11 DestroyWindow failure.",
                 self.0.xcb.destroy_window(self.0.x_window),
             )?;
-            self.0.xcb.flush()?;
+            xcb_flush(&self.0.xcb);
 
             anyhow::Ok(())
         })
@@ -750,6 +773,7 @@ impl X11Window {
         atoms: &XcbAtoms,
         scale_factor: f32,
         appearance: WindowAppearance,
+        parent_window: Option<xproto::Window>,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
             state: Rc::new(RefCell::new(X11WindowState::new(
@@ -765,6 +789,7 @@ impl X11Window {
                 atoms,
                 scale_factor,
                 appearance,
+                parent_window,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),
@@ -799,7 +824,9 @@ impl X11Window {
                 xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
                 message,
             ),
-        )
+        )?;
+        xcb_flush(&self.0.xcb);
+        Ok(())
     }
 
     fn get_root_position(
@@ -852,15 +879,8 @@ impl X11Window {
             ),
         )?;
 
-        self.flush()
-    }
-
-    fn flush(&self) -> anyhow::Result<()> {
-        self.0
-            .xcb
-            .flush()
-            .map_err(handle_connection_error)
-            .context("X11 flush failed")
+        xcb_flush(&self.0.xcb);
+        Ok(())
     }
 }
 
@@ -974,20 +994,23 @@ impl X11WindowStatePtr {
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
-        if let Some(ref mut fun) = self.callbacks.borrow_mut().input {
-            if !fun(input.clone()).propagate {
-                return;
-            }
+        if let Some(ref mut fun) = self.callbacks.borrow_mut().input
+            && !fun(input.clone()).propagate
+        {
+            return;
         }
         if let PlatformInput::KeyDown(event) = input {
-            let mut state = self.state.borrow_mut();
-            if let Some(mut input_handler) = state.input_handler.take() {
-                if let Some(key_char) = &event.keystroke.key_char {
-                    drop(state);
-                    input_handler.replace_text_in_range(None, key_char);
-                    state = self.state.borrow_mut();
+            // only allow shift modifier when inserting text
+            if event.keystroke.modifiers.is_subset_of(&Modifiers::shift()) {
+                let mut state = self.state.borrow_mut();
+                if let Some(mut input_handler) = state.input_handler.take() {
+                    if let Some(key_char) = &event.keystroke.key_char {
+                        drop(state);
+                        input_handler.replace_text_in_range(None, key_char);
+                        state = self.state.borrow_mut();
+                    }
+                    state.input_handler = Some(input_handler);
                 }
-                state.input_handler = Some(input_handler);
             }
         }
     }
@@ -1034,8 +1057,9 @@ impl X11WindowStatePtr {
         }
     }
 
-    pub fn get_ime_area(&self) -> Option<Bounds<Pixels>> {
+    pub fn get_ime_area(&self) -> Option<Bounds<ScaledPixels>> {
         let mut state = self.state.borrow_mut();
+        let scale_factor = state.scale_factor;
         let mut bounds: Option<Bounds<Pixels>> = None;
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
@@ -1045,7 +1069,7 @@ impl X11WindowStatePtr {
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         };
-        bounds
+        bounds.map(|b| b.scale(scale_factor))
     }
 
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
@@ -1083,15 +1107,14 @@ impl X11WindowStatePtr {
         }
 
         let mut callbacks = self.callbacks.borrow_mut();
-        if let Some((content_size, scale_factor)) = resize_args {
-            if let Some(ref mut fun) = callbacks.resize {
-                fun(content_size, scale_factor)
-            }
+        if let Some((content_size, scale_factor)) = resize_args
+            && let Some(ref mut fun) = callbacks.resize
+        {
+            fun(content_size, scale_factor)
         }
-        if !is_resize {
-            if let Some(ref mut fun) = callbacks.moved {
-                fun();
-            }
+
+        if !is_resize && let Some(ref mut fun) = callbacks.moved {
+            fun();
         }
 
         Ok(())
@@ -1198,7 +1221,7 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
-        self.flush().log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn scale_factor(&self) -> f32 {
@@ -1219,7 +1242,7 @@ impl PlatformWindow for X11Window {
             self.0.xcb.query_pointer(self.0.x_window),
         )
         .log_err()
-        .map_or(Point::new(Pixels(0.0), Pixels(0.0)), |reply| {
+        .map_or(Point::new(Pixels::ZERO, Pixels::ZERO), |reply| {
             Point::new((reply.root_x as u32).into(), (reply.root_y as u32).into())
         })
     }
@@ -1289,7 +1312,7 @@ impl PlatformWindow for X11Window {
                 xproto::Time::CURRENT_TIME,
             )
             .log_err();
-        self.flush().log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn is_active(&self) -> bool {
@@ -1324,7 +1347,7 @@ impl PlatformWindow for X11Window {
             ),
         )
         .log_err();
-        self.flush().log_err();
+        xcb_flush(&self.0.xcb);
     }
 
     fn set_app_id(&mut self, app_id: &str) {
@@ -1634,7 +1657,7 @@ impl PlatformWindow for X11Window {
         }
     }
 
-    fn update_ime_position(&self, bounds: Bounds<ScaledPixels>) {
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let mut state = self.0.state.borrow_mut();
         let client = state.client.clone();
         drop(state);

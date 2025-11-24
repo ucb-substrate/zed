@@ -1,11 +1,11 @@
 # Using Rules {#using-rules}
 
 A rule is essentially a prompt that is inserted at the beginning of each interaction with the Agent.
-Currently, Zed supports `.rules` files at the directory's root and the Rules Library, which allows you to store multiple rules for on-demand usage.
+Currently, Zed supports adding rules through files inserted directly in the worktree or through the Rules Library, which allows you to store multiple rules for constant or on-demand usage.
 
 ## `.rules` files
 
-Zed supports including `.rules` files at the top level of worktrees, and act as project-level instructions that are included in all of your interactions with the Agent Panel.
+Zed supports including `.rules` files at the top level of worktrees, and they act as project-level instructions that are included in all of your interactions with the Agent Panel.
 Other names for this file are also supported for compatibility with other agents, but note that the first file which matches in this list will be used:
 
 - `.rules`
@@ -16,6 +16,7 @@ Other names for this file are also supported for compatibility with other agents
 - `AGENT.md`
 - `AGENTS.md`
 - `CLAUDE.md`
+- `GEMINI.md`
 
 ## Rules Library {#rules-library}
 
@@ -29,7 +30,7 @@ You can use the inline assistant right in the rules editor, allowing you to auto
 2. Click on the Agent menu (`...`) in the top right corner.
 3. Select `Rules...` from the dropdown.
 
-You can also use the `agent: open rules library` command while in the Agent Panel.
+You can also reach it by running {#action agent::OpenRulesLibrary} in the command palette or through the {#kb agent::OpenRulesLibrary} keybinding.
 
 ### Managing Rules
 

@@ -14,7 +14,7 @@ impl Example for FileChangeNotificationExample {
             url: "https://github.com/octocat/hello-world".to_string(),
             revision: "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d".to_string(),
             language_server: None,
-            max_assertions: Some(1),
+            max_assertions: None,
             profile_id: AgentProfileId::default(),
             existing_thread_json: None,
             max_turns: Some(3),
@@ -48,8 +48,8 @@ impl Example for FileChangeNotificationExample {
         })?;
 
         // Start conversation (specific message is not important)
-        cx.push_user_message("Find all files in this repo");
-        cx.run_turn().await?;
+        cx.prompt_with_max_turns("Find all files in this repo", 1)
+            .await?;
 
         // Edit the README buffer - the model should get a notification on next turn
         buffer.update(cx, |buffer, cx| {
@@ -58,7 +58,7 @@ impl Example for FileChangeNotificationExample {
 
         // Run for some more turns.
         // The model shouldn't thank us for letting it know about the file change.
-        cx.run_turns(3).await?;
+        cx.proceed_with_max_turns(3).await?;
 
         Ok(())
     }

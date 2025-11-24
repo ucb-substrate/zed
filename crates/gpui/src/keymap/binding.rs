@@ -1,16 +1,19 @@
 use std::rc::Rc;
 
-use collections::HashMap;
-
-use crate::{Action, InvalidKeystrokeError, KeyBindingContextPredicate, Keystroke};
+use crate::{
+    Action, AsKeystroke, DummyKeyboardMapper, InvalidKeystrokeError, KeyBindingContextPredicate,
+    KeybindingKeystroke, Keystroke, PlatformKeyboardMapper, SharedString,
+};
 use smallvec::SmallVec;
 
 /// A keybinding and its associated metadata, from the keymap.
 pub struct KeyBinding {
     pub(crate) action: Box<dyn Action>,
-    pub(crate) keystrokes: SmallVec<[Keystroke; 2]>,
+    pub(crate) keystrokes: SmallVec<[KeybindingKeystroke; 2]>,
     pub(crate) context_predicate: Option<Rc<KeyBindingContextPredicate>>,
     pub(crate) meta: Option<KeyBindingMetaIndex>,
+    /// The json input string used when building the keybinding, if any
+    pub(crate) action_input: Option<SharedString>,
 }
 
 impl Clone for KeyBinding {
@@ -20,6 +23,7 @@ impl Clone for KeyBinding {
             keystrokes: self.keystrokes.clone(),
             context_predicate: self.context_predicate.clone(),
             meta: self.meta,
+            action_input: self.action_input.clone(),
         }
     }
 }
@@ -27,12 +31,17 @@ impl Clone for KeyBinding {
 impl KeyBinding {
     /// Construct a new keybinding from the given data. Panics on parse error.
     pub fn new<A: Action>(keystrokes: &str, action: A, context: Option<&str>) -> Self {
-        let context_predicate = if let Some(context) = context {
-            Some(KeyBindingContextPredicate::parse(context).unwrap().into())
-        } else {
-            None
-        };
-        Self::load(keystrokes, Box::new(action), context_predicate, None).unwrap()
+        let context_predicate =
+            context.map(|context| KeyBindingContextPredicate::parse(context).unwrap().into());
+        Self::load(
+            keystrokes,
+            Box::new(action),
+            context_predicate,
+            false,
+            None,
+            &DummyKeyboardMapper,
+        )
+        .unwrap()
     }
 
     /// Load a keybinding from the given raw data.
@@ -40,28 +49,28 @@ impl KeyBinding {
         keystrokes: &str,
         action: Box<dyn Action>,
         context_predicate: Option<Rc<KeyBindingContextPredicate>>,
-        key_equivalents: Option<&HashMap<char, char>>,
+        use_key_equivalents: bool,
+        action_input: Option<SharedString>,
+        keyboard_mapper: &dyn PlatformKeyboardMapper,
     ) -> std::result::Result<Self, InvalidKeystrokeError> {
-        let mut keystrokes: SmallVec<[Keystroke; 2]> = keystrokes
+        let keystrokes: SmallVec<[KeybindingKeystroke; 2]> = keystrokes
             .split_whitespace()
-            .map(Keystroke::parse)
+            .map(|source| {
+                let keystroke = Keystroke::parse(source)?;
+                Ok(KeybindingKeystroke::new_with_mapper(
+                    keystroke,
+                    use_key_equivalents,
+                    keyboard_mapper,
+                ))
+            })
             .collect::<std::result::Result<_, _>>()?;
-
-        if let Some(equivalents) = key_equivalents {
-            for keystroke in keystrokes.iter_mut() {
-                if keystroke.key.chars().count() == 1 {
-                    if let Some(key) = equivalents.get(&keystroke.key.chars().next().unwrap()) {
-                        keystroke.key = key.to_string();
-                    }
-                }
-            }
-        }
 
         Ok(Self {
             keystrokes,
             action,
             context_predicate,
             meta: None,
+            action_input,
         })
     }
 
@@ -77,13 +86,13 @@ impl KeyBinding {
     }
 
     /// Check if the given keystrokes match this binding.
-    pub fn match_keystrokes(&self, typed: &[Keystroke]) -> Option<bool> {
+    pub fn match_keystrokes(&self, typed: &[impl AsKeystroke]) -> Option<bool> {
         if self.keystrokes.len() < typed.len() {
             return None;
         }
 
         for (target, typed) in self.keystrokes.iter().zip(typed.iter()) {
-            if !typed.should_match(target) {
+            if !typed.as_keystroke().should_match(target) {
                 return None;
             }
         }
@@ -92,7 +101,7 @@ impl KeyBinding {
     }
 
     /// Get the keystrokes associated with this binding
-    pub fn keystrokes(&self) -> &[Keystroke] {
+    pub fn keystrokes(&self) -> &[KeybindingKeystroke] {
         self.keystrokes.as_slice()
     }
 
@@ -109,6 +118,11 @@ impl KeyBinding {
     /// Get the metadata for this binding
     pub fn meta(&self) -> Option<KeyBindingMetaIndex> {
         self.meta
+    }
+
+    /// Get the action input associated with the action for this binding
+    pub fn action_input(&self) -> Option<SharedString> {
+        self.action_input.clone()
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{App, AppContext, VisualContext, Window, seal::Sealed};
+use crate::{App, AppContext, GpuiBorrow, VisualContext, Window, seal::Sealed};
 use anyhow::{Context as _, Result};
 use collections::FxHashSet;
 use derive_more::{Deref, DerefMut};
@@ -105,7 +105,7 @@ impl EntityMap {
 
     /// Move an entity to the stack.
     #[track_caller]
-    pub fn lease<'a, T>(&mut self, pointer: &'a Entity<T>) -> Lease<'a, T> {
+    pub fn lease<T>(&mut self, pointer: &Entity<T>) -> Lease<T> {
         self.assert_valid_context(pointer);
         let mut accessed_entities = self.accessed_entities.borrow_mut();
         accessed_entities.insert(pointer.entity_id);
@@ -117,15 +117,14 @@ impl EntityMap {
         );
         Lease {
             entity,
-            pointer,
+            id: pointer.entity_id,
             entity_type: PhantomData,
         }
     }
 
     /// Returns an entity after moving it to the stack.
     pub fn end_lease<T>(&mut self, mut lease: Lease<T>) {
-        self.entities
-            .insert(lease.pointer.entity_id, lease.entity.take().unwrap());
+        self.entities.insert(lease.id, lease.entity.take().unwrap());
     }
 
     pub fn read<T: 'static>(&self, entity: &Entity<T>) -> &T {
@@ -187,13 +186,13 @@ fn double_lease_panic<T>(operation: &str) -> ! {
     )
 }
 
-pub(crate) struct Lease<'a, T> {
+pub(crate) struct Lease<T> {
     entity: Option<Box<dyn Any>>,
-    pub pointer: &'a Entity<T>,
+    pub id: EntityId,
     entity_type: PhantomData<T>,
 }
 
-impl<T: 'static> core::ops::Deref for Lease<'_, T> {
+impl<T: 'static> core::ops::Deref for Lease<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -201,13 +200,13 @@ impl<T: 'static> core::ops::Deref for Lease<'_, T> {
     }
 }
 
-impl<T: 'static> core::ops::DerefMut for Lease<'_, T> {
+impl<T: 'static> core::ops::DerefMut for Lease<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.entity.as_mut().unwrap().downcast_mut().unwrap()
     }
 }
 
-impl<T> Drop for Lease<'_, T> {
+impl<T> Drop for Lease<T> {
     fn drop(&mut self) {
         if self.entity.is_some() && !panicking() {
             panic!("Leases must be ended with EntityMap::end_lease")
@@ -232,23 +231,26 @@ impl AnyEntity {
         Self {
             entity_id: id,
             entity_type,
-            entity_map: entity_map.clone(),
             #[cfg(any(test, feature = "leak-detection"))]
             handle_id: entity_map
+                .clone()
                 .upgrade()
                 .unwrap()
                 .write()
                 .leak_detector
                 .handle_created(id),
+            entity_map,
         }
     }
 
     /// Returns the id associated with this entity.
+    #[inline]
     pub fn entity_id(&self) -> EntityId {
         self.entity_id
     }
 
     /// Returns the [TypeId] associated with this entity.
+    #[inline]
     pub fn entity_type(&self) -> TypeId {
         self.entity_type
     }
@@ -332,18 +334,21 @@ impl Drop for AnyEntity {
 }
 
 impl<T> From<Entity<T>> for AnyEntity {
+    #[inline]
     fn from(entity: Entity<T>) -> Self {
         entity.any_entity
     }
 }
 
 impl Hash for AnyEntity {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.entity_id.hash(state);
     }
 }
 
 impl PartialEq for AnyEntity {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.entity_id == other.entity_id
     }
@@ -352,12 +357,14 @@ impl PartialEq for AnyEntity {
 impl Eq for AnyEntity {}
 
 impl Ord for AnyEntity {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.entity_id.cmp(&other.entity_id)
     }
 }
 
 impl PartialOrd for AnyEntity {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -371,21 +378,20 @@ impl std::fmt::Debug for AnyEntity {
     }
 }
 
-/// A strong, well typed reference to a struct which is managed
+/// A strong, well-typed reference to a struct which is managed
 /// by GPUI
 #[derive(Deref, DerefMut)]
 pub struct Entity<T> {
     #[deref]
     #[deref_mut]
     pub(crate) any_entity: AnyEntity,
-    pub(crate) entity_type: PhantomData<T>,
+    pub(crate) entity_type: PhantomData<fn(T) -> T>,
 }
 
-unsafe impl<T> Send for Entity<T> {}
-unsafe impl<T> Sync for Entity<T> {}
 impl<T> Sealed for Entity<T> {}
 
 impl<T: 'static> Entity<T> {
+    #[inline]
     fn new(id: EntityId, entity_map: Weak<RwLock<EntityRefCounts>>) -> Self
     where
         T: 'static,
@@ -397,11 +403,13 @@ impl<T: 'static> Entity<T> {
     }
 
     /// Get the entity ID associated with this entity
+    #[inline]
     pub fn entity_id(&self) -> EntityId {
         self.any_entity.entity_id
     }
 
     /// Downgrade this entity pointer to a non-retaining weak pointer
+    #[inline]
     pub fn downgrade(&self) -> WeakEntity<T> {
         WeakEntity {
             any_entity: self.any_entity.downgrade(),
@@ -410,16 +418,19 @@ impl<T: 'static> Entity<T> {
     }
 
     /// Convert this into a dynamically typed entity.
+    #[inline]
     pub fn into_any(self) -> AnyEntity {
         self.any_entity
     }
 
     /// Grab a reference to this entity from the context.
+    #[inline]
     pub fn read<'a>(&self, cx: &'a App) -> &'a T {
         cx.entities.read(self)
     }
 
     /// Read the entity referenced by this handle with the given function.
+    #[inline]
     pub fn read_with<R, C: AppContext>(
         &self,
         cx: &C,
@@ -429,6 +440,7 @@ impl<T: 'static> Entity<T> {
     }
 
     /// Updates the entity referenced by this handle with the given function.
+    #[inline]
     pub fn update<R, C: AppContext>(
         &self,
         cx: &mut C,
@@ -437,9 +449,24 @@ impl<T: 'static> Entity<T> {
         cx.update_entity(self, update)
     }
 
+    /// Updates the entity referenced by this handle with the given function.
+    #[inline]
+    pub fn as_mut<'a, C: AppContext>(&self, cx: &'a mut C) -> C::Result<GpuiBorrow<'a, T>> {
+        cx.as_mut(self)
+    }
+
+    /// Updates the entity referenced by this handle with the given function.
+    pub fn write<C: AppContext>(&self, cx: &mut C, value: T) -> C::Result<()> {
+        self.update(cx, |entity, cx| {
+            *entity = value;
+            cx.notify();
+        })
+    }
+
     /// Updates the entity referenced by this handle with the given function if
     /// the referenced entity still exists, within a visual context that has a window.
     /// Returns an error if the entity has been released.
+    #[inline]
     pub fn update_in<R, C: VisualContext>(
         &self,
         cx: &mut C,
@@ -450,6 +477,7 @@ impl<T: 'static> Entity<T> {
 }
 
 impl<T> Clone for Entity<T> {
+    #[inline]
     fn clone(&self) -> Self {
         Self {
             any_entity: self.any_entity.clone(),
@@ -468,12 +496,14 @@ impl<T> std::fmt::Debug for Entity<T> {
 }
 
 impl<T> Hash for Entity<T> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.any_entity.hash(state);
     }
 }
 
 impl<T> PartialEq for Entity<T> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.any_entity == other.any_entity
     }
@@ -482,18 +512,21 @@ impl<T> PartialEq for Entity<T> {
 impl<T> Eq for Entity<T> {}
 
 impl<T> PartialEq<WeakEntity<T>> for Entity<T> {
+    #[inline]
     fn eq(&self, other: &WeakEntity<T>) -> bool {
         self.any_entity.entity_id() == other.entity_id()
     }
 }
 
 impl<T: 'static> Ord for Entity<T> {
+    #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.entity_id().cmp(&other.entity_id())
     }
 }
 
 impl<T: 'static> PartialOrd for Entity<T> {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -509,6 +542,7 @@ pub struct AnyWeakEntity {
 
 impl AnyWeakEntity {
     /// Get the entity ID associated with this weak reference.
+    #[inline]
     pub fn entity_id(&self) -> EntityId {
         self.entity_id
     }
@@ -607,18 +641,21 @@ impl std::fmt::Debug for AnyWeakEntity {
 }
 
 impl<T> From<WeakEntity<T>> for AnyWeakEntity {
+    #[inline]
     fn from(entity: WeakEntity<T>) -> Self {
         entity.any_entity
     }
 }
 
 impl Hash for AnyWeakEntity {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.entity_id.hash(state);
     }
 }
 
 impl PartialEq for AnyWeakEntity {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.entity_id == other.entity_id
     }
@@ -627,12 +664,14 @@ impl PartialEq for AnyWeakEntity {
 impl Eq for AnyWeakEntity {}
 
 impl Ord for AnyWeakEntity {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.entity_id.cmp(&other.entity_id)
     }
 }
 
 impl PartialOrd for AnyWeakEntity {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -644,20 +683,17 @@ pub struct WeakEntity<T> {
     #[deref]
     #[deref_mut]
     any_entity: AnyWeakEntity,
-    entity_type: PhantomData<T>,
+    entity_type: PhantomData<fn(T) -> T>,
 }
 
 impl<T> std::fmt::Debug for WeakEntity<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(&type_name::<Self>())
+        f.debug_struct(type_name::<Self>())
             .field("entity_id", &self.any_entity.entity_id)
             .field("entity_type", &type_name::<T>())
             .finish()
     }
 }
-
-unsafe impl<T> Send for WeakEntity<T> {}
-unsafe impl<T> Sync for WeakEntity<T> {}
 
 impl<T> Clone for WeakEntity<T> {
     fn clone(&self) -> Self {
@@ -732,6 +768,7 @@ impl<T: 'static> WeakEntity<T> {
     }
 
     /// Create a new weak entity that can never be upgraded.
+    #[inline]
     pub fn new_invalid() -> Self {
         Self {
             any_entity: AnyWeakEntity::new_invalid(),
@@ -741,12 +778,14 @@ impl<T: 'static> WeakEntity<T> {
 }
 
 impl<T> Hash for WeakEntity<T> {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.any_entity.hash(state);
     }
 }
 
 impl<T> PartialEq for WeakEntity<T> {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.any_entity == other.any_entity
     }
@@ -755,18 +794,21 @@ impl<T> PartialEq for WeakEntity<T> {
 impl<T> Eq for WeakEntity<T> {}
 
 impl<T> PartialEq<Entity<T>> for WeakEntity<T> {
+    #[inline]
     fn eq(&self, other: &Entity<T>) -> bool {
         self.entity_id() == other.any_entity.entity_id()
     }
 }
 
 impl<T: 'static> Ord for WeakEntity<T> {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.entity_id().cmp(&other.entity_id())
     }
 }
 
 impl<T: 'static> PartialOrd for WeakEntity<T> {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
@@ -774,7 +816,7 @@ impl<T: 'static> PartialOrd for WeakEntity<T> {
 
 #[cfg(any(test, feature = "leak-detection"))]
 static LEAK_BACKTRACE: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("LEAK_BACKTRACE").map_or(false, |b| !b.is_empty()));
+    std::sync::LazyLock::new(|| std::env::var("LEAK_BACKTRACE").is_ok_and(|b| !b.is_empty()));
 
 #[cfg(any(test, feature = "leak-detection"))]
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]

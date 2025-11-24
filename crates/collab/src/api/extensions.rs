@@ -11,7 +11,7 @@ use axum::{
 };
 use collections::{BTreeSet, HashMap};
 use rpc::{ExtensionApiManifest, ExtensionProvides, GetExtensionsResponse};
-use semantic_version::SemanticVersion;
+use semver::Version as SemanticVersion;
 use serde::Deserialize;
 use std::str::FromStr;
 use std::{sync::Arc, time::Duration};
@@ -108,8 +108,8 @@ struct GetExtensionUpdatesParams {
     ids: String,
     min_schema_version: i32,
     max_schema_version: i32,
-    min_wasm_api_version: SemanticVersion,
-    max_wasm_api_version: SemanticVersion,
+    min_wasm_api_version: semver::Version,
+    max_wasm_api_version: semver::Version,
 }
 
 async fn get_extension_updates(
@@ -337,8 +337,7 @@ async fn fetch_extensions_from_blob_store(
             if known_versions
                 .binary_search_by_key(&published_version, |known_version| known_version)
                 .is_err()
-            {
-                if let Some(extension) = fetch_extension_manifest(
+                && let Some(extension) = fetch_extension_manifest(
                     blob_store_client,
                     blob_store_bucket,
                     extension_id,
@@ -346,12 +345,11 @@ async fn fetch_extensions_from_blob_store(
                 )
                 .await
                 .log_err()
-                {
-                    new_versions
-                        .entry(extension_id)
-                        .or_default()
-                        .push(extension);
-                }
+            {
+                new_versions
+                    .entry(extension_id)
+                    .or_default()
+                    .push(extension);
             }
         }
     }

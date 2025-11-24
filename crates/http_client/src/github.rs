@@ -1,13 +1,17 @@
-use crate::HttpClient;
+use crate::{HttpClient, HttpRequestExt};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::AsyncReadExt;
+use http::Request;
 use serde::Deserialize;
 use std::sync::Arc;
 use url::Url;
 
+const GITHUB_API_URL: &str = "https://api.github.com";
+
 pub struct GitHubLspBinaryVersion {
     pub name: String,
     pub url: String,
+    pub digest: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -24,6 +28,7 @@ pub struct GithubRelease {
 pub struct GithubReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
+    pub digest: Option<String>,
 }
 
 pub async fn latest_github_release(
@@ -32,12 +37,17 @@ pub async fn latest_github_release(
     pre_release: bool,
     http: Arc<dyn HttpClient>,
 ) -> anyhow::Result<GithubRelease> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases");
+
+    let request = Request::get(&url)
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .when_some(std::env::var("GITHUB_TOKEN").ok(), |builder, token| {
+            builder.header("Authorization", format!("Bearer {}", token))
+        })
+        .body(Default::default())?;
+
     let mut response = http
-        .get(
-            format!("https://api.github.com/repos/{repo_name_with_owner}/releases").as_str(),
-            Default::default(),
-            true,
-        )
+        .send(request)
         .await
         .context("error fetching latest release")?;
 
@@ -69,11 +79,19 @@ pub async fn latest_github_release(
         }
     };
 
-    releases
+    let mut release = releases
         .into_iter()
         .filter(|release| !require_assets || !release.assets.is_empty())
         .find(|release| release.pre_release == pre_release)
-        .context("finding a prerelease")
+        .context("finding a prerelease")?;
+    release.assets.iter_mut().for_each(|asset| {
+        if let Some(digest) = &mut asset.digest
+            && let Some(stripped) = digest.strip_prefix("sha256:")
+        {
+            *digest = stripped.to_owned();
+        }
+    });
+    Ok(release)
 }
 
 pub async fn get_release_by_tag_name(
@@ -81,12 +99,17 @@ pub async fn get_release_by_tag_name(
     tag: &str,
     http: Arc<dyn HttpClient>,
 ) -> anyhow::Result<GithubRelease> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases/tags/{tag}");
+
+    let request = Request::get(&url)
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .when_some(std::env::var("GITHUB_TOKEN").ok(), |builder, token| {
+            builder.header("Authorization", format!("Bearer {}", token))
+        })
+        .body(Default::default())?;
+
     let mut response = http
-        .get(
-            &format!("https://api.github.com/repos/{repo_name_with_owner}/releases/tags/{tag}"),
-            Default::default(),
-            true,
-        )
+        .send(request)
         .await
         .context("error fetching latest release")?;
 

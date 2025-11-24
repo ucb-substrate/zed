@@ -7,7 +7,7 @@ use gpui::{
     Window, actions,
 };
 use picker::{Picker, PickerDelegate};
-use settings::{SettingsStore, update_settings_file};
+use settings::{Settings, SettingsStore, update_settings_file};
 use std::sync::Arc;
 use theme::{Appearance, Theme, ThemeMeta, ThemeRegistry, ThemeSettings};
 use ui::{ListItem, ListItemSpacing, prelude::*, v_flex};
@@ -17,7 +17,13 @@ use zed_actions::{ExtensionCategoryFilter, Extensions};
 
 use crate::icon_theme_selector::{IconThemeSelector, IconThemeSelectorDelegate};
 
-actions!(theme_selector, [Reload]);
+actions!(
+    theme_selector,
+    [
+        /// Reloads all themes from disk.
+        Reload
+    ]
+);
 
 pub fn init(cx: &mut App) {
     cx.on_action(|action: &zed_actions::theme_selector::Toggle, cx| {
@@ -86,7 +92,10 @@ impl Focusable for ThemeSelector {
 
 impl Render for ThemeSelector {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+        v_flex()
+            .key_context("ThemeSelector")
+            .w(rems(34.))
+            .child(self.picker.clone())
     }
 }
 
@@ -194,12 +203,11 @@ impl ThemeSelectorDelegate {
     }
 
     fn set_theme(theme: Arc<Theme>, cx: &mut App) {
-        SettingsStore::update_global(cx, |store, cx| {
+        SettingsStore::update_global(cx, |store, _| {
             let mut theme_settings = store.get::<ThemeSettings>(None).clone();
-            theme_settings.active_theme = theme;
-            theme_settings.apply_theme_overrides();
+            let name = theme.as_ref().name.clone().into();
+            theme_settings.theme = theme::ThemeSelection::Static(theme::ThemeName(name));
             store.override_global(theme_settings);
-            cx.refresh_windows();
         });
     }
 }
@@ -223,14 +231,13 @@ impl PickerDelegate for ThemeSelectorDelegate {
     ) {
         self.selection_completed = true;
 
-        let theme_name = cx.theme().name.clone();
+        let appearance = Appearance::from(window.appearance());
+        let theme_name = ThemeSettings::get_global(cx).theme.name(appearance).0;
 
         telemetry::event!("Settings Changed", setting = "theme", value = theme_name);
 
-        let appearance = Appearance::from(window.appearance());
-
-        update_settings_file::<ThemeSettings>(self.fs.clone(), cx, move |settings, _| {
-            settings.set_theme(theme_name.to_string(), appearance);
+        update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            theme::set_theme(settings, theme_name.to_string(), appearance);
         });
 
         self.selector
@@ -336,7 +343,7 @@ impl PickerDelegate for ThemeSelectorDelegate {
         _window: &mut Window,
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let theme_match = &self.matches[ix];
+        let theme_match = &self.matches.get(ix)?;
 
         Some(
             ListItem::new(ix)
@@ -367,7 +374,7 @@ impl PickerDelegate for ThemeSelectorDelegate {
                     Button::new("docs", "View Theme Docs")
                         .icon(IconName::ArrowUpRight)
                         .icon_position(IconPosition::End)
-                        .icon_size(IconSize::XSmall)
+                        .icon_size(IconSize::Small)
                         .icon_color(Color::Muted)
                         .on_click(cx.listener(|_, _, _, cx| {
                             cx.open_url("https://zed.dev/docs/themes");
@@ -379,6 +386,7 @@ impl PickerDelegate for ThemeSelectorDelegate {
                             window.dispatch_action(
                                 Box::new(Extensions {
                                     category_filter: Some(ExtensionCategoryFilter::Themes),
+                                    id: None,
                                 }),
                                 cx,
                             );

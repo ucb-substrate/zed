@@ -2,11 +2,15 @@ use crate::{Anchor, BufferSnapshot, TextDimension};
 use std::cmp::Ordering;
 use std::ops::Range;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Default, Copy, Clone, Debug, PartialEq)]
 pub enum SelectionGoal {
+    #[default]
     None,
-    HorizontalPosition(f32),
-    HorizontalRange { start: f32, end: f32 },
+    HorizontalPosition(f64),
+    HorizontalRange {
+        start: f64,
+        end: f64,
+    },
     WrappedHorizontalPosition((u32, f32)),
 }
 
@@ -17,12 +21,6 @@ pub struct Selection<T> {
     pub end: T,
     pub reversed: bool,
     pub goal: SelectionGoal,
-}
-
-impl Default for SelectionGoal {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl<T: Clone> Selection<T> {
@@ -104,6 +102,19 @@ impl<T: Copy + Ord> Selection<T> {
         self.goal = new_goal;
     }
 
+    pub fn set_head_tail(&mut self, head: T, tail: T, new_goal: SelectionGoal) {
+        if head < tail {
+            self.reversed = true;
+            self.start = head;
+            self.end = tail;
+        } else {
+            self.reversed = false;
+            self.start = tail;
+            self.end = head;
+        }
+        self.goal = new_goal;
+    }
+
     pub fn swap_head_tail(&mut self) {
         if self.reversed {
             self.reversed = false;
@@ -119,9 +130,15 @@ impl<T: Copy> Selection<T> {
     }
 }
 
-impl Selection<usize> {
+impl<T: std::ops::Sub + Copy> Selection<T> {
+    pub fn len(&self) -> <T as std::ops::Sub>::Output {
+        self.end - self.start
+    }
+}
+
+impl<T: Copy + Eq> Selection<T> {
     #[cfg(feature = "test-support")]
-    pub fn from_offset(offset: usize) -> Self {
+    pub fn from_offset(offset: T) -> Self {
         Selection {
             id: 0,
             start: offset,
@@ -131,7 +148,7 @@ impl Selection<usize> {
         }
     }
 
-    pub fn equals(&self, offset_range: &Range<usize>) -> bool {
+    pub fn equals(&self, offset_range: &Range<T>) -> bool {
         self.start == offset_range.start && self.end == offset_range.end
     }
 }

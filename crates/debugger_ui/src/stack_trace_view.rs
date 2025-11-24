@@ -4,10 +4,10 @@ use collections::HashMap;
 use dap::StackFrameId;
 use editor::{
     Anchor, Bias, DebugStackFrameLine, Editor, EditorEvent, ExcerptId, ExcerptRange, MultiBuffer,
-    RowHighlightOptions, ToPoint, scroll::Autoscroll,
+    RowHighlightOptions, SelectionEffects, ToPoint, scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, AppContext, Entity, EventEmitter, Focusable, IntoElement, Render, SharedString,
+    App, AppContext, Entity, EventEmitter, Focusable, IntoElement, Render, SharedString,
     Subscription, Task, WeakEntity, Window,
 };
 use language::{BufferSnapshot, Capability, Point, Selection, SelectionGoal, TreeSitterOptions};
@@ -55,11 +55,14 @@ impl StackTraceView {
         cx.subscribe_in(&editor, window, |this, editor, event, window, cx| {
             if let EditorEvent::SelectionsChanged { local: true } = event {
                 let excerpt_id = editor.update(cx, |editor, cx| {
-                    let position: Point = editor.selections.newest(cx).head();
+                    let position: Point = editor
+                        .selections
+                        .newest(&editor.display_snapshot(cx))
+                        .head();
 
                     editor
                         .snapshot(window, cx)
-                        .buffer_snapshot
+                        .buffer_snapshot()
                         .excerpt_containing(position..position)
                         .map(|excerpt| excerpt.id())
                 });
@@ -99,10 +102,11 @@ impl StackTraceView {
                             if frame_anchor.excerpt_id
                                 != editor.selections.newest_anchor().head().excerpt_id
                             {
-                                let auto_scroll =
-                                    Some(Autoscroll::center().for_anchor(frame_anchor));
+                                let effects = SelectionEffects::scroll(
+                                    Autoscroll::center().for_anchor(frame_anchor),
+                                );
 
-                                editor.change_selections(auto_scroll, window, cx, |selections| {
+                                editor.change_selections(effects, window, cx, |selections| {
                                     let selection_id = selections.new_selection_id();
 
                                     let selection = Selection {
@@ -180,7 +184,7 @@ impl StackTraceView {
 
                 let project_path = ProjectPath {
                     worktree_id: worktree.read_with(cx, |tree, _| tree.id())?,
-                    path: relative_path.into(),
+                    path: relative_path,
                 };
 
                 if let Some(buffer) = this
@@ -258,7 +262,7 @@ impl StackTraceView {
             let mut is_first = true;
 
             for (_, highlight) in self.highlights.iter().skip(active_idx) {
-                let position = highlight.to_point(&snapshot.buffer_snapshot);
+                let position = highlight.to_point(&snapshot.buffer_snapshot());
                 let color = if is_first {
                     is_first = false;
                     first_color
@@ -267,11 +271,11 @@ impl StackTraceView {
                 };
 
                 let start = snapshot
-                    .buffer_snapshot
+                    .buffer_snapshot()
                     .clip_point(Point::new(position.row, 0), Bias::Left);
                 let end = start + Point::new(1, 0);
-                let start = snapshot.buffer_snapshot.anchor_before(start);
-                let end = snapshot.buffer_snapshot.anchor_before(end);
+                let start = snapshot.buffer_snapshot().anchor_before(start);
+                let end = snapshot.buffer_snapshot().anchor_before(end);
                 editor.highlight_rows::<DebugStackFrameLine>(
                     start..end,
                     color,
@@ -353,10 +357,6 @@ impl Item for StackTraceView {
         self.editor.for_each_project_item(cx, f)
     }
 
-    fn is_singleton(&self, _: &App) -> bool {
-        false
-    }
-
     fn set_nav_history(
         &mut self,
         nav_history: ItemNavHistory,
@@ -418,11 +418,11 @@ impl Item for StackTraceView {
         type_id: TypeId,
         self_handle: &'a Entity<Self>,
         _: &'a App,
-    ) -> Option<AnyView> {
+    ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
-            Some(self_handle.to_any())
+            Some(self_handle.clone().into())
         } else if type_id == TypeId::of::<Editor>() {
-            Some(self.editor.to_any())
+            Some(self.editor.clone().into())
         } else {
             None
         }

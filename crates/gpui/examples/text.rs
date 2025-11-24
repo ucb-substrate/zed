@@ -132,11 +132,11 @@ impl RenderOnce for Specimen {
         let mut line_height = global_style.line_height;
 
         if let Some(style_override) = style_override {
-            font_size = style_override.font_size.to_pixels(rem_size).0;
+            font_size = style_override.font_size.to_pixels(rem_size).into();
             line_height = match style_override.line_height {
                 DefiniteLength::Absolute(absolute_len) => match absolute_len {
-                    AbsoluteLength::Rems(absolute_len) => absolute_len.to_pixels(rem_size).0,
-                    AbsoluteLength::Pixels(absolute_len) => absolute_len.0,
+                    AbsoluteLength::Rems(absolute_len) => absolute_len.to_pixels(rem_size).into(),
+                    AbsoluteLength::Pixels(absolute_len) => absolute_len.into(),
                 },
                 DefiniteLength::Fraction(value) => value,
             };
@@ -155,7 +155,7 @@ impl RenderOnce for Specimen {
             .text_size(px(font_size * scale))
             .line_height(relative(line_height))
             .p(px(10.0))
-            .child(self.string.clone())
+            .child(self.string)
     }
 }
 
@@ -198,7 +198,7 @@ impl RenderOnce for CharacterGrid {
             "χ", "ψ", "∂", "а", "в", "Ж", "ж", "З", "з", "К", "к", "л", "м", "Н", "н", "Р", "р",
             "У", "у", "ф", "ч", "ь", "ы", "Э", "э", "Я", "я", "ij", "öẋ", ".,", "⣝⣑", "~", "*",
             "_", "^", "`", "'", "(", "{", "«", "#", "&", "@", "$", "¢", "%", "|", "?", "¶", "µ",
-            "❮", "<=", "!=", "==", "--", "++", "=>", "->",
+            "❮", "<=", "!=", "==", "--", "++", "=>", "->", "🏀", "🎊", "😍", "❤️", "👍", "👎",
         ];
 
         let columns = 11;

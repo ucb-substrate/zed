@@ -7,11 +7,11 @@ use client::{
 };
 use collections::HashMap;
 use editor::{
-    CollaborationHub, DisplayPoint, Editor, EditorEvent, display_map::ToDisplayPoint,
-    scroll::Autoscroll,
+    CollaborationHub, DisplayPoint, Editor, EditorEvent, SelectionEffects,
+    display_map::ToDisplayPoint, scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, ClipboardItem, Context, Entity, EventEmitter, Focusable, Pixels, Point, Render,
+    App, ClipboardItem, Context, Entity, EventEmitter, Focusable, Pixels, Point, Render,
     Subscription, Task, VisualContext as _, WeakEntity, Window, actions,
 };
 use project::Project;
@@ -25,12 +25,18 @@ use util::ResultExt;
 use workspace::{CollaboratorId, item::TabContentParams};
 use workspace::{
     ItemNavHistory, Pane, SaveIntent, Toast, ViewId, Workspace, WorkspaceId,
-    item::{FollowableItem, Item, ItemEvent, ItemHandle},
+    item::{FollowableItem, Item, ItemEvent},
     searchable::SearchableItemHandle,
 };
 use workspace::{item::Dedup, notifications::NotificationId};
 
-actions!(collab, [CopyLink]);
+actions!(
+    collab,
+    [
+        /// Copies a link to the current position in the channel buffer.
+        CopyLink
+    ]
+);
 
 pub fn init(cx: &mut App) {
     workspace::FollowableViewRegistry::register::<ChannelView>(cx)
@@ -60,7 +66,7 @@ impl ChannelView {
             channel_id,
             link_position,
             pane.clone(),
-            workspace.clone(),
+            workspace,
             window,
             cx,
         );
@@ -101,43 +107,32 @@ impl ChannelView {
                     .find(|view| view.read(cx).channel_buffer.read(cx).remote_id(cx) == buffer_id);
 
                 // If this channel buffer is already open in this pane, just return it.
-                if let Some(existing_view) = existing_view.clone() {
-                    if existing_view.read(cx).channel_buffer == channel_view.read(cx).channel_buffer
-                    {
-                        if let Some(link_position) = link_position {
-                            existing_view.update(cx, |channel_view, cx| {
-                                channel_view.focus_position_from_link(
-                                    link_position,
-                                    true,
-                                    window,
-                                    cx,
-                                )
-                            });
-                        }
-                        return existing_view;
+                if let Some(existing_view) = existing_view.clone()
+                    && existing_view.read(cx).channel_buffer == channel_view.read(cx).channel_buffer
+                {
+                    if let Some(link_position) = link_position {
+                        existing_view.update(cx, |channel_view, cx| {
+                            channel_view.focus_position_from_link(link_position, true, window, cx)
+                        });
                     }
+                    return existing_view;
                 }
 
                 // If the pane contained a disconnected view for this channel buffer,
                 // replace that.
-                if let Some(existing_item) = existing_view {
-                    if let Some(ix) = pane.index_for_item(&existing_item) {
-                        pane.close_item_by_id(
-                            existing_item.entity_id(),
-                            SaveIntent::Skip,
-                            window,
-                            cx,
-                        )
+                if let Some(existing_item) = existing_view
+                    && let Some(ix) = pane.index_for_item(&existing_item)
+                {
+                    pane.close_item_by_id(existing_item.entity_id(), SaveIntent::Skip, window, cx)
                         .detach();
-                        pane.add_item(
-                            Box::new(channel_view.clone()),
-                            true,
-                            true,
-                            Some(ix),
-                            window,
-                            cx,
-                        );
-                    }
+                    pane.add_item(
+                        Box::new(channel_view.clone()),
+                        true,
+                        true,
+                        Some(ix),
+                        window,
+                        cx,
+                    );
                 }
 
                 if let Some(link_position) = link_position {
@@ -253,19 +248,21 @@ impl ChannelView {
             .editor
             .update(cx, |editor, cx| editor.snapshot(window, cx));
 
-        if let Some(outline) = snapshot.buffer_snapshot.outline(None) {
-            if let Some(item) = outline
+        if let Some(outline) = snapshot.buffer_snapshot().outline(None)
+            && let Some(item) = outline
                 .items
                 .iter()
                 .find(|item| &Channel::slug(&item.text).to_lowercase() == &position)
-            {
-                self.editor.update(cx, |editor, cx| {
-                    editor.change_selections(Some(Autoscroll::focused()), window, cx, |s| {
-                        s.replace_cursors_with(|map| vec![item.range.start.to_display_point(map)])
-                    })
-                });
-                return;
-            }
+        {
+            self.editor.update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::focused()),
+                    window,
+                    cx,
+                    |s| s.replace_cursors_with(|map| vec![item.range.start.to_display_point(map)]),
+                )
+            });
+            return;
         }
 
         if !first_attempt {
@@ -290,9 +287,12 @@ impl ChannelView {
     }
 
     fn copy_link(&mut self, _: &CopyLink, window: &mut Window, cx: &mut Context<Self>) {
-        let position = self
-            .editor
-            .update(cx, |editor, cx| editor.selections.newest_display(cx).start);
+        let position = self.editor.update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest_display(&editor.display_snapshot(cx))
+                .start
+        });
         self.copy_link_for_position(position, window, cx)
     }
 
@@ -308,7 +308,7 @@ impl ChannelView {
 
         let mut closest_heading = None;
 
-        if let Some(outline) = snapshot.buffer_snapshot.outline(None) {
+        if let Some(outline) = snapshot.buffer_snapshot().outline(None) {
             for item in outline.items {
                 if item.range.start.to_display_point(&snapshot) > position {
                     break;
@@ -441,11 +441,11 @@ impl Item for ChannelView {
         type_id: TypeId,
         self_handle: &'a Entity<Self>,
         _: &'a App,
-    ) -> Option<AnyView> {
+    ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
-            Some(self_handle.to_any())
+            Some(self_handle.clone().into())
         } else if type_id == TypeId::of::<Editor>() {
-            Some(self.editor.to_any())
+            Some(self.editor.clone().into())
         } else {
             None
         }
@@ -493,13 +493,17 @@ impl Item for ChannelView {
         None
     }
 
+    fn can_split(&self) -> bool {
+        true
+    }
+
     fn clone_on_split(
         &self,
         _: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Self>> {
-        Some(cx.new(|cx| {
+    ) -> Task<Option<Entity<Self>>> {
+        Task::ready(Some(cx.new(|cx| {
             Self::new(
                 self.project.clone(),
                 self.workspace.clone(),
@@ -508,11 +512,7 @@ impl Item for ChannelView {
                 window,
                 cx,
             )
-        }))
-    }
-
-    fn is_singleton(&self, _cx: &App) -> bool {
-        false
+        })))
     }
 
     fn navigate(

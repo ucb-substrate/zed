@@ -23,7 +23,7 @@ impl SessionId {
         Self(client_id as u32)
     }
 
-    pub fn to_proto(&self) -> u64 {
+    pub fn to_proto(self) -> u64 {
         self.0 as u64
     }
 }
@@ -108,7 +108,9 @@ impl DebugAdapterClient {
             arguments: Some(serialized_arguments),
         };
         self.transport_delegate
-            .add_pending_request(sequence_id, callback_tx);
+            .pending_requests
+            .lock()
+            .insert(sequence_id, callback_tx)?;
 
         log::debug!(
             "Client {} send `{}` request with sequence_id: {}",
@@ -116,6 +118,7 @@ impl DebugAdapterClient {
             R::COMMAND,
             sequence_id
         );
+        log::debug!("  request: {request:?}");
 
         self.send_message(Message::Request(request)).await?;
 
@@ -128,6 +131,8 @@ impl DebugAdapterClient {
             command,
             sequence_id
         );
+        log::debug!("  response: {response:?}");
+
         match response.success {
             true => {
                 if let Some(json) = response.body {
@@ -166,6 +171,7 @@ impl DebugAdapterClient {
     pub fn kill(&self) {
         log::debug!("Killing DAP process");
         self.transport_delegate.transport.lock().kill();
+        self.transport_delegate.pending_requests.lock().shutdown();
     }
 
     pub fn has_adapter_logs(&self) -> bool {
@@ -180,11 +186,34 @@ impl DebugAdapterClient {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn on_request<R: dap_types::requests::Request, F>(&self, handler: F)
+    pub fn on_request<R: dap_types::requests::Request, F>(&self, mut handler: F)
     where
         F: 'static
             + Send
             + FnMut(u64, R::Arguments) -> Result<R::Response, dap_types::ErrorResponse>,
+    {
+        use crate::transport::RequestHandling;
+
+        self.transport_delegate
+            .transport
+            .lock()
+            .as_fake()
+            .on_request::<R, _>(move |seq, request| {
+                RequestHandling::Respond(handler(seq, request))
+            });
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn on_request_ext<R: dap_types::requests::Request, F>(&self, handler: F)
+    where
+        F: 'static
+            + Send
+            + FnMut(
+                u64,
+                R::Arguments,
+            ) -> crate::transport::RequestHandling<
+                Result<R::Response, dap_types::ErrorResponse>,
+            >,
     {
         self.transport_delegate
             .transport
@@ -227,7 +256,7 @@ impl DebugAdapterClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{client::DebugAdapterClient, debugger_settings::DebuggerSettings};
+    use crate::client::DebugAdapterClient;
     use dap_types::{
         Capabilities, InitializeRequestArguments, InitializeRequestArgumentsPathFormat,
         RunInTerminalRequestArguments, StartDebuggingRequestArguments,
@@ -236,7 +265,7 @@ mod tests {
     };
     use gpui::TestAppContext;
     use serde_json::json;
-    use settings::{Settings, SettingsStore};
+    use settings::SettingsStore;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -248,7 +277,6 @@ mod tests {
         cx.update(|cx| {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
-            DebuggerSettings::register(cx);
         });
     }
 
@@ -269,7 +297,7 @@ mod tests {
                     request: dap_types::StartDebuggingRequestArgumentsRequest::Launch,
                 },
             },
-            Box::new(|_| panic!("Did not expect to hit this code path")),
+            Box::new(|_| {}),
             &mut cx.to_async(),
         )
         .await

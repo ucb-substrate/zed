@@ -501,10 +501,8 @@ impl Database {
 
     /// Returns all channels for the user with the given ID.
     pub async fn get_channels_for_user(&self, user_id: UserId) -> Result<ChannelsForUser> {
-        self.weak_transaction(
-            |tx| async move { self.get_user_channels(user_id, None, true, &tx).await },
-        )
-        .await
+        self.transaction(|tx| async move { self.get_user_channels(user_id, None, true, &tx).await })
+            .await
     }
 
     /// Returns all channels for the user with the given ID that are descendants
@@ -620,14 +618,8 @@ impl Database {
         }
         drop(rows);
 
-        let latest_channel_messages = self.latest_channel_messages(&channel_ids, tx).await?;
-
         let observed_buffer_versions = self
             .observed_channel_buffer_changes(&channel_ids_by_buffer_id, user_id, tx)
-            .await?;
-
-        let observed_channel_messages = self
-            .observed_channel_messages(&channel_ids, user_id, tx)
             .await?;
 
         Ok(ChannelsForUser {
@@ -636,9 +628,7 @@ impl Database {
             invited_channels,
             channel_participants,
             latest_buffer_versions,
-            latest_channel_messages,
             observed_buffer_versions,
-            observed_channel_messages,
         })
     }
 
@@ -734,8 +724,8 @@ impl Database {
                     users.push(proto::User {
                         id: user.id.to_proto(),
                         avatar_url: format!(
-                            "https://github.com/{}.png?size=128",
-                            user.github_login
+                            "https://avatars.githubusercontent.com/u/{}?s=128&v=4",
+                            user.github_user_id
                         ),
                         github_login: user.github_login,
                         name: user.name,
@@ -1138,9 +1128,4 @@ async fn max_order(parent_path: &str, tx: &TransactionHandle) -> Result<i32> {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
 enum QueryIds {
     Id,
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
-enum QueryUserIds {
-    UserId,
 }

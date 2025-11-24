@@ -154,6 +154,14 @@ This query identifies opening and closing brackets, braces, and quotation marks.
 | @open   | Captures opening brackets, braces, and quotes |
 | @close  | Captures closing brackets, braces, and quotes |
 
+Zed uses these to highlight matching brackets: painting each bracket pair with a different color ("rainbow brackets") and highlighting the brackets if the cursor is inside the bracket pair.
+
+To opt out of rainbow brackets colorization, add the following to the corresponding `brackets.scm` entry:
+
+```scheme
+(("\"" @open "\"" @close) (#set! rainbow.exclude))
+```
+
 ### Code outline/structure
 
 The `outline.scm` file defines the structure for the code outline.
@@ -269,7 +277,7 @@ The `textobjects.scm` file defines rules for navigating by text objects. This wa
 
 Vim provides two levels of granularity for navigating around files. Section-by-section with `[]` etc., and method-by-method with `]m` etc. Even languages that don't support functions and classes can work well by defining similar concepts. For example CSS defines a rule-set as a method, and a media-query as a class.
 
-For languages with closures, these typically should not count as functions in Zed. This is best-effort however, as languages like Javascript do not syntactically differentiate syntactically between closures and top-level function declarations.
+For languages with closures, these typically should not count as functions in Zed. This is best-effort however, as languages like JavaScript do not syntactically differentiate syntactically between closures and top-level function declarations.
 
 For languages with declarations like C, provide queries that match `@class.around` or `@function.around`. The `if` and `ic` text objects will default to these if there is no inside.
 
@@ -324,7 +332,7 @@ This query marks number and string values in key-value pairs and arrays for reda
 
 The `runnables.scm` file defines rules for detecting runnable code.
 
-Here's an example from an `runnables.scm` file for JSON:
+Here's an example from a `runnables.scm` file for JSON:
 
 ```scheme
 (
@@ -366,7 +374,7 @@ TBD: `#set! tag`
 
 Zed uses the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) to provide advanced language support.
 
-An extension may provide any number of language servers. To provide a language server from your extension, add an entry to your `extension.toml` with the name of your language server and the language(s) it applies to:
+An extension may provide any number of language servers. To provide a language server from your extension, add an entry to your `extension.toml` with the name of your language server and the language(s) it applies to. The entry in the list of `languages` has to match the `name` field from the `config.toml` file for that language:
 
 ```toml
 [language_servers.my-language-server]
@@ -402,11 +410,10 @@ If your language server supports additional languages, you can use `language_ids
 
 [language-servers.my-language-server]
 name = "Whatever LSP"
-languages = ["JavaScript", "JSX", "HTML", "CSS"]
+languages = ["JavaScript", "HTML", "CSS"]
 
 [language-servers.my-language-server.language_ids]
 "JavaScript" = "javascript"
-"JSX" = "javascriptreact"
 "TSX" = "typescriptreact"
 "HTML" = "html"
 "CSS" = "css"

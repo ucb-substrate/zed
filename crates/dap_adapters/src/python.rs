@@ -1,81 +1,87 @@
 use crate::*;
-use anyhow::Context as _;
-use dap::adapters::latest_github_release;
+use anyhow::{Context as _, bail};
+use collections::HashMap;
 use dap::{DebugRequest, StartDebuggingRequestArguments, adapters::DebugTaskDefinition};
-use gpui::{AppContext, AsyncApp, SharedString};
+use fs::RemoveOptions;
+use futures::{StreamExt, TryStreamExt};
+use gpui::http_client::AsyncBody;
+use gpui::{AsyncApp, SharedString};
 use json_dotpath::DotPaths;
 use language::{LanguageName, Toolchain};
+use paths::debug_adapters_dir;
 use serde_json::Value;
+use smol::fs::File;
+use smol::io::AsyncReadExt;
+use smol::lock::OnceCell;
+use std::ffi::OsString;
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::{
-    collections::HashMap,
     ffi::OsStr,
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
-use util::ResultExt;
+use util::command::new_smol_command;
+use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
+
+enum DebugpyLaunchMode<'a> {
+    Normal,
+    AttachWithConnect { host: Option<&'a str> },
+}
 
 #[derive(Default)]
 pub(crate) struct PythonDebugAdapter {
-    checked: OnceLock<()>,
+    base_venv_path: OnceCell<Result<Arc<Path>, String>>,
+    debugpy_whl_base_path: OnceCell<Result<Arc<Path>, String>>,
 }
 
 impl PythonDebugAdapter {
     const ADAPTER_NAME: &'static str = "Debugpy";
     const DEBUG_ADAPTER_NAME: DebugAdapterName =
         DebugAdapterName(SharedString::new_static(Self::ADAPTER_NAME));
-    const ADAPTER_PACKAGE_NAME: &'static str = "debugpy";
-    const ADAPTER_PATH: &'static str = "src/debugpy/adapter";
+
     const LANGUAGE_NAME: &'static str = "Python";
 
-    async fn generate_debugpy_arguments(
-        host: &Ipv4Addr,
+    async fn generate_debugpy_arguments<'a>(
+        host: &'a Ipv4Addr,
         port: u16,
-        user_installed_path: Option<&Path>,
+        launch_mode: DebugpyLaunchMode<'a>,
+        user_installed_path: Option<&'a Path>,
         user_args: Option<Vec<String>>,
-        installed_in_venv: bool,
     ) -> Result<Vec<String>> {
         let mut args = if let Some(user_installed_path) = user_installed_path {
             log::debug!(
                 "Using user-installed debugpy adapter from: {}",
                 user_installed_path.display()
             );
-            vec![
-                user_installed_path
-                    .join(Self::ADAPTER_PATH)
-                    .to_string_lossy()
-                    .to_string(),
-            ]
-        } else if installed_in_venv {
-            log::debug!("Using venv-installed debugpy");
-            vec!["-m".to_string(), "debugpy.adapter".to_string()]
+            vec![user_installed_path.to_string_lossy().into_owned()]
         } else {
             let adapter_path = paths::debug_adapters_dir().join(Self::DEBUG_ADAPTER_NAME.as_ref());
-            let file_name_prefix = format!("{}_", Self::ADAPTER_NAME);
-
-            let debugpy_dir =
-                util::fs::find_file_name_in_dir(adapter_path.as_path(), |file_name| {
-                    file_name.starts_with(&file_name_prefix)
-                })
-                .await
-                .context("Debugpy directory not found")?;
-
-            log::debug!(
-                "Using GitHub-downloaded debugpy adapter from: {}",
-                debugpy_dir.display()
-            );
-            vec![
-                debugpy_dir
-                    .join(Self::ADAPTER_PATH)
-                    .to_string_lossy()
-                    .to_string(),
-            ]
+            let path = adapter_path
+                .join("debugpy")
+                .join("adapter")
+                .to_string_lossy()
+                .into_owned();
+            log::debug!("Using pip debugpy adapter from: {path}");
+            vec![path]
         };
 
         args.extend(if let Some(args) = user_args {
             args
         } else {
-            vec![format!("--host={}", host), format!("--port={}", port)]
+            match launch_mode {
+                DebugpyLaunchMode::Normal => {
+                    vec![format!("--host={}", host), format!("--port={}", port)]
+                }
+                DebugpyLaunchMode::AttachWithConnect { host } => {
+                    let mut args = vec!["connect".to_string()];
+
+                    if let Some(host) = host {
+                        args.push(format!("{host}:"));
+                    }
+                    args.push(format!("{port}"));
+                    args
+                }
+            }
         });
         Ok(args)
     }
@@ -105,44 +111,218 @@ impl PythonDebugAdapter {
             request,
         })
     }
-    async fn fetch_latest_adapter_version(
+
+    async fn fetch_wheel(
         &self,
+        toolchain: Option<Toolchain>,
         delegate: &Arc<dyn DapDelegate>,
-    ) -> Result<AdapterVersion> {
-        let github_repo = GithubRepo {
-            repo_name: Self::ADAPTER_PACKAGE_NAME.into(),
-            repo_owner: "microsoft".into(),
-        };
+    ) -> Result<Arc<Path>> {
+        let download_dir = debug_adapters_dir().join(Self::ADAPTER_NAME).join("wheels");
+        std::fs::create_dir_all(&download_dir)?;
+        let venv_python = self.base_venv_path(toolchain, delegate).await?;
 
-        fetch_latest_adapter_version_from_github(github_repo, delegate.as_ref()).await
-    }
-
-    async fn install_binary(
-        adapter_name: DebugAdapterName,
-        version: AdapterVersion,
-        delegate: Arc<dyn DapDelegate>,
-    ) -> Result<()> {
-        let version_path = adapters::download_adapter_from_github(
-            adapter_name,
-            version,
-            adapters::DownloadedFileType::GzipTar,
-            delegate.as_ref(),
-        )
-        .await?;
-        // only needed when you install the latest version for the first time
-        if let Some(debugpy_dir) =
-            util::fs::find_file_name_in_dir(version_path.as_path(), |file_name| {
-                file_name.starts_with("microsoft-debugpy-")
-            })
+        let installation_succeeded = util::command::new_smol_command(venv_python.as_ref())
+            .args([
+                "-m",
+                "pip",
+                "download",
+                "debugpy",
+                "--only-binary=:all:",
+                "-d",
+                download_dir.to_string_lossy().as_ref(),
+            ])
+            .output()
             .await
-        {
-            // TODO Debugger: Rename folder instead of moving all files to another folder
-            // We're doing unnecessary IO work right now
-            util::fs::move_folder_files_to_folder(debugpy_dir.as_path(), version_path.as_path())
-                .await?;
+            .context("spawn system python")?
+            .status
+            .success();
+        if !installation_succeeded {
+            bail!("debugpy installation failed (could not fetch Debugpy's wheel)");
         }
 
-        Ok(())
+        let wheel_path = std::fs::read_dir(&download_dir)?
+            .find_map(|entry| {
+                entry.ok().filter(|e| {
+                    e.file_type().is_ok_and(|typ| typ.is_file())
+                        && Path::new(&e.file_name()).extension() == Some("whl".as_ref())
+                })
+            })
+            .with_context(|| format!("Did not find a .whl in {download_dir:?}"))?;
+
+        util::archive::extract_zip(
+            &debug_adapters_dir().join(Self::ADAPTER_NAME),
+            File::open(&wheel_path.path()).await?,
+        )
+        .await?;
+
+        Ok(Arc::from(wheel_path.path()))
+    }
+
+    async fn maybe_fetch_new_wheel(
+        &self,
+        toolchain: Option<Toolchain>,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<()> {
+        let latest_release = delegate
+            .http_client()
+            .get(
+                "https://pypi.org/pypi/debugpy/json",
+                AsyncBody::empty(),
+                false,
+            )
+            .await
+            .log_err();
+        let response = latest_release
+            .filter(|response| response.status().is_success())
+            .context("getting latest release")?;
+
+        let download_dir = debug_adapters_dir().join(Self::ADAPTER_NAME);
+        std::fs::create_dir_all(&download_dir)?;
+
+        let mut output = String::new();
+        response.into_body().read_to_string(&mut output).await?;
+        let as_json = serde_json::Value::from_str(&output)?;
+        let latest_version = as_json
+            .get("info")
+            .and_then(|info| {
+                info.get("version")
+                    .and_then(|version| version.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .context("parsing latest release information")?;
+        let dist_info_dirname: OsString = format!("debugpy-{latest_version}.dist-info").into();
+        let is_up_to_date = delegate
+            .fs()
+            .read_dir(&debug_adapters_dir().join(Self::ADAPTER_NAME))
+            .await?
+            .into_stream()
+            .any(async |entry| {
+                entry.is_ok_and(|e| e.file_name().is_some_and(|name| name == dist_info_dirname))
+            })
+            .await;
+
+        if !is_up_to_date {
+            delegate
+                .fs()
+                .remove_dir(
+                    &debug_adapters_dir().join(Self::ADAPTER_NAME),
+                    RemoveOptions {
+                        recursive: true,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await?;
+            self.fetch_wheel(toolchain, delegate).await?;
+        }
+        anyhow::Ok(())
+    }
+
+    async fn fetch_debugpy_whl(
+        &self,
+        toolchain: Option<Toolchain>,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<Arc<Path>, String> {
+        self.debugpy_whl_base_path
+            .get_or_init(|| async move {
+                self.maybe_fetch_new_wheel(toolchain, delegate)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                Ok(Arc::from(
+                    debug_adapters_dir()
+                        .join(Self::ADAPTER_NAME)
+                        .join("debugpy")
+                        .join("adapter")
+                        .as_ref(),
+                ))
+            })
+            .await
+            .clone()
+    }
+
+    async fn base_venv_path(
+        &self,
+        toolchain: Option<Toolchain>,
+        delegate: &Arc<dyn DapDelegate>,
+    ) -> Result<Arc<Path>> {
+        let result = self.base_venv_path
+            .get_or_init(|| async {
+                let base_python = if let Some(toolchain) = toolchain {
+                    toolchain.path.to_string()
+                } else {
+                    Self::system_python_name(delegate).await.ok_or_else(|| {
+                        let mut message = "Could not find a Python installation".to_owned();
+                        if cfg!(windows){
+                            message.push_str(". Install Python from the Microsoft Store, or manually from https://www.python.org/downloads/windows.")
+                        }
+                        message
+                    })?
+                };
+
+                let debug_adapter_path = paths::debug_adapters_dir().join(Self::DEBUG_ADAPTER_NAME.as_ref());
+                let output = util::command::new_smol_command(&base_python)
+                    .args(["-m", "venv", "zed_base_venv"])
+                    .current_dir(
+                        &debug_adapter_path,
+                    )
+                    .spawn()
+                    .map_err(|e| format!("{e:#?}"))?
+                    .output()
+                    .await
+                    .map_err(|e| format!("{e:#?}"))?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let debug_adapter_path = debug_adapter_path.display();
+                    return Err(format!("Failed to create base virtual environment with {base_python} in:\n{debug_adapter_path}\nstderr:\n{stderr}\nstdout:\n{stdout}\n"));
+                }
+
+                const PYTHON_PATH: &str = if cfg!(target_os = "windows") {
+                    "Scripts/python.exe"
+                } else {
+                    "bin/python3"
+                };
+                Ok(Arc::from(
+                    paths::debug_adapters_dir()
+                        .join(Self::DEBUG_ADAPTER_NAME.as_ref())
+                        .join("zed_base_venv")
+                        .join(PYTHON_PATH)
+                        .as_ref(),
+                ))
+            })
+            .await
+            .clone();
+        match result {
+            Ok(path) => Ok(path),
+            Err(e) => Err(anyhow::anyhow!("{e}")),
+        }
+    }
+    async fn system_python_name(delegate: &Arc<dyn DapDelegate>) -> Option<String> {
+        const BINARY_NAMES: [&str; 3] = ["python3", "python", "py"];
+        let mut name = None;
+
+        for cmd in BINARY_NAMES {
+            let Some(path) = delegate.which(OsStr::new(cmd)).await else {
+                continue;
+            };
+            // Try to detect situations where `python3` exists but is not a real Python interpreter.
+            // Notably, on fresh Windows installs, `python3` is a shim that opens the Microsoft Store app
+            // when run with no arguments, and just fails otherwise.
+            let Some(output) = new_smol_command(&path)
+                .args(["-c", "print(1 + 2)"])
+                .output()
+                .await
+                .ok()
+            else {
+                continue;
+            };
+            if output.stdout.trim_ascii() != b"3" {
+                continue;
+            }
+            name = Some(path.to_string_lossy().into_owned());
+            break;
+        }
+        name
     }
 
     async fn get_installed_binary(
@@ -151,28 +331,58 @@ impl PythonDebugAdapter {
         config: &DebugTaskDefinition,
         user_installed_path: Option<PathBuf>,
         user_args: Option<Vec<String>>,
-        toolchain: Option<Toolchain>,
-        installed_in_venv: bool,
+        user_env: Option<HashMap<String, String>>,
+        python_from_toolchain: Option<String>,
     ) -> Result<DebugAdapterBinary> {
-        const BINARY_NAMES: [&str; 3] = ["python3", "python", "py"];
-        let tcp_connection = config.tcp_connection.clone().unwrap_or_default();
+        let mut tcp_connection = config.tcp_connection.clone().unwrap_or_default();
+
+        let (config_port, config_host) = config
+            .config
+            .get("connect")
+            .map(|value| {
+                (
+                    value
+                        .get("port")
+                        .and_then(|val| val.as_u64().map(|p| p as u16)),
+                    value.get("host").and_then(|val| val.as_str()),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    config
+                        .config
+                        .get("port")
+                        .and_then(|port| port.as_u64().map(|p| p as u16)),
+                    config.config.get("host").and_then(|host| host.as_str()),
+                )
+            });
+
+        let is_attach_with_connect = if config
+            .config
+            .get("request")
+            .is_some_and(|val| val.as_str().is_some_and(|request| request == "attach"))
+        {
+            if tcp_connection.host.is_some() && config_host.is_some() {
+                bail!("Cannot have two different hosts in debug configuration")
+            } else if tcp_connection.port.is_some() && config_port.is_some() {
+                bail!("Cannot have two different ports in debug configuration")
+            }
+
+            if let Some(hostname) = config_host {
+                tcp_connection.host = Some(hostname.parse().context("hostname must be IPv4")?);
+            }
+            tcp_connection.port = config_port;
+            DebugpyLaunchMode::AttachWithConnect { host: config_host }
+        } else {
+            DebugpyLaunchMode::Normal
+        };
+
         let (host, port, timeout) = crate::configure_tcp_connection(tcp_connection).await?;
 
-        let python_path = if let Some(toolchain) = toolchain {
-            Some(toolchain.path.to_string())
+        let python_path = if let Some(toolchain) = python_from_toolchain {
+            Some(toolchain)
         } else {
-            let mut name = None;
-
-            for cmd in BINARY_NAMES {
-                name = delegate
-                    .which(OsStr::new(cmd))
-                    .await
-                    .map(|path| path.to_string_lossy().to_string());
-                if name.is_some() {
-                    break;
-                }
-            }
-            name
+            Self::system_python_name(delegate).await
         };
 
         let python_command = python_path.context("failed to find binary path for Python")?;
@@ -181,9 +391,9 @@ impl PythonDebugAdapter {
         let arguments = Self::generate_debugpy_arguments(
             &host,
             port,
+            is_attach_with_connect,
             user_installed_path.as_deref(),
             user_args,
-            installed_in_venv,
         )
         .await?;
 
@@ -202,7 +412,7 @@ impl PythonDebugAdapter {
                 timeout,
             }),
             cwd: Some(delegate.worktree_root_path().to_path_buf()),
-            envs: HashMap::default(),
+            envs: user_env.unwrap_or_default(),
             request_args: self.request_args(delegate, config).await?,
         })
     }
@@ -597,6 +807,7 @@ impl DebugAdapter for PythonDebugAdapter {
         config: &DebugTaskDefinition,
         user_installed_path: Option<PathBuf>,
         user_args: Option<Vec<String>>,
+        user_env: Option<HashMap<String, String>>,
         cx: &mut AsyncApp,
     ) -> Result<DebugAdapterBinary> {
         if let Some(local_path) = &user_installed_path {
@@ -607,83 +818,245 @@ impl DebugAdapter for PythonDebugAdapter {
             return self
                 .get_installed_binary(
                     delegate,
-                    &config,
+                    config,
                     Some(local_path.clone()),
                     user_args,
+                    user_env,
                     None,
-                    false,
                 )
                 .await;
         }
 
-        let toolchain = delegate
-            .toolchain_store()
-            .active_toolchain(
-                delegate.worktree_id(),
-                Arc::from("".as_ref()),
-                language::LanguageName::new(Self::LANGUAGE_NAME),
-                cx,
+        let base_paths = ["cwd", "program", "module"]
+            .into_iter()
+            .filter_map(|key| {
+                config.config.get(key).and_then(|cwd| {
+                    RelPath::new(
+                        cwd.as_str()
+                            .map(Path::new)?
+                            .strip_prefix(delegate.worktree_root_path())
+                            .ok()?,
+                        PathStyle::local(),
+                    )
+                    .ok()
+                })
+            })
+            .chain(
+                // While Debugpy's wiki saids absolute paths are required, but it actually supports relative paths when cwd is passed in.
+                // (Which should always be the case because Zed defaults to the cwd worktree root)
+                // So we want to check that these relative paths find toolchains as well. Otherwise, they won't be checked
+                // because the strip prefix in the iteration above will return an error
+                config
+                    .config
+                    .get("cwd")
+                    .map(|_| {
+                        ["program", "module"].into_iter().filter_map(|key| {
+                            config.config.get(key).and_then(|value| {
+                                let path = Path::new(value.as_str()?);
+                                RelPath::new(path, PathStyle::local()).ok()
+                            })
+                        })
+                    })
+                    .into_iter()
+                    .flatten(),
             )
-            .await;
+            .chain([RelPath::empty().into()]);
 
+        let mut toolchain = None;
+
+        for base_path in base_paths {
+            if let Some(found_toolchain) = delegate
+                .toolchain_store()
+                .active_toolchain(
+                    delegate.worktree_id(),
+                    base_path.into_arc(),
+                    language::LanguageName::new(Self::LANGUAGE_NAME),
+                    cx,
+                )
+                .await
+            {
+                toolchain = Some(found_toolchain);
+                break;
+            }
+        }
+
+        self.fetch_debugpy_whl(toolchain.clone(), delegate)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if let Some(toolchain) = &toolchain {
-            if let Some(path) = Path::new(&toolchain.path.to_string()).parent() {
-                let debugpy_path = path.join("debugpy");
-                if delegate.fs().is_file(&debugpy_path).await {
-                    log::debug!(
-                        "Found debugpy in toolchain environment: {}",
-                        debugpy_path.display()
-                    );
-                    return self
-                        .get_installed_binary(
-                            delegate,
-                            &config,
-                            None,
-                            user_args,
-                            Some(toolchain.clone()),
-                            true,
-                        )
-                        .await;
-                }
-            }
+            return self
+                .get_installed_binary(
+                    delegate,
+                    config,
+                    None,
+                    user_args,
+                    user_env,
+                    Some(toolchain.path.to_string()),
+                )
+                .await;
         }
 
-        if self.checked.set(()).is_ok() {
-            delegate.output_to_console(format!("Checking latest version of {}...", self.name()));
-            if let Some(version) = self.fetch_latest_adapter_version(delegate).await.log_err() {
-                cx.background_spawn(Self::install_binary(self.name(), version, delegate.clone()))
-                    .await
-                    .context("Failed to install debugpy")?;
-            }
-        }
-
-        self.get_installed_binary(delegate, &config, None, user_args, toolchain, false)
+        self.get_installed_binary(delegate, config, None, user_args, user_env, None)
             .await
     }
-}
 
-async fn fetch_latest_adapter_version_from_github(
-    github_repo: GithubRepo,
-    delegate: &dyn DapDelegate,
-) -> Result<AdapterVersion> {
-    let release = latest_github_release(
-        &format!("{}/{}", github_repo.repo_owner, github_repo.repo_name),
-        false,
-        false,
-        delegate.http_client(),
-    )
-    .await?;
-
-    Ok(AdapterVersion {
-        tag_name: release.tag_name,
-        url: release.tarball_url,
-    })
+    fn label_for_child_session(&self, args: &StartDebuggingRequestArguments) -> Option<String> {
+        let label = args
+            .configuration
+            .get("name")?
+            .as_str()
+            .filter(|label| !label.is_empty())?;
+        Some(label.to_owned())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use util::path;
+
     use super::*;
-    use std::{net::Ipv4Addr, path::PathBuf};
+    use task::TcpArgumentsTemplate;
+
+    #[gpui::test]
+    async fn test_tcp_connection_conflict_with_connect_args() {
+        let adapter = PythonDebugAdapter {
+            base_venv_path: OnceCell::new(),
+            debugpy_whl_base_path: OnceCell::new(),
+        };
+
+        let config_with_port_conflict = json!({
+            "request": "attach",
+            "connect": {
+                "port": 5679
+            }
+        });
+
+        let tcp_connection = TcpArgumentsTemplate {
+            host: None,
+            port: Some(5678),
+            timeout: None,
+        };
+
+        let task_def = DebugTaskDefinition {
+            label: "test".into(),
+            adapter: PythonDebugAdapter::ADAPTER_NAME.into(),
+            config: config_with_port_conflict,
+            tcp_connection: Some(tcp_connection.clone()),
+        };
+
+        let result = adapter
+            .get_installed_binary(
+                &test_mocks::MockDelegate::new(),
+                &task_def,
+                None,
+                None,
+                None,
+                Some("python3".to_string()),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot have two different ports")
+        );
+
+        let host = Ipv4Addr::new(127, 0, 0, 1);
+        let config_with_host_conflict = json!({
+            "request": "attach",
+            "connect": {
+                "host": "192.168.1.1",
+                "port": 5678
+            }
+        });
+
+        let tcp_connection_with_host = TcpArgumentsTemplate {
+            host: Some(host),
+            port: None,
+            timeout: None,
+        };
+
+        let task_def_host = DebugTaskDefinition {
+            label: "test".into(),
+            adapter: PythonDebugAdapter::ADAPTER_NAME.into(),
+            config: config_with_host_conflict,
+            tcp_connection: Some(tcp_connection_with_host),
+        };
+
+        let result_host = adapter
+            .get_installed_binary(
+                &test_mocks::MockDelegate::new(),
+                &task_def_host,
+                None,
+                None,
+                None,
+                Some("python3".to_string()),
+            )
+            .await;
+
+        assert!(result_host.is_err());
+        assert!(
+            result_host
+                .unwrap_err()
+                .to_string()
+                .contains("Cannot have two different hosts")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_attach_with_connect_mode_generates_correct_arguments() {
+        let host = Ipv4Addr::new(127, 0, 0, 1);
+        let port = 5678;
+
+        let args_without_host = PythonDebugAdapter::generate_debugpy_arguments(
+            &host,
+            port,
+            DebugpyLaunchMode::AttachWithConnect { host: None },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let expected_suffix = path!("debug_adapters/Debugpy/debugpy/adapter");
+        assert!(args_without_host[0].ends_with(expected_suffix));
+        assert_eq!(args_without_host[1], "connect");
+        assert_eq!(args_without_host[2], "5678");
+
+        let args_with_host = PythonDebugAdapter::generate_debugpy_arguments(
+            &host,
+            port,
+            DebugpyLaunchMode::AttachWithConnect {
+                host: Some("192.168.1.100"),
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(args_with_host[0].ends_with(expected_suffix));
+        assert_eq!(args_with_host[1], "connect");
+        assert_eq!(args_with_host[2], "192.168.1.100:");
+        assert_eq!(args_with_host[3], "5678");
+
+        let args_normal = PythonDebugAdapter::generate_debugpy_arguments(
+            &host,
+            port,
+            DebugpyLaunchMode::Normal,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(args_normal[0].ends_with(expected_suffix));
+        assert_eq!(args_normal[1], "--host=127.0.0.1");
+        assert_eq!(args_normal[2], "--port=5678");
+        assert!(!args_normal.contains(&"connect".to_string()));
+    }
 
     #[gpui::test]
     async fn test_debugpy_install_path_cases() {
@@ -691,48 +1064,52 @@ mod tests {
         let port = 5678;
 
         // Case 1: User-defined debugpy path (highest precedence)
-        let user_path = PathBuf::from("/custom/path/to/debugpy");
+        let user_path = PathBuf::from("/custom/path/to/debugpy/src/debugpy/adapter");
         let user_args = PythonDebugAdapter::generate_debugpy_arguments(
             &host,
             port,
+            DebugpyLaunchMode::Normal,
             Some(&user_path),
             None,
-            false,
         )
         .await
         .unwrap();
 
-        // Case 2: Venv-installed debugpy (uses -m debugpy.adapter)
-        let venv_args =
-            PythonDebugAdapter::generate_debugpy_arguments(&host, port, None, None, true)
-                .await
-                .unwrap();
+        let venv_args = PythonDebugAdapter::generate_debugpy_arguments(
+            &host,
+            port,
+            DebugpyLaunchMode::Normal,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
-        assert!(user_args[0].ends_with("src/debugpy/adapter"));
+        assert_eq!(user_args[0], "/custom/path/to/debugpy/src/debugpy/adapter");
         assert_eq!(user_args[1], "--host=127.0.0.1");
         assert_eq!(user_args[2], "--port=5678");
 
-        assert_eq!(venv_args[0], "-m");
-        assert_eq!(venv_args[1], "debugpy.adapter");
-        assert_eq!(venv_args[2], "--host=127.0.0.1");
-        assert_eq!(venv_args[3], "--port=5678");
+        let expected_suffix = path!("debug_adapters/Debugpy/debugpy/adapter");
+        assert!(venv_args[0].ends_with(expected_suffix));
+        assert_eq!(venv_args[1], "--host=127.0.0.1");
+        assert_eq!(venv_args[2], "--port=5678");
 
         // The same cases, with arguments overridden by the user
         let user_args = PythonDebugAdapter::generate_debugpy_arguments(
             &host,
             port,
+            DebugpyLaunchMode::Normal,
             Some(&user_path),
             Some(vec!["foo".into()]),
-            false,
         )
         .await
         .unwrap();
         let venv_args = PythonDebugAdapter::generate_debugpy_arguments(
             &host,
             port,
+            DebugpyLaunchMode::Normal,
             None,
             Some(vec!["foo".into()]),
-            true,
         )
         .await
         .unwrap();
@@ -740,9 +1117,8 @@ mod tests {
         assert!(user_args[0].ends_with("src/debugpy/adapter"));
         assert_eq!(user_args[1], "foo");
 
-        assert_eq!(venv_args[0], "-m");
-        assert_eq!(venv_args[1], "debugpy.adapter");
-        assert_eq!(venv_args[2], "foo");
+        assert!(venv_args[0].ends_with(expected_suffix));
+        assert_eq!(venv_args[1], "foo");
 
         // Note: Case 3 (GitHub-downloaded debugpy) is not tested since this requires mocking the Github API.
     }

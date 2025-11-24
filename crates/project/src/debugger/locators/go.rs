@@ -117,7 +117,20 @@ impl DapLocator for GoLocator {
                         // HACK: tasks assume that they are run in a shell context,
                         // so the -run regex has escaped specials. Delve correctly
                         // handles escaping, so we undo that here.
-                        if arg.starts_with("\\^") && arg.ends_with("\\$") {
+                        if let Some((left, right)) = arg.split_once("/")
+                            && left.starts_with("\\^")
+                            && left.ends_with("\\$")
+                            && right.starts_with("\\^")
+                            && right.ends_with("\\$")
+                        {
+                            let mut left = left[1..left.len() - 2].to_string();
+                            left.push('$');
+
+                            let mut right = right[1..right.len() - 2].to_string();
+                            right.push('$');
+
+                            args.push(format!("{left}/{right}"));
+                        } else if arg.starts_with("\\^") && arg.ends_with("\\$") {
                             let mut arg = arg[1..arg.len() - 2].to_string();
                             arg.push('$');
                             args.push(arg);
@@ -161,7 +174,7 @@ impl DapLocator for GoLocator {
                     request: "launch".to_string(),
                     mode: "test".to_string(),
                     program,
-                    args: args,
+                    args,
                     build_flags,
                     cwd: build_config.cwd.clone(),
                     env: build_config.env.clone(),
@@ -172,7 +185,7 @@ impl DapLocator for GoLocator {
                     label: resolved_label.to_string().into(),
                     adapter: adapter.0.clone(),
                     build: None,
-                    config: config,
+                    config,
                     tcp_connection: None,
                 })
             }
@@ -207,7 +220,7 @@ impl DapLocator for GoLocator {
                     request: "launch".to_string(),
                     mode: "debug".to_string(),
                     program,
-                    args: args,
+                    args,
                     build_flags,
                 })
                 .unwrap();

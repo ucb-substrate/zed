@@ -10,16 +10,20 @@ use gpui::{
 };
 use picker::{Picker, PickerDelegate};
 use std::sync::Arc;
-use ui::{Avatar, CheckboxWithLabel, ContextMenu, ListItem, ListItemSpacing, prelude::*};
+use ui::{Avatar, Checkbox, ContextMenu, ListItem, ListItemSpacing, prelude::*};
 use util::TryFutureExt;
 use workspace::{ModalView, notifications::DetachAndPromptErr};
 
 actions!(
     channel_modal,
     [
+        /// Selects the next control in the channel modal.
         SelectNextControl,
+        /// Toggles between invite members and manage members mode.
         ToggleMode,
+        /// Toggles admin status for the selected member.
         ToggleMemberAdmin,
+        /// Removes the selected member from the channel.
         RemoveMember
     ]
 );
@@ -161,16 +165,18 @@ impl Render for ChannelModal {
                             .h(rems_from_px(22.))
                             .justify_between()
                             .line_height(rems(1.25))
-                            .child(CheckboxWithLabel::new(
-                                "is-public",
-                                Label::new("Public").size(LabelSize::Small),
-                                if visibility == ChannelVisibility::Public {
-                                    ui::ToggleState::Selected
-                                } else {
-                                    ui::ToggleState::Unselected
-                                },
-                                cx.listener(Self::set_channel_visibility),
-                            ))
+                            .child(
+                                Checkbox::new(
+                                    "is-public",
+                                    if visibility == ChannelVisibility::Public {
+                                        ui::ToggleState::Selected
+                                    } else {
+                                        ui::ToggleState::Unselected
+                                    },
+                                )
+                                .label("Public")
+                                .on_click(cx.listener(Self::set_channel_visibility)),
+                            )
                             .children(
                                 Some(
                                     Button::new("copy-link", "Copy Link")
@@ -582,7 +588,7 @@ impl ChannelModalDelegate {
             return;
         };
         let user_id = membership.user.id;
-        let picker = cx.entity().clone();
+        let picker = cx.entity();
         let context_menu = ContextMenu::build(window, cx, |mut menu, _window, _cx| {
             let role = membership.role;
 

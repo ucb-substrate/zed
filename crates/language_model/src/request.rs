@@ -1,10 +1,9 @@
 use std::io::{Cursor, Write};
 use std::sync::Arc;
 
-use crate::role::Role;
-use crate::{LanguageModelToolUse, LanguageModelToolUseId};
 use anyhow::Result;
 use base64::write::EncoderWriter;
+use cloud_llm_client::{CompletionIntent, CompletionMode};
 use gpui::{
     App, AppContext as _, DevicePixels, Image, ImageFormat, ObjectFit, SharedString, Size, Task,
     point, px, size,
@@ -12,7 +11,9 @@ use gpui::{
 use image::codecs::png::PngEncoder;
 use serde::{Deserialize, Serialize};
 use util::ResultExt;
-use zed_llm_client::{CompletionIntent, CompletionMode};
+
+use crate::role::Role;
+use crate::{LanguageModelToolUse, LanguageModelToolUseId};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub struct LanguageModelImage {
@@ -76,7 +77,7 @@ impl std::fmt::Debug for LanguageModelImage {
 }
 
 /// Anthropic wants uploaded images to be smaller than this in both dimensions.
-const ANTHROPIC_SIZE_LIMT: f32 = 1568.;
+const ANTHROPIC_SIZE_LIMIT: f32 = 1568.;
 
 impl LanguageModelImage {
     pub fn empty() -> Self {
@@ -98,6 +99,10 @@ impl LanguageModelImage {
                     .and_then(image::DynamicImage::from_decoder),
                 ImageFormat::Gif => image::codecs::gif::GifDecoder::new(image_bytes)
                     .and_then(image::DynamicImage::from_decoder),
+                ImageFormat::Bmp => image::codecs::bmp::BmpDecoder::new(image_bytes)
+                    .and_then(image::DynamicImage::from_decoder),
+                ImageFormat::Tiff => image::codecs::tiff::TiffDecoder::new(image_bytes)
+                    .and_then(image::DynamicImage::from_decoder),
                 _ => return None,
             }
             .log_err()?;
@@ -107,19 +112,19 @@ impl LanguageModelImage {
             let image_size = size(DevicePixels(width as i32), DevicePixels(height as i32));
 
             let base64_image = {
-                if image_size.width.0 > ANTHROPIC_SIZE_LIMT as i32
-                    || image_size.height.0 > ANTHROPIC_SIZE_LIMT as i32
+                if image_size.width.0 > ANTHROPIC_SIZE_LIMIT as i32
+                    || image_size.height.0 > ANTHROPIC_SIZE_LIMIT as i32
                 {
                     let new_bounds = ObjectFit::ScaleDown.get_bounds(
                         gpui::Bounds {
                             origin: point(px(0.0), px(0.0)),
-                            size: size(px(ANTHROPIC_SIZE_LIMT), px(ANTHROPIC_SIZE_LIMT)),
+                            size: size(px(ANTHROPIC_SIZE_LIMIT), px(ANTHROPIC_SIZE_LIMIT)),
                         },
                         image_size,
                     );
                     let resized_image = dynamic_image.resize(
-                        new_bounds.size.width.0 as u32,
-                        new_bounds.size.height.0 as u32,
+                        new_bounds.size.width.into(),
+                        new_bounds.size.height.into(),
                         image::imageops::FilterType::Triangle,
                     );
 
@@ -219,42 +224,39 @@ impl<'de> Deserialize<'de> for LanguageModelToolResultContent {
 
             // Accept wrapped text format: { "type": "text", "text": "..." }
             if let (Some(type_value), Some(text_value)) =
-                (get_field(&obj, "type"), get_field(&obj, "text"))
+                (get_field(obj, "type"), get_field(obj, "text"))
+                && let Some(type_str) = type_value.as_str()
+                && type_str.to_lowercase() == "text"
+                && let Some(text) = text_value.as_str()
             {
-                if let Some(type_str) = type_value.as_str() {
-                    if type_str.to_lowercase() == "text" {
-                        if let Some(text) = text_value.as_str() {
-                            return Ok(Self::Text(Arc::from(text)));
-                        }
-                    }
-                }
+                return Ok(Self::Text(Arc::from(text)));
             }
 
             // Check for wrapped Text variant: { "text": "..." }
-            if let Some((_key, value)) = obj.iter().find(|(k, _)| k.to_lowercase() == "text") {
-                if obj.len() == 1 {
-                    // Only one field, and it's "text" (case-insensitive)
-                    if let Some(text) = value.as_str() {
-                        return Ok(Self::Text(Arc::from(text)));
-                    }
+            if let Some((_key, value)) = obj.iter().find(|(k, _)| k.to_lowercase() == "text")
+                && obj.len() == 1
+            {
+                // Only one field, and it's "text" (case-insensitive)
+                if let Some(text) = value.as_str() {
+                    return Ok(Self::Text(Arc::from(text)));
                 }
             }
 
             // Check for wrapped Image variant: { "image": { "source": "...", "size": ... } }
-            if let Some((_key, value)) = obj.iter().find(|(k, _)| k.to_lowercase() == "image") {
-                if obj.len() == 1 {
-                    // Only one field, and it's "image" (case-insensitive)
-                    // Try to parse the nested image object
-                    if let Some(image_obj) = value.as_object() {
-                        if let Some(image) = LanguageModelImage::from_json(image_obj) {
-                            return Ok(Self::Image(image));
-                        }
-                    }
+            if let Some((_key, value)) = obj.iter().find(|(k, _)| k.to_lowercase() == "image")
+                && obj.len() == 1
+            {
+                // Only one field, and it's "image" (case-insensitive)
+                // Try to parse the nested image object
+                if let Some(image_obj) = value.as_object()
+                    && let Some(image) = LanguageModelImage::from_json(image_obj)
+                {
+                    return Ok(Self::Image(image));
                 }
             }
 
             // Try as direct Image (object with "source" and "size" fields)
-            if let Some(image) = LanguageModelImage::from_json(&obj) {
+            if let Some(image) = LanguageModelImage::from_json(obj) {
                 return Ok(Self::Image(image));
             }
         }
@@ -271,7 +273,7 @@ impl<'de> Deserialize<'de> for LanguageModelToolResultContent {
 impl LanguageModelToolResultContent {
     pub fn to_str(&self) -> Option<&str> {
         match self {
-            Self::Text(text) => Some(&text),
+            Self::Text(text) => Some(text),
             Self::Image(_) => None,
         }
     }
@@ -293,6 +295,12 @@ impl From<&str> for LanguageModelToolResultContent {
 impl From<String> for LanguageModelToolResultContent {
     fn from(value: String) -> Self {
         Self::Text(Arc::from(value))
+    }
+}
+
+impl From<LanguageModelImage> for LanguageModelToolResultContent {
+    fn from(image: LanguageModelImage) -> Self {
+        Self::Image(image)
     }
 }
 
@@ -391,6 +399,7 @@ pub struct LanguageModelRequest {
     pub tool_choice: Option<LanguageModelToolChoice>,
     pub stop: Vec<String>,
     pub temperature: Option<f32>,
+    pub thinking_allowed: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]

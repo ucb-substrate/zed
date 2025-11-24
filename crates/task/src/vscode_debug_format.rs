@@ -6,13 +6,6 @@ use crate::{
     DebugScenario, DebugTaskFile, EnvVariableReplacer, TcpArgumentsTemplate, VariableName,
 };
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-enum Request {
-    Launch,
-    Attach,
-}
-
 // TODO support preLaunchTask linkage with other tasks
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -30,12 +23,12 @@ impl VsCodeDebugTaskDefinition {
         let label = replacer.replace(&self.name);
         let mut config = replacer.replace_value(self.other_attributes);
         let adapter = task_type_to_adapter_name(&self.r#type);
-        if let Some(config) = config.as_object_mut() {
-            if adapter == "JavaScript" {
-                config.insert("type".to_owned(), self.r#type.clone().into());
-                if let Some(port) = self.port.take() {
-                    config.insert("port".to_owned(), port.into());
-                }
+        if let Some(config) = config.as_object_mut()
+            && adapter == "JavaScript"
+        {
+            config.insert("type".to_owned(), self.r#type.clone().into());
+            if let Some(port) = self.port.take() {
+                config.insert("port".to_owned(), port.into());
             }
         }
         let definition = DebugScenario {
@@ -75,7 +68,11 @@ impl TryFrom<VsCodeDebugTaskFile> for DebugTaskFile {
                 VariableName::RelativeFile.to_string(),
             ),
             ("file".to_owned(), VariableName::File.to_string()),
-        ]));
+        ]))
+        .with_commands([(
+            "pickMyProcess".to_owned(),
+            VariableName::PickProcessId.to_string(),
+        )]);
         let templates = file
             .configurations
             .into_iter()
@@ -90,10 +87,10 @@ fn task_type_to_adapter_name(task_type: &str) -> String {
         "pwa-node" | "node" | "node-terminal" | "chrome" | "pwa-chrome" | "edge" | "pwa-edge"
         | "msedge" | "pwa-msedge" => "JavaScript",
         "go" => "Delve",
-        "php" => "PHP",
+        "php" => "Xdebug",
         "cppdbg" | "lldb" => "CodeLLDB",
         "debugpy" => "Debugpy",
-        "rdbg" => "Ruby",
+        "rdbg" => "rdbg",
         _ => task_type,
     }
     .to_owned()
@@ -103,7 +100,7 @@ fn task_type_to_adapter_name(task_type: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use crate::{DebugScenario, DebugTaskFile};
+    use crate::{DebugScenario, DebugTaskFile, VariableName};
 
     use super::VsCodeDebugTaskFile;
 
@@ -131,7 +128,7 @@ mod tests {
             }
         "#;
         let parsed: VsCodeDebugTaskFile =
-            serde_json_lenient::from_str(&raw).expect("deserializing launch.json");
+            serde_json_lenient::from_str(raw).expect("deserializing launch.json");
         let zed = DebugTaskFile::try_from(parsed).expect("converting to Zed debug templates");
         pretty_assertions::assert_eq!(
             zed,
@@ -153,6 +150,41 @@ mod tests {
                     },
                     "type": "node",
                     "port": 17,
+                }),
+                tcp_connection: None,
+                build: None
+            }])
+        );
+    }
+
+    #[test]
+    fn test_command_pickmyprocess_replacement() {
+        let raw = r#"
+            {
+                "version": "0.2.0",
+                "configurations": [
+                    {
+                        "name": "Attach to Process",
+                        "request": "attach",
+                        "type": "cppdbg",
+                        "processId": "${command:pickMyProcess}"
+                    }
+                ]
+            }
+        "#;
+        let parsed: VsCodeDebugTaskFile =
+            serde_json_lenient::from_str(raw).expect("deserializing launch.json");
+        let zed = DebugTaskFile::try_from(parsed).expect("converting to Zed debug templates");
+
+        let expected_placeholder = format!("${{{}}}", VariableName::PickProcessId);
+        pretty_assertions::assert_eq!(
+            zed,
+            DebugTaskFile(vec![DebugScenario {
+                label: "Attach to Process".into(),
+                adapter: "CodeLLDB".into(),
+                config: json!({
+                    "request": "attach",
+                    "processId": expected_placeholder,
                 }),
                 tcp_connection: None,
                 build: None

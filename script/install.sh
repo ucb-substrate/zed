@@ -9,7 +9,12 @@ main() {
     platform="$(uname -s)"
     arch="$(uname -m)"
     channel="${ZED_CHANNEL:-stable}"
-    temp="$(mktemp -d "/tmp/zed-XXXXXX")"
+    # Use TMPDIR if available (for environments with non-standard temp directories)
+    if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then
+        temp="$(mktemp -d "$TMPDIR/zed-XXXXXX")"
+    else
+        temp="$(mktemp -d "/tmp/zed-XXXXXX")"
+    fi
 
     if [ "$platform" = "Darwin" ]; then
         platform="macos"
@@ -77,7 +82,7 @@ linux() {
         cp "$ZED_BUNDLE_PATH" "$temp/zed-linux-$arch.tar.gz"
     else
         echo "Downloading Zed"
-        curl "https://zed.dev/api/releases/$channel/latest/zed-linux-$arch.tar.gz" > "$temp/zed-linux-$arch.tar.gz"
+        curl "https://cloud.zed.dev/releases/$channel/latest/download?asset=zed&arch=$arch&os=linux&source=install.sh" > "$temp/zed-linux-$arch.tar.gz"
     fi
 
     suffix=""
@@ -130,7 +135,7 @@ linux() {
 
 macos() {
     echo "Downloading Zed"
-    curl "https://zed.dev/api/releases/$channel/latest/Zed-$arch.dmg" > "$temp/Zed-$arch.dmg"
+    curl "https://cloud.zed.dev/releases/$channel/latest/download?asset=zed&os=macos&arch=$arch&source=install.sh" > "$temp/Zed-$arch.dmg"
     hdiutil attach -quiet "$temp/Zed-$arch.dmg" -mountpoint "$temp/mount"
     app="$(cd "$temp/mount/"; echo *.app)"
     echo "Installing $app"

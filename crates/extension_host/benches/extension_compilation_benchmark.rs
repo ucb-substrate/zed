@@ -8,7 +8,7 @@ use extension::{
 };
 use extension_host::wasm_host::WasmHost;
 use fs::RealFs;
-use gpui::{SemanticVersion, TestAppContext, TestDispatcher};
+use gpui::{TestAppContext, TestDispatcher};
 use http_client::{FakeHttpClient, Response};
 use node_runtime::NodeRuntime;
 use rand::{SeedableRng, rngs::StdRng};
@@ -19,6 +19,7 @@ use util::test::TempTree;
 
 fn extension_benchmarks(c: &mut Criterion) {
     let cx = init();
+    cx.update(gpui_tokio::init);
 
     let mut group = c.benchmark_group("load");
 
@@ -37,7 +38,7 @@ fn extension_benchmarks(c: &mut Criterion) {
             |wasm_bytes| {
                 let _extension = cx
                     .executor()
-                    .block(wasm_host.load_extension(wasm_bytes, &manifest, cx.executor()))
+                    .block(wasm_host.load_extension(wasm_bytes, &manifest, &cx.to_async()))
                     .unwrap();
             },
             BatchSize::SmallInput,
@@ -53,7 +54,7 @@ fn init() -> TestAppContext {
     cx.update(|cx| {
         let store = SettingsStore::test(cx);
         cx.set_global(store);
-        release_channel::init(SemanticVersion::default(), cx);
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
     });
 
     cx
@@ -123,7 +124,7 @@ fn manifest() -> ExtensionManifest {
         icon_themes: Vec::new(),
         lib: LibManifestEntry {
             kind: Some(ExtensionLibraryKind::Rust),
-            version: Some(SemanticVersion::new(0, 1, 0)),
+            version: Some(semver::Version::new(0, 1, 0)),
         },
         languages: Vec::new(),
         grammars: BTreeMap::default(),
@@ -131,13 +132,15 @@ fn manifest() -> ExtensionManifest {
             .into_iter()
             .collect(),
         context_servers: BTreeMap::default(),
+        agent_servers: BTreeMap::default(),
         slash_commands: BTreeMap::default(),
-        indexed_docs_providers: BTreeMap::default(),
         snippets: None,
-        capabilities: vec![ExtensionCapability::ProcessExec {
-            command: "echo".into(),
-            args: vec!["hello!".into()],
-        }],
+        capabilities: vec![ExtensionCapability::ProcessExec(
+            extension::ProcessExecCapability {
+                command: "echo".into(),
+                args: vec!["hello!".into()],
+            },
+        )],
         debug_adapters: Default::default(),
         debug_locators: Default::default(),
     }

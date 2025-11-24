@@ -48,13 +48,23 @@ There are several third-party Zed packages for various Linux distributions and p
 - Manjaro: [`zed`](https://packages.manjaro.org/?query=zed)
 - ALT Linux (Sisyphus): [`zed`](https://packages.altlinux.org/en/sisyphus/srpms/zed/)
 - AOSC OS: [`zed`](https://packages.aosc.io/packages/zed)
-- openSUSE Tumbleweed: [`zed`](https://en.opensuse.org/Zed)
 
 See [Repology](https://repology.org/project/zed-editor/versions) for a list of Zed packages in various repositories.
+
+### Community
 
 When installing a third-party package please be aware that it may not be completely up to date and may be slightly different from the Zed we package (a common change is to rename the binary to `zedit` or `zeditor` to avoid conflicting with other packages).
 
 We'd love your help making Zed available for everyone. If Zed is not yet available for your package manager, and you would like to fix that, we have some notes on [how to do it](./development/linux.md#notes-for-packaging-zed).
+
+The packages in this section provide binary installs for Zed but are not official packages within the associated distributions. These packages are maintained by community members and as such a higher level of caution should be taken when installing them.
+
+#### Debian
+
+Zed is available in [this community-maintained repository](https://debian.griffo.io/).
+
+Instructions for each version are available in the README of the repository where packages are built.
+Build, packaging and instructions for each version are available in the README of the [repository](https://github.com/dariogriffo/zed-debian)
 
 ### Downloading manually
 
@@ -62,9 +72,10 @@ If you'd prefer, you can install Zed by downloading our pre-built .tar.gz. This 
 
 Download the `.tar.gz` file:
 
-- [zed-linux-x86_64.tar.gz](https://zed.dev/api/releases/stable/latest/zed-linux-x86_64.tar.gz) ([preview](https://zed.dev/api/releases/preview/latest/zed-linux-x86_64.tar.gz))
-- [zed-linux-aarch64.tar.gz](https://zed.dev/api/releases/stable/latest/zed-linux-aarch64.tar.gz)
-  ([preview](https://zed.dev/api/releases/preview/latest/zed-linux-aarch64.tar.gz))
+- [zed-linux-x86_64.tar.gz](https://cloud.zed.dev/releases/stable/latest/download?asset=zed&arch=x86_64&os=linux&source=docs)
+  ([preview](https://cloud.zed.dev/releases/preview/latest/download?asset=zed&arch=x86_64&os=linux&source=docs))
+- [zed-linux-aarch64.tar.gz](https://cloud.zed.dev/releases/stable/latest/download?asset=zed&arch=aarch64&os=linux&source=docs)
+  ([preview](https://cloud.zed.dev/releases/preview/latest/download?asset=zed&arch=aarch64&os=linux&source=docs))
 
 Then ensure that the `zed` binary in the tarball is on your path. The easiest way is to unpack the tarball and create a symlink:
 
@@ -138,7 +149,7 @@ vkcube
 
 > **_Note_**: Try running in both X11 and wayland modes by running `vkcube -m [x11|wayland]`. Some versions of `vkcube` use `vkcube` to run in X11 and `vkcube-wayland` to run in wayland.
 
-This should output a line describing your current graphics setup and show a rotating cube. If this does not work, you should be able to fix it by installing Vulkan compatible GPU drivers, however in some cases (for example running Linux on an Arm-based MacBook) there is no Vulkan support yet.
+This should output a line describing your current graphics setup and show a rotating cube. If this does not work, you should be able to fix it by installing Vulkan compatible GPU drivers, however in some cases there is no Vulkan support yet.
 
 You can find out which graphics card Zed is using by looking in the Zed log (`~/.local/share/zed/logs/Zed.log`) for `Using GPU: ...`.
 
@@ -152,7 +163,7 @@ If you're using an AMD GPU and Zed crashes when selecting long lines, try settin
 
 If you're using an AMD GPU, you might get a 'Broken Pipe' error. Try using the RADV or Mesa drivers. (See [#13880](https://github.com/zed-industries/zed/issues/13880))
 
-If you are using `amdvlk` you may find that zed only opens when run with `sudo $(which zed)`. To fix this, remove the `amdvlk` and `lib32-amdvlk` packages and install mesa/vulkan instead. ([#14141](https://github.com/zed-industries/zed/issues/14141)).
+If you are using `amdvlk`, the default open-source AMD graphics driver, you may find that Zed consistently fails to launch. This is a known issue for some users, for example on Omarchy (see issue [#28851](https://github.com/zed-industries/zed/issues/28851)). To fix this, you will need to use a different driver. We recommend removing the `amdvlk` and `lib32-amdvlk` packages and installing `vulkan-radeon` instead (see issue [#14141](https://github.com/zed-industries/zed/issues/14141)).
 
 For more information, the [Arch guide to Vulkan](https://wiki.archlinux.org/title/Vulkan) has some good steps that translate well to most distributions.
 
@@ -180,7 +191,7 @@ Make sure to export the variable if you choose to define it globally in a `.bash
 
 ##### Option B
 
-If you are using Mesa, you can run `MESA_VK_DEVICE_SELECT=list zed --foreground` to get a list of available GPUs and then export `MESA_VK_DEVICE_SELECT=xxxx:yyyy` to choose a specific device.
+If you are using Mesa, you can run `MESA_VK_DEVICE_SELECT=list zed --foreground` to get a list of available GPUs and then export `MESA_VK_DEVICE_SELECT=xxxx:yyyy` to choose a specific device. Furthermore, you can fallback to xwayland with an additional export of `WAYLAND_DISPLAY=""`.
 
 ##### Option C
 
@@ -294,3 +305,90 @@ If your system uses PipeWire:
    ```
 
 3. **Restart your system**
+
+### Forcing X11 scale factor
+
+On X11 systems, Zed automatically detects the appropriate scale factor for high-DPI displays. The scale factor is determined using the following priority order:
+
+1. `GPUI_X11_SCALE_FACTOR` environment variable (if set)
+2. `Xft.dpi` from X resources database (xrdb)
+3. Automatic detection via RandR based on monitor resolution and physical size
+
+If you want to customize the scale factor beyond what Zed detects automatically, you have several options:
+
+#### Check your current scale factor
+
+You can verify if you have `Xft.dpi` set:
+
+```sh
+xrdb -query | grep Xft.dpi
+```
+
+If this command returns no output, Zed is using RandR (X11's monitor management extension) to automatically calculate the scale factor based on your monitor's reported resolution and physical dimensions.
+
+#### Option 1: Set Xft.dpi (X Resources Database)
+
+`Xft.dpi` is a standard X11 setting that many applications use for consistent font and UI scaling. Setting this ensures Zed scales the same way as other X11 applications that respect this setting.
+
+Edit or create the `~/.Xresources` file:
+
+```sh
+vim ~/.Xresources
+```
+
+Add this line with your desired DPI:
+
+```sh
+Xft.dpi: 96
+```
+
+Common DPI values:
+
+- `96` for standard 1x scaling
+- `144` for 1.5x scaling
+- `192` for 2x scaling
+- `288` for 3x scaling
+
+Load the configuration:
+
+```sh
+xrdb -merge ~/.Xresources
+```
+
+Restart Zed for the changes to take effect.
+
+#### Option 2: Use the GPUI_X11_SCALE_FACTOR environment variable
+
+This Zed-specific environment variable directly sets the scale factor, bypassing all automatic detection.
+
+```sh
+GPUI_X11_SCALE_FACTOR=1.5 zed
+```
+
+You can use decimal values (e.g., `1.25`, `1.5`, `2.0`) or set `GPUI_X11_SCALE_FACTOR=randr` to force RandR-based detection even when `Xft.dpi` is set.
+
+To make this permanent, add it to your shell profile or desktop entry.
+
+#### Option 3: Adjust system-wide RandR DPI
+
+This changes the reported DPI for your entire X11 session, affecting how RandR calculates scaling for all applications that use it.
+
+Add this to your `.xprofile` or `.xinitrc`:
+
+```sh
+xrandr --dpi 192
+```
+
+Replace `192` with your desired DPI value. This affects the system globally and will be used by Zed's automatic RandR detection when `Xft.dpi` is not set.
+
+### Font rendering parameters
+
+When using Blade rendering (Linux platforms and self-compiled builds with the Blade renderer enabled), Zed reads `ZED_FONTS_GAMMA` and `ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST` environment variables for the values to use for font rendering.
+
+`ZED_FONTS_GAMMA` corresponds to [getgamma](https://learn.microsoft.com/en-us/windows/win32/api/dwrite/nf-dwrite-idwriterenderingparams-getgamma) values.
+Allowed range [1.0, 2.2], other values are clipped.
+Default: 1.8
+
+`ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST` corresponds to [getgrayscaleenhancedcontrast](https://learn.microsoft.com/en-us/windows/win32/api/dwrite_1/nf-dwrite_1-idwriterenderingparams1-getgrayscaleenhancedcontrast) values.
+Allowed range: [0.0, ..), other values are clipped.
+Default: 1.0

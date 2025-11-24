@@ -8,10 +8,9 @@ use gpui::{AnyElement, Hsla, ImageSource, Img, IntoElement, Styled, img};
 /// # Examples
 ///
 /// ```
-/// use ui::{Avatar, AvatarShape};
+/// use ui::Avatar;
 ///
 /// Avatar::new("path/to/image.png")
-///     .shape(AvatarShape::Circle)
 ///     .grayscale(true)
 ///     .border_color(gpui::red());
 /// ```
@@ -39,7 +38,7 @@ impl Avatar {
     /// # Examples
     ///
     /// ```
-    /// use ui::{Avatar, AvatarShape};
+    /// use ui::Avatar;
     ///
     /// let avatar = Avatar::new("path/to/image.png").grayscale(true);
     /// ```
@@ -92,7 +91,12 @@ impl RenderOnce for Avatar {
                 self.image
                     .size(image_size)
                     .rounded_full()
-                    .bg(cx.theme().colors().ghost_element_background),
+                    .bg(cx.theme().colors().ghost_element_background)
+                    .with_fallback(|| {
+                        Icon::new(IconName::Person)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    }),
             )
             .children(self.indicator.map(|indicator| div().child(indicator)))
     }

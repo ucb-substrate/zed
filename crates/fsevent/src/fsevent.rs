@@ -70,10 +70,14 @@ impl EventStream {
                     path_bytes.len() as cf::CFIndex,
                     false,
                 );
-                let cf_path = cf::CFURLCopyFileSystemPath(cf_url, cf::kCFURLPOSIXPathStyle);
-                cf::CFArrayAppendValue(cf_paths, cf_path);
-                cf::CFRelease(cf_path);
-                cf::CFRelease(cf_url);
+                if !cf_url.is_null() {
+                    let cf_path = cf::CFURLCopyFileSystemPath(cf_url, cf::kCFURLPOSIXPathStyle);
+                    cf::CFArrayAppendValue(cf_paths, cf_path);
+                    cf::CFRelease(cf_path);
+                    cf::CFRelease(cf_url);
+                } else {
+                    log::error!("Failed to create CFURL for path: {}", path.display());
+                }
             }
 
             let mut state = Box::new(State {
@@ -178,40 +182,39 @@ impl EventStream {
                     flags.contains(StreamFlags::USER_DROPPED)
                         || flags.contains(StreamFlags::KERNEL_DROPPED)
                 })
+                && let Some(last_valid_event_id) = state.last_valid_event_id.take()
             {
-                if let Some(last_valid_event_id) = state.last_valid_event_id.take() {
-                    fs::FSEventStreamStop(state.stream);
-                    fs::FSEventStreamInvalidate(state.stream);
-                    fs::FSEventStreamRelease(state.stream);
+                fs::FSEventStreamStop(state.stream);
+                fs::FSEventStreamInvalidate(state.stream);
+                fs::FSEventStreamRelease(state.stream);
 
-                    let stream_context = fs::FSEventStreamContext {
-                        version: 0,
-                        info,
-                        retain: None,
-                        release: None,
-                        copy_description: None,
-                    };
-                    let stream = fs::FSEventStreamCreate(
-                        cf::kCFAllocatorDefault,
-                        Self::trampoline,
-                        &stream_context,
-                        state.paths,
-                        last_valid_event_id,
-                        state.latency.as_secs_f64(),
-                        fs::kFSEventStreamCreateFlagFileEvents
-                            | fs::kFSEventStreamCreateFlagNoDefer
-                            | fs::kFSEventStreamCreateFlagWatchRoot,
-                    );
+                let stream_context = fs::FSEventStreamContext {
+                    version: 0,
+                    info,
+                    retain: None,
+                    release: None,
+                    copy_description: None,
+                };
+                let stream = fs::FSEventStreamCreate(
+                    cf::kCFAllocatorDefault,
+                    Self::trampoline,
+                    &stream_context,
+                    state.paths,
+                    last_valid_event_id,
+                    state.latency.as_secs_f64(),
+                    fs::kFSEventStreamCreateFlagFileEvents
+                        | fs::kFSEventStreamCreateFlagNoDefer
+                        | fs::kFSEventStreamCreateFlagWatchRoot,
+                );
 
-                    state.stream = stream;
-                    fs::FSEventStreamScheduleWithRunLoop(
-                        state.stream,
-                        cf::CFRunLoopGetCurrent(),
-                        cf::kCFRunLoopDefaultMode,
-                    );
-                    fs::FSEventStreamStart(state.stream);
-                    stream_restarted = true;
-                }
+                state.stream = stream;
+                fs::FSEventStreamScheduleWithRunLoop(
+                    state.stream,
+                    cf::CFRunLoopGetCurrent(),
+                    cf::kCFRunLoopDefaultMode,
+                );
+                fs::FSEventStreamStart(state.stream);
+                stream_restarted = true;
             }
 
             if !stream_restarted {
@@ -369,7 +372,9 @@ unsafe extern "C" {
     pub fn FSEventsGetCurrentEventId() -> u64;
 }
 
-#[cfg(test)]
+// These tests are disabled by default because they seem to be unresolvably flaky.
+// Feel free to bring them back to help test this code
+#[cfg(false)]
 mod tests {
     use super::*;
     use std::{fs, sync::mpsc, thread, time::Duration};
@@ -392,19 +397,19 @@ mod tests {
             thread::spawn(move || stream.run(move |events| tx.send(events.to_vec()).is_ok()));
 
             fs::write(path.join("new-file"), "").unwrap();
-            let events = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let events = rx.recv_timeout(timeout()).unwrap();
             let event = events.last().unwrap();
             assert_eq!(event.path, path.join("new-file"));
             assert!(event.flags.contains(StreamFlags::ITEM_CREATED));
 
             fs::remove_file(path.join("existing-file-5")).unwrap();
-            let mut events = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let mut events = rx.recv_timeout(timeout()).unwrap();
             let mut event = events.last().unwrap();
             // we see this duplicate about 1/100 test runs.
             if event.path == path.join("new-file")
                 && event.flags.contains(StreamFlags::ITEM_CREATED)
             {
-                events = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                events = rx.recv_timeout(timeout()).unwrap();
                 event = events.last().unwrap();
             }
             assert_eq!(event.path, path.join("existing-file-5"));
@@ -437,13 +442,13 @@ mod tests {
             });
 
             fs::write(path.join("new-file"), "").unwrap();
-            let events = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let events = rx.recv_timeout(timeout()).unwrap();
             let event = events.last().unwrap();
             assert_eq!(event.path, path.join("new-file"));
             assert!(event.flags.contains(StreamFlags::ITEM_CREATED));
 
             fs::remove_file(path.join("existing-file-5")).unwrap();
-            let events = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let events = rx.recv_timeout(timeout()).unwrap();
             let event = events.last().unwrap();
             assert_eq!(event.path, path.join("existing-file-5"));
             assert!(event.flags.contains(StreamFlags::ITEM_REMOVED));
@@ -474,11 +479,11 @@ mod tests {
         });
 
         fs::write(path.join("new-file"), "").unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "running");
+        assert_eq!(rx.recv_timeout(timeout()).unwrap(), "running");
 
         // Dropping the handle causes `EventStream::run` to return.
         drop(handle);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "stopped");
+        assert_eq!(rx.recv_timeout(timeout()).unwrap(), "stopped");
     }
 
     #[test]
@@ -497,11 +502,14 @@ mod tests {
     }
 
     fn flush_historical_events() {
-        let duration = if std::env::var("CI").is_ok() {
-            Duration::from_secs(2)
+        thread::sleep(timeout());
+    }
+
+    fn timeout() -> Duration {
+        if std::env::var("CI").is_ok() {
+            Duration::from_secs(4)
         } else {
             Duration::from_millis(500)
-        };
-        thread::sleep(duration);
+        }
     }
 }

@@ -1,9 +1,9 @@
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use collections::{BTreeMap, HashMap};
 use fs::Fs;
 use language::LanguageName;
 use lsp::LanguageServerName;
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+use crate::ExtensionCapability;
 
 /// This is the old version of the extension manifest, from when it was `extension.json`.
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
@@ -80,9 +82,9 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub context_servers: BTreeMap<Arc<str>, ContextServerManifestEntry>,
     #[serde(default)]
-    pub slash_commands: BTreeMap<Arc<str>, SlashCommandManifestEntry>,
+    pub agent_servers: BTreeMap<Arc<str>, AgentServerManifestEntry>,
     #[serde(default)]
-    pub indexed_docs_providers: BTreeMap<Arc<str>, IndexedDocsProviderEntry>,
+    pub slash_commands: BTreeMap<Arc<str>, SlashCommandManifestEntry>,
     #[serde(default)]
     pub snippets: Option<PathBuf>,
     #[serde(default)]
@@ -100,24 +102,8 @@ impl ExtensionManifest {
         desired_args: &[impl AsRef<str> + std::fmt::Debug],
     ) -> Result<()> {
         let is_allowed = self.capabilities.iter().any(|capability| match capability {
-            ExtensionCapability::ProcessExec { command, args } if command == desired_command => {
-                for (ix, arg) in args.iter().enumerate() {
-                    if arg == "**" {
-                        return true;
-                    }
-
-                    if ix >= desired_args.len() {
-                        return false;
-                    }
-
-                    if arg != "*" && arg != desired_args[ix].as_ref() {
-                        return false;
-                    }
-                }
-                if args.len() < desired_args.len() {
-                    return false;
-                }
-                true
+            ExtensionCapability::ProcessExec(capability) => {
+                capability.allows(desired_command, desired_args)
             }
             _ => false,
         });
@@ -130,26 +116,113 @@ impl ExtensionManifest {
 
         Ok(())
     }
+
+    pub fn allow_remote_load(&self) -> bool {
+        !self.language_servers.is_empty()
+            || !self.debug_adapters.is_empty()
+            || !self.debug_locators.is_empty()
+    }
 }
 
-/// A capability for an extension.
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum ExtensionCapability {
-    #[serde(rename = "process:exec")]
-    ProcessExec {
-        /// The command to execute.
-        command: String,
-        /// The arguments to pass to the command. Use `*` for a single wildcard argument.
-        /// If the last element is `**`, then any trailing arguments are allowed.
-        args: Vec<String>,
-    },
+pub fn build_debug_adapter_schema_path(
+    adapter_name: &Arc<str>,
+    meta: &DebugAdapterManifestEntry,
+) -> PathBuf {
+    meta.schema_path.clone().unwrap_or_else(|| {
+        Path::new("debug_adapter_schemas")
+            .join(Path::new(adapter_name.as_ref()).with_extension("json"))
+    })
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct LibManifestEntry {
     pub kind: Option<ExtensionLibraryKind>,
-    pub version: Option<SemanticVersion>,
+    pub version: Option<Version>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct AgentServerManifestEntry {
+    /// Display name for the agent (shown in menus).
+    pub name: String,
+    /// Environment variables to set when launching the agent server.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional icon path (relative to extension root, e.g., "ai.svg").
+    /// Should be a small SVG icon for display in menus.
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// Per-target configuration for archive-based installation.
+    /// The key format is "{os}-{arch}" where:
+    /// - os: "darwin" (macOS), "linux", "windows"
+    /// - arch: "aarch64" (arm64), "x86_64"
+    ///
+    /// Example:
+    /// ```toml
+    /// [agent_servers.myagent.targets.darwin-aarch64]
+    /// archive = "https://example.com/myagent-darwin-arm64.zip"
+    /// cmd = "./myagent"
+    /// args = ["--serve"]
+    /// sha256 = "abc123..."  # optional
+    /// ```
+    ///
+    /// For Node.js-based agents, you can use "node" as the cmd to automatically
+    /// use Zed's managed Node.js runtime instead of relying on the user's PATH:
+    /// ```toml
+    /// [agent_servers.nodeagent.targets.darwin-aarch64]
+    /// archive = "https://example.com/nodeagent.zip"
+    /// cmd = "node"
+    /// args = ["index.js", "--port", "3000"]
+    /// ```
+    ///
+    /// Note: All commands are executed with the archive extraction directory as the
+    /// working directory, so relative paths in args (like "index.js") will resolve
+    /// relative to the extracted archive contents.
+    pub targets: HashMap<String, TargetConfig>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct TargetConfig {
+    /// URL to download the archive from (e.g., "https://github.com/owner/repo/releases/download/v1.0.0/myagent-darwin-arm64.zip")
+    pub archive: String,
+    /// Command to run (e.g., "./myagent" or "./myagent.exe")
+    pub cmd: String,
+    /// Command-line arguments to pass to the agent server.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Optional SHA-256 hash of the archive for verification.
+    /// If not provided and the URL is a GitHub release, we'll attempt to fetch it from GitHub.
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// Environment variables to set when launching the agent server.
+    /// These target-specific env vars will override any env vars set at the agent level.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+}
+
+impl TargetConfig {
+    pub fn from_proto(proto: proto::ExternalExtensionAgentTarget) -> Self {
+        Self {
+            archive: proto.archive,
+            cmd: proto.cmd,
+            args: proto.args,
+            sha256: proto.sha256,
+            env: proto.env.into_iter().collect(),
+        }
+    }
+
+    pub fn to_proto(&self) -> proto::ExternalExtensionAgentTarget {
+        proto::ExternalExtensionAgentTarget {
+            archive: self.archive.clone(),
+            cmd: self.cmd.clone(),
+            args: self.args.clone(),
+            sha256: self.sha256.clone(),
+            env: self
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
@@ -175,7 +248,7 @@ pub struct LanguageServerManifestEntry {
     #[serde(default)]
     languages: Vec<LanguageName>,
     #[serde(default)]
-    pub language_ids: HashMap<String, String>,
+    pub language_ids: HashMap<LanguageName, String>,
     #[serde(default)]
     pub code_action_kinds: Option<Vec<lsp::CodeActionKind>>,
 }
@@ -208,9 +281,6 @@ pub struct SlashCommandManifestEntry {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
-pub struct IndexedDocsProviderEntry {}
-
-#[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct DebugAdapterManifestEntry {
     pub schema_path: Option<PathBuf>,
 }
@@ -225,26 +295,26 @@ impl ExtensionManifest {
             .and_then(OsStr::to_str)
             .context("invalid extension name")?;
 
-        let mut extension_manifest_path = extension_dir.join("extension.json");
+        let extension_manifest_path = extension_dir.join("extension.toml");
         if fs.is_file(&extension_manifest_path).await {
-            let manifest_content = fs
-                .load(&extension_manifest_path)
-                .await
-                .with_context(|| format!("failed to load {extension_name} extension.json"))?;
-            let manifest_json = serde_json::from_str::<OldExtensionManifest>(&manifest_content)
-                .with_context(|| {
-                    format!("invalid extension.json for extension {extension_name}")
-                })?;
+            let manifest_content = fs.load(&extension_manifest_path).await.with_context(|| {
+                format!("loading {extension_name} extension.toml, {extension_manifest_path:?}")
+            })?;
+            toml::from_str(&manifest_content).map_err(|err| {
+                anyhow!("Invalid extension.toml for extension {extension_name}:\n{err}")
+            })
+        } else if let extension_manifest_path = extension_manifest_path.with_extension("json")
+            && fs.is_file(&extension_manifest_path).await
+        {
+            let manifest_content = fs.load(&extension_manifest_path).await.with_context(|| {
+                format!("loading {extension_name} extension.json, {extension_manifest_path:?}")
+            })?;
 
-            Ok(manifest_from_old_manifest(manifest_json, extension_name))
+            serde_json::from_str::<OldExtensionManifest>(&manifest_content)
+                .with_context(|| format!("invalid extension.json for extension {extension_name}"))
+                .map(|manifest_json| manifest_from_old_manifest(manifest_json, extension_name))
         } else {
-            extension_manifest_path.set_extension("toml");
-            let manifest_content = fs
-                .load(&extension_manifest_path)
-                .await
-                .with_context(|| format!("failed to load {extension_name} extension.toml"))?;
-            toml::from_str(&manifest_content)
-                .with_context(|| format!("invalid extension.toml for extension {extension_name}"))
+            anyhow::bail!("No extension manifest found for extension {extension_name}")
         }
     }
 }
@@ -282,8 +352,8 @@ fn manifest_from_old_manifest(
             .collect(),
         language_servers: Default::default(),
         context_servers: BTreeMap::default(),
+        agent_servers: BTreeMap::default(),
         slash_commands: BTreeMap::default(),
-        indexed_docs_providers: BTreeMap::default(),
         snippets: None,
         capabilities: Vec::new(),
         debug_adapters: Default::default(),
@@ -293,6 +363,10 @@ fn manifest_from_old_manifest(
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::ProcessExecCapability;
+
     use super::*;
 
     fn extension_manifest() -> ExtensionManifest {
@@ -311,8 +385,8 @@ mod tests {
             grammars: BTreeMap::default(),
             language_servers: BTreeMap::default(),
             context_servers: BTreeMap::default(),
+            agent_servers: BTreeMap::default(),
             slash_commands: BTreeMap::default(),
-            indexed_docs_providers: BTreeMap::default(),
             snippets: None,
             capabilities: vec![],
             debug_adapters: Default::default(),
@@ -321,12 +395,35 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_exact_match() {
+    fn test_build_adapter_schema_path_with_schema_path() {
+        let adapter_name = Arc::from("my_adapter");
+        let entry = DebugAdapterManifestEntry {
+            schema_path: Some(PathBuf::from("foo/bar")),
+        };
+
+        let path = build_debug_adapter_schema_path(&adapter_name, &entry);
+        assert_eq!(path, PathBuf::from("foo/bar"));
+    }
+
+    #[test]
+    fn test_build_adapter_schema_path_without_schema_path() {
+        let adapter_name = Arc::from("my_adapter");
+        let entry = DebugAdapterManifestEntry { schema_path: None };
+
+        let path = build_debug_adapter_schema_path(&adapter_name, &entry);
+        assert_eq!(
+            path,
+            PathBuf::from("debug_adapter_schemas").join("my_adapter.json")
+        );
+    }
+
+    #[test]
+    fn test_allow_exec_exact_match() {
         let manifest = ExtensionManifest {
-            capabilities: vec![ExtensionCapability::ProcessExec {
+            capabilities: vec![ExtensionCapability::ProcessExec(ProcessExecCapability {
                 command: "ls".to_string(),
                 args: vec!["-la".to_string()],
-            }],
+            })],
             ..extension_manifest()
         };
 
@@ -336,12 +433,12 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_wildcard_arg() {
+    fn test_allow_exec_wildcard_arg() {
         let manifest = ExtensionManifest {
-            capabilities: vec![ExtensionCapability::ProcessExec {
+            capabilities: vec![ExtensionCapability::ProcessExec(ProcessExecCapability {
                 command: "git".to_string(),
                 args: vec!["*".to_string()],
-            }],
+            })],
             ..extension_manifest()
         };
 
@@ -352,12 +449,12 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_double_wildcard() {
+    fn test_allow_exec_double_wildcard() {
         let manifest = ExtensionManifest {
-            capabilities: vec![ExtensionCapability::ProcessExec {
+            capabilities: vec![ExtensionCapability::ProcessExec(ProcessExecCapability {
                 command: "cargo".to_string(),
                 args: vec!["test".to_string(), "**".to_string()],
-            }],
+            })],
             ..extension_manifest()
         };
 
@@ -372,12 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_mixed_wildcards() {
+    fn test_allow_exec_mixed_wildcards() {
         let manifest = ExtensionManifest {
-            capabilities: vec![ExtensionCapability::ProcessExec {
+            capabilities: vec![ExtensionCapability::ProcessExec(ProcessExecCapability {
                 command: "docker".to_string(),
                 args: vec!["run".to_string(), "*".to_string(), "**".to_string()],
-            }],
+            })],
             ..extension_manifest()
         };
 
@@ -394,5 +491,32 @@ mod tests {
                 .is_ok()
         );
         assert!(manifest.allow_exec("docker", &["ps"]).is_err()); // wrong first arg
+    }
+    #[test]
+    fn parse_manifest_with_agent_server_archive_launcher() {
+        let toml_src = r#"
+id = "example.agent-server-ext"
+name = "Agent Server Example"
+version = "1.0.0"
+schema_version = 0
+
+[agent_servers.foo]
+name = "Foo Agent"
+
+[agent_servers.foo.targets.linux-x86_64]
+archive = "https://example.com/agent-linux-x64.tar.gz"
+cmd = "./agent"
+args = ["--serve"]
+"#;
+
+        let manifest: ExtensionManifest = toml::from_str(toml_src).expect("manifest should parse");
+        assert_eq!(manifest.id.as_ref(), "example.agent-server-ext");
+        assert!(manifest.agent_servers.contains_key("foo"));
+        let entry = manifest.agent_servers.get("foo").unwrap();
+        assert!(entry.targets.contains_key("linux-x86_64"));
+        let target = entry.targets.get("linux-x86_64").unwrap();
+        assert_eq!(target.archive, "https://example.com/agent-linux-x64.tar.gz");
+        assert_eq!(target.cmd, "./agent");
+        assert_eq!(target.args, vec!["--serve"]);
     }
 }

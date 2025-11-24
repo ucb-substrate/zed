@@ -46,7 +46,7 @@ impl AlacModifiers {
 pub fn to_esc_str(
     keystroke: &Keystroke,
     mode: &TermMode,
-    alt_is_meta: bool,
+    option_as_meta: bool,
 ) -> Option<Cow<'static, str>> {
     let modifiers = AlacModifiers::new(keystroke);
 
@@ -56,7 +56,7 @@ pub fn to_esc_str(
         ("tab", AlacModifiers::None) => Some("\x09"),
         ("escape", AlacModifiers::None) => Some("\x1b"),
         ("enter", AlacModifiers::None) => Some("\x0d"),
-        ("enter", AlacModifiers::Shift) => Some("\x0d"),
+        ("enter", AlacModifiers::Shift) => Some("\x0a"),
         ("enter", AlacModifiers::Alt) => Some("\x1b\x0d"),
         ("backspace", AlacModifiers::None) => Some("\x7f"),
         //Interesting escape codes
@@ -218,7 +218,7 @@ pub fn to_esc_str(
         }
     }
 
-    if alt_is_meta {
+    if !cfg!(target_os = "macos") || option_as_meta {
         let is_alt_lowercase_ascii = modifiers == AlacModifiers::Alt && keystroke.key.is_ascii();
         let is_alt_uppercase_ascii =
             keystroke.modifiers.alt && keystroke.modifiers.shift && keystroke.key.is_ascii();
@@ -404,6 +404,22 @@ mod test {
                 format!("\x1b{}", key)
             );
         }
+    }
+
+    #[test]
+    fn test_shift_enter_newline() {
+        let shift_enter = Keystroke::parse("shift-enter").unwrap();
+        let regular_enter = Keystroke::parse("enter").unwrap();
+        let mode = TermMode::NONE;
+
+        // Shift-enter should send line feed (newline)
+        assert_eq!(to_esc_str(&shift_enter, &mode, false), Some("\x0a".into()));
+
+        // Regular enter should still send carriage return
+        assert_eq!(
+            to_esc_str(&regular_enter, &mode, false),
+            Some("\x0d".into())
+        );
     }
 
     #[test]

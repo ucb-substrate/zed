@@ -1,17 +1,14 @@
 use crate::{
     ModelUsageContext,
-    language_model_selector::{
-        LanguageModelSelector, ToggleModelSelector, language_model_selector,
-    },
+    language_model_selector::{LanguageModelSelector, language_model_selector},
 };
-use agent_settings::AgentSettings;
 use fs::Fs;
 use gpui::{Entity, FocusHandle, SharedString};
-use language_model::{ConfiguredModel, LanguageModelRegistry};
 use picker::popover_menu::PickerPopoverMenu;
 use settings::update_settings_file;
 use std::sync::Arc;
-use ui::{PopoverMenuHandle, Tooltip, prelude::*};
+use ui::{ButtonLike, PopoverMenuHandle, TintColor, Tooltip, prelude::*};
+use zed_actions::agent::ToggleModelSelector;
 
 pub struct AgentModelSelector {
     selector: Entity<LanguageModelSelector>,
@@ -28,6 +25,8 @@ impl AgentModelSelector {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle_clone = focus_handle.clone();
+
         Self {
             selector: cx.new(move |cx| {
                 let fs = fs.clone();
@@ -40,42 +39,18 @@ impl AgentModelSelector {
                         let provider = model.provider_id().0.to_string();
                         let model_id = model.id().0.to_string();
                         match &model_usage_context {
-                            ModelUsageContext::Thread(thread) => {
-                                thread.update(cx, |thread, cx| {
-                                    let registry = LanguageModelRegistry::read_global(cx);
-                                    if let Some(provider) = registry.provider(&model.provider_id())
-                                    {
-                                        thread.set_configured_model(
-                                            Some(ConfiguredModel {
-                                                provider,
-                                                model: model.clone(),
-                                            }),
-                                            cx,
-                                        );
-                                    }
-                                });
-                                update_settings_file::<AgentSettings>(
-                                    fs.clone(),
-                                    cx,
-                                    move |settings, _cx| {
-                                        settings.set_model(model.clone());
-                                    },
-                                );
-                            }
                             ModelUsageContext::InlineAssistant => {
-                                update_settings_file::<AgentSettings>(
-                                    fs.clone(),
-                                    cx,
-                                    move |settings, _cx| {
-                                        settings.set_inline_assistant_model(
-                                            provider.clone(),
-                                            model_id.clone(),
-                                        );
-                                    },
-                                );
+                                update_settings_file(fs.clone(), cx, move |settings, _cx| {
+                                    settings
+                                        .agent
+                                        .get_or_insert_default()
+                                        .set_inline_assistant_model(provider.clone(), model_id);
+                                });
                             }
                         }
                     },
+                    true, // Use popover styles for picker
+                    focus_handle_clone,
                     window,
                     cx,
                 )
@@ -94,33 +69,48 @@ impl Render for AgentModelSelector {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.selector.read(cx).delegate.active_model(cx);
         let model_name = model
+            .as_ref()
             .map(|model| model.model.name().0)
-            .unwrap_or_else(|| SharedString::from("No model selected"));
+            .unwrap_or_else(|| SharedString::from("Select a Model"));
+
+        let provider_icon = model.as_ref().map(|model| model.provider.icon());
+        let color = if self.menu_handle.is_deployed() {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
 
         let focus_handle = self.focus_handle.clone();
 
         PickerPopoverMenu::new(
             self.selector.clone(),
-            Button::new("active-model", model_name)
-                .label_size(LabelSize::Small)
-                .color(Color::Muted)
-                .icon(IconName::ChevronDown)
-                .icon_size(IconSize::XSmall)
-                .icon_position(IconPosition::End)
-                .icon_color(Color::Muted),
-            move |window, cx| {
-                Tooltip::for_action_in(
-                    "Change Model",
-                    &ToggleModelSelector,
-                    &focus_handle,
-                    window,
-                    cx,
+            ButtonLike::new("active-model")
+                .when_some(provider_icon, |this, icon| {
+                    this.child(Icon::new(icon).color(color).size(IconSize::XSmall))
+                })
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .child(
+                    Label::new(model_name)
+                        .color(color)
+                        .size(LabelSize::Small)
+                        .ml_0p5(),
                 )
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .color(color)
+                        .size(IconSize::XSmall),
+                ),
+            move |_window, cx| {
+                Tooltip::for_action_in("Change Model", &ToggleModelSelector, &focus_handle, cx)
             },
-            gpui::Corner::BottomRight,
+            gpui::Corner::TopRight,
             cx,
         )
         .with_handle(self.menu_handle.clone())
+        .offset(gpui::Point {
+            x: px(0.0),
+            y: px(2.0),
+        })
         .render(window, cx)
     }
 }

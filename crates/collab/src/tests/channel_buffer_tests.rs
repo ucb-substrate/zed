@@ -7,12 +7,13 @@ use channel::ACKNOWLEDGE_DEBOUNCE_INTERVAL;
 use client::{Collaborator, ParticipantIndex, UserId};
 use collab_ui::channel_view::ChannelView;
 use collections::HashMap;
-use editor::{Anchor, Editor, ToOffset};
+use editor::{Anchor, Editor, MultiBufferOffset, ToOffset};
 use futures::future;
 use gpui::{BackgroundExecutor, Context, Entity, TestAppContext, Window};
 use rpc::{RECEIVE_TIMEOUT, proto::PeerId};
 use serde_json::json;
 use std::ops::Range;
+use util::rel_path::rel_path;
 use workspace::CollaboratorId;
 
 #[gpui::test]
@@ -178,8 +179,8 @@ async fn test_channel_notes_participant_indices(
     channel_view_a.update_in(cx_a, |notes, window, cx| {
         notes.editor.update(cx, |editor, cx| {
             editor.insert("a", window, cx);
-            editor.change_selections(None, window, cx, |selections| {
-                selections.select_ranges(vec![0..1]);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges(vec![MultiBufferOffset(0)..MultiBufferOffset(1)]);
             });
         });
     });
@@ -188,8 +189,8 @@ async fn test_channel_notes_participant_indices(
         notes.editor.update(cx, |editor, cx| {
             editor.move_down(&Default::default(), window, cx);
             editor.insert("b", window, cx);
-            editor.change_selections(None, window, cx, |selections| {
-                selections.select_ranges(vec![1..2]);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges(vec![MultiBufferOffset(1)..MultiBufferOffset(2)]);
             });
         });
     });
@@ -198,8 +199,8 @@ async fn test_channel_notes_participant_indices(
         notes.editor.update(cx, |editor, cx| {
             editor.move_down(&Default::default(), window, cx);
             editor.insert("c", window, cx);
-            editor.change_selections(None, window, cx, |selections| {
-                selections.select_ranges(vec![2..3]);
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges(vec![MultiBufferOffset(2)..MultiBufferOffset(3)]);
             });
         });
     });
@@ -256,7 +257,13 @@ async fn test_channel_notes_participant_indices(
     executor.start_waiting();
     let editor_a = workspace_a
         .update_in(cx_a, |workspace, window, cx| {
-            workspace.open_path((worktree_id_a, "file.txt"), None, true, window, cx)
+            workspace.open_path(
+                (worktree_id_a, rel_path("file.txt")),
+                None,
+                true,
+                window,
+                cx,
+            )
         })
         .await
         .unwrap()
@@ -265,7 +272,13 @@ async fn test_channel_notes_participant_indices(
     executor.start_waiting();
     let editor_b = workspace_b
         .update_in(cx_b, |workspace, window, cx| {
-            workspace.open_path((worktree_id_a, "file.txt"), None, true, window, cx)
+            workspace.open_path(
+                (worktree_id_a, rel_path("file.txt")),
+                None,
+                true,
+                window,
+                cx,
+            )
         })
         .await
         .unwrap()
@@ -273,13 +286,13 @@ async fn test_channel_notes_participant_indices(
         .unwrap();
 
     editor_a.update_in(cx_a, |editor, window, cx| {
-        editor.change_selections(None, window, cx, |selections| {
-            selections.select_ranges(vec![0..1]);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges(vec![MultiBufferOffset(0)..MultiBufferOffset(1)]);
         });
     });
     editor_b.update_in(cx_b, |editor, window, cx| {
-        editor.change_selections(None, window, cx, |selections| {
-            selections.select_ranges(vec![2..3]);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges(vec![MultiBufferOffset(2)..MultiBufferOffset(3)]);
         });
     });
     executor.run_until_parked();
@@ -310,11 +323,11 @@ fn assert_remote_selections(
             let CollaboratorId::PeerId(peer_id) = s.collaborator_id else {
                 panic!("unexpected collaborator id");
             };
-            let start = s.selection.start.to_offset(&snapshot.buffer_snapshot);
-            let end = s.selection.end.to_offset(&snapshot.buffer_snapshot);
+            let start = s.selection.start.to_offset(snapshot.buffer_snapshot());
+            let end = s.selection.end.to_offset(snapshot.buffer_snapshot());
             let user_id = collaborators.get(&peer_id).unwrap().user_id;
             let participant_index = hub.user_participant_indices(cx).get(&user_id).copied();
-            (participant_index, start..end)
+            (participant_index, start.0..end.0)
         })
         .collect::<Vec<_>>();
     assert_eq!(

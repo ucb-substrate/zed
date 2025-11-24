@@ -21,7 +21,7 @@ use futures::{FutureExt as _, io::BufReader};
 use gpui::{BackgroundExecutor, SharedString};
 use language::{BinaryStatus, LanguageName, language_settings::AllLanguageSettings};
 use project::project_settings::ProjectSettings;
-use semantic_version::SemanticVersion;
+use semver::Version;
 use std::{
     env,
     net::Ipv4Addr,
@@ -30,11 +30,14 @@ use std::{
     sync::{Arc, OnceLock},
 };
 use task::{SpawnInTerminal, ZedDebugConfig};
-use util::{archive::extract_zip, fs::make_file_executable, maybe};
+use url::Url;
+use util::{
+    archive::extract_zip, fs::make_file_executable, maybe, paths::PathStyle, rel_path::RelPath,
+};
 use wasmtime::component::{Linker, Resource};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 6, 0);
-pub const MAX_VERSION: SemanticVersion = SemanticVersion::new(0, 6, 0);
+pub const MIN_VERSION: Version = Version::new(0, 6, 0);
+pub const MAX_VERSION: Version = Version::new(0, 7, 0);
 
 wasmtime::component::bindgen!({
     async: true,
@@ -51,6 +54,7 @@ wasmtime::component::bindgen!({
 pub use self::zed::extension::*;
 
 mod settings {
+    #![allow(dead_code)]
     include!(concat!(env!("OUT_DIR"), "/since_v0.6.0/settings.rs"));
 }
 
@@ -75,7 +79,7 @@ impl From<Range> for std::ops::Range<usize> {
 impl From<Command> for extension::Command {
     fn from(value: Command) -> Self {
         Self {
-            command: value.command,
+            command: value.command.into(),
             args: value.args,
             env: value.env,
         }
@@ -299,15 +303,24 @@ impl From<extension::DebugScenario> for DebugScenario {
     }
 }
 
-impl From<SpawnInTerminal> for ResolvedTask {
-    fn from(value: SpawnInTerminal) -> Self {
-        Self {
+impl TryFrom<SpawnInTerminal> for ResolvedTask {
+    type Error = anyhow::Error;
+
+    fn try_from(value: SpawnInTerminal) -> Result<Self, Self::Error> {
+        Ok(Self {
             label: value.label,
-            command: value.command,
+            command: value.command.context("missing command")?,
             args: value.args,
             env: value.env.into_iter().collect(),
-            cwd: value.cwd.map(|s| s.to_string_lossy().into_owned()),
-        }
+            cwd: value.cwd.map(|s| {
+                let s = s.to_string_lossy();
+                if cfg!(target_os = "windows") {
+                    s.replace('\\', "/")
+                } else {
+                    s.into_owned()
+                }
+            }),
+        })
     }
 }
 
@@ -553,7 +566,7 @@ impl HostWorktree for WasmState {
     ) -> wasmtime::Result<Result<String, String>> {
         let delegate = self.table.get(&delegate)?;
         Ok(delegate
-            .read_text_file(path.into())
+            .read_text_file(&RelPath::new(Path::new(&path), PathStyle::Posix)?)
             .await
             .map_err(|error| error.to_string()))
     }
@@ -711,7 +724,7 @@ impl nodejs::Host for WasmState {
             .node_runtime
             .binary_path()
             .await
-            .map(|path| path.to_string_lossy().to_string())
+            .map(|path| path.to_string_lossy().into_owned())
             .to_wasmtime_result()
     }
 
@@ -742,6 +755,9 @@ impl nodejs::Host for WasmState {
         package_name: String,
         version: String,
     ) -> wasmtime::Result<Result<(), String>> {
+        self.capability_granter
+            .grant_npm_install_package(&package_name)?;
+
         self.host
             .node_runtime
             .npm_install_packages(&self.work_dir(), &[(&package_name, &version)])
@@ -845,7 +861,8 @@ impl process::Host for WasmState {
         command: process::Command,
     ) -> wasmtime::Result<Result<process::Output, String>> {
         maybe!(async {
-            self.manifest.allow_exec(&command.command, &command.args)?;
+            self.capability_granter
+                .grant_exec(&command.command, &command.args)?;
 
             let output = util::command::new_smol_command(command.command.as_str())
                 .args(&command.args)
@@ -899,11 +916,15 @@ impl ExtensionImports for WasmState {
     ) -> wasmtime::Result<Result<String, String>> {
         self.on_main_thread(|cx| {
             async move {
-                let location = location
+                let path = location.as_ref().and_then(|location| {
+                    RelPath::new(Path::new(&location.path), PathStyle::Posix).ok()
+                });
+                let location = path
                     .as_ref()
-                    .map(|location| ::settings::SettingsLocation {
+                    .zip(location.as_ref())
+                    .map(|(path, location)| ::settings::SettingsLocation {
                         worktree_id: WorktreeId::from_proto(location.worktree_id),
-                        path: Path::new(&location.path),
+                        path,
                     });
 
                 cx.update(|cx| match category.as_str() {
@@ -931,7 +952,7 @@ impl ExtensionImports for WasmState {
                             binary: settings.binary.map(|binary| settings::CommandSettings {
                                 path: binary.path,
                                 arguments: binary.arguments,
-                                env: binary.env,
+                                env: binary.env.map(|env| env.into_iter().collect()),
                             }),
                             settings: settings.settings,
                             initialization_options: settings.initialization_options,
@@ -945,7 +966,10 @@ impl ExtensionImports for WasmState {
                                     .get(key.as_str())
                             })
                             .cloned()
-                            .context("Failed to get context server configuration")?;
+                            .unwrap_or_else(|| {
+                                project::project_settings::ContextServerSettings::default_extension(
+                                )
+                            });
 
                         match settings {
                             project::project_settings::ContextServerSettings::Custom {
@@ -953,7 +977,7 @@ impl ExtensionImports for WasmState {
                                 command,
                             } => Ok(serde_json::to_string(&settings::ContextServerSettings {
                                 command: Some(settings::CommandSettings {
-                                    path: Some(command.path),
+                                    path: command.path.to_str().map(|path| path.to_string()),
                                     arguments: Some(command.args),
                                     env: command.env.map(|env| env.into_iter().collect()),
                                 }),
@@ -966,6 +990,9 @@ impl ExtensionImports for WasmState {
                                 command: None,
                                 settings: Some(settings),
                             })?),
+                            project::project_settings::ContextServerSettings::Http { .. } => {
+                                bail!("remote context server settings not supported in 0.6.0")
+                            }
                         }
                     }
                     _ => {
@@ -1005,6 +1032,9 @@ impl ExtensionImports for WasmState {
         file_type: DownloadedFileType,
     ) -> wasmtime::Result<Result<(), String>> {
         maybe!(async {
+            let parsed_url = Url::parse(&url)?;
+            self.capability_granter.grant_download_file(&parsed_url)?;
+
             let path = PathBuf::from(path);
             let extension_work_dir = self.host.work_dir.join(self.manifest.id.as_ref());
 
@@ -1024,7 +1054,7 @@ impl ExtensionImports for WasmState {
             anyhow::ensure!(
                 response.status().is_success(),
                 "download failed with status {}",
-                response.status().to_string()
+                response.status()
             );
             let body = BufReader::new(response.body_mut());
 

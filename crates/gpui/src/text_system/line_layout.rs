@@ -185,10 +185,10 @@ impl LineLayout {
 
             if width > wrap_width && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines {
-                    if boundaries.len() >= max_lines - 1 {
-                        break;
-                    }
+                if let Some(max_lines) = max_lines
+                    && boundaries.len() >= max_lines - 1
+                {
+                    break;
                 }
 
                 if let Some(last_candidate_ix) = last_candidate_ix.take() {
@@ -482,6 +482,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width,
+            force_width: None,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -500,7 +501,7 @@ impl LineLayoutCache {
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs);
+            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
                 unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
             } else {
@@ -516,6 +517,7 @@ impl LineLayoutCache {
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width,
+                force_width: None,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -533,6 +535,7 @@ impl LineLayoutCache {
         text: Text,
         font_size: Pixels,
         runs: &[FontRun],
+        force_width: Option<Pixels>,
     ) -> Arc<LineLayout>
     where
         Text: AsRef<str>,
@@ -543,6 +546,7 @@ impl LineLayoutCache {
             font_size,
             runs,
             wrap_width: None,
+            force_width,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -557,16 +561,30 @@ impl LineLayoutCache {
             layout
         } else {
             let text = SharedString::from(text);
-            let layout = Arc::new(
-                self.platform_text_system
-                    .layout_line(&text, font_size, runs),
-            );
+            let mut layout = self
+                .platform_text_system
+                .layout_line(&text, font_size, runs);
+
+            if let Some(force_width) = force_width {
+                let mut glyph_pos = 0;
+                for run in layout.runs.iter_mut() {
+                    for glyph in run.glyphs.iter_mut() {
+                        if (glyph.position.x - glyph_pos * force_width).abs() > px(1.) {
+                            glyph.position.x = glyph_pos * force_width;
+                        }
+                        glyph_pos += 1;
+                    }
+                }
+            }
+
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
                 runs: SmallVec::from(runs),
                 wrap_width: None,
+                force_width,
             });
+            let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
             current_frame.used_lines.push(key);
             layout
@@ -582,7 +600,7 @@ pub struct FontRun {
 }
 
 trait AsCacheKeyRef {
-    fn as_cache_key_ref(&self) -> CacheKeyRef;
+    fn as_cache_key_ref(&self) -> CacheKeyRef<'_>;
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -591,6 +609,7 @@ struct CacheKey {
     font_size: Pixels,
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
+    force_width: Option<Pixels>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -599,17 +618,18 @@ struct CacheKeyRef<'a> {
     font_size: Pixels,
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
+    force_width: Option<Pixels>,
 }
 
-impl PartialEq for (dyn AsCacheKeyRef + '_) {
+impl PartialEq for dyn AsCacheKeyRef + '_ {
     fn eq(&self, other: &dyn AsCacheKeyRef) -> bool {
         self.as_cache_key_ref() == other.as_cache_key_ref()
     }
 }
 
-impl Eq for (dyn AsCacheKeyRef + '_) {}
+impl Eq for dyn AsCacheKeyRef + '_ {}
 
-impl Hash for (dyn AsCacheKeyRef + '_) {
+impl Hash for dyn AsCacheKeyRef + '_ {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_cache_key_ref().hash(state)
     }
@@ -622,6 +642,7 @@ impl AsCacheKeyRef for CacheKey {
             font_size: self.font_size,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
+            force_width: self.force_width,
         }
     }
 }

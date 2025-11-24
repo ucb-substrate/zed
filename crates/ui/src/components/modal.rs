@@ -1,5 +1,5 @@
 use crate::{
-    Clickable, Color, DynamicSpacing, Headline, HeadlineSize, IconButton, IconButtonShape,
+    Clickable, Color, DynamicSpacing, Headline, HeadlineSize, Icon, IconButton, IconButtonShape,
     IconName, Label, LabelCommon, LabelSize, h_flex, v_flex,
 };
 use gpui::{prelude::FluentBuilder, *};
@@ -77,6 +77,7 @@ impl RenderOnce for Modal {
                     .w_full()
                     .flex_1()
                     .gap(DynamicSpacing::Base08.rems(cx))
+                    .when(self.footer.is_some(), |this| this.pb_4())
                     .when_some(
                         self.container_scroll_handler,
                         |this, container_scroll_handle| {
@@ -92,7 +93,9 @@ impl RenderOnce for Modal {
 
 #[derive(IntoElement)]
 pub struct ModalHeader {
+    icon: Option<Icon>,
     headline: Option<SharedString>,
+    description: Option<SharedString>,
     children: SmallVec<[AnyElement; 2]>,
     show_dismiss_button: bool,
     show_back_button: bool,
@@ -107,11 +110,18 @@ impl Default for ModalHeader {
 impl ModalHeader {
     pub fn new() -> Self {
         Self {
+            icon: None,
             headline: None,
+            description: None,
             children: SmallVec::new(),
             show_dismiss_button: false,
             show_back_button: false,
         }
+    }
+
+    pub fn icon(mut self, icon: Icon) -> Self {
+        self.icon = Some(icon);
+        self
     }
 
     /// Set the headline of the modal.
@@ -120,6 +130,11 @@ impl ModalHeader {
     /// of `children` if it is not already present.
     pub fn headline(mut self, headline: impl Into<SharedString>) -> Self {
         self.headline = Some(headline.into());
+        self
+    }
+
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
         self
     }
 
@@ -171,7 +186,19 @@ impl RenderOnce for ModalHeader {
                         }),
                 )
             })
-            .child(div().flex_1().children(children))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .when_some(self.icon, |this, icon| this.child(icon))
+                            .children(children),
+                    )
+                    .when_some(self.description, |this, description| {
+                        this.child(Label::new(description).color(Color::Muted).mb_2())
+                    }),
+            )
             .when(self.show_dismiss_button, |this| {
                 this.child(
                     IconButton::new("dismiss", IconName::Close)
@@ -250,7 +277,6 @@ impl RenderOnce for ModalFooter {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
             .w_full()
-            .mt_4()
             .p(DynamicSpacing::Base08.rems(cx))
             .flex_none()
             .justify_between()

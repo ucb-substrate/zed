@@ -4,8 +4,9 @@ use std::{
     sync::Arc,
 };
 
-use editor::RowHighlightOptions;
+use editor::scroll::ScrollOffset;
 use editor::{Anchor, AnchorRangeExt, Editor, scroll::Autoscroll};
+use editor::{MultiBufferOffset, RowHighlightOptions, SelectionEffects};
 use fuzzy::StringMatch;
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
@@ -19,7 +20,7 @@ use settings::Settings;
 use theme::{ActiveTheme, ThemeSettings};
 use ui::{ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt;
-use workspace::{DismissDecision, ModalView};
+use workspace::{DismissDecision, ModalView, Workspace};
 
 pub fn init(cx: &mut App) {
     cx.observe_new(OutlineView::register).detach();
@@ -47,7 +48,8 @@ pub fn toggle(
         .snapshot(cx)
         .outline(Some(cx.theme().syntax()));
 
-    if let Some((workspace, outline)) = editor.read(cx).workspace().zip(outline) {
+    let workspace = window.root::<Workspace>().flatten();
+    if let Some((workspace, outline)) = workspace.zip(outline) {
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
                 OutlineView::new(outline, editor, window, cx)
@@ -81,8 +83,19 @@ impl ModalView for OutlineView {
 }
 
 impl Render for OutlineView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(rems(34.))
+            .on_action(cx.listener(
+                |_this: &mut OutlineView,
+                 _: &zed_actions::outline::ToggleOutline,
+                 _window: &mut Window,
+                 cx: &mut Context<OutlineView>| {
+                    // When outline::Toggle is triggered while the outline is open, dismiss it
+                    cx.emit(DismissEvent);
+                },
+            ))
+            .child(self.picker.clone())
     }
 }
 
@@ -119,7 +132,7 @@ struct OutlineViewDelegate {
     active_editor: Entity<Editor>,
     outline: Outline<Anchor>,
     selected_match_index: usize,
-    prev_scroll_position: Option<Point<f32>>,
+    prev_scroll_position: Option<Point<ScrollOffset>>,
     matches: Vec<StringMatch>,
     last_query: String,
 }
@@ -232,7 +245,10 @@ impl PickerDelegate for OutlineViewDelegate {
 
             let (buffer, cursor_offset) = self.active_editor.update(cx, |editor, cx| {
                 let buffer = editor.buffer().read(cx).snapshot(cx);
-                let cursor_offset = editor.selections.newest::<usize>(cx).head();
+                let cursor_offset = editor
+                    .selections
+                    .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                    .head();
                 (buffer, cursor_offset)
             });
             selected_index = self
@@ -243,8 +259,8 @@ impl PickerDelegate for OutlineViewDelegate {
                 .map(|(ix, item)| {
                     let range = item.range.to_offset(&buffer);
                     let distance_to_closest_endpoint = cmp::min(
-                        (range.start as isize - cursor_offset as isize).abs(),
-                        (range.end as isize - cursor_offset as isize).abs(),
+                        (range.start.0 as isize - cursor_offset.0 as isize).abs(),
+                        (range.end.0 as isize - cursor_offset.0 as isize).abs(),
                     );
                     let depth = if range.contains(&cursor_offset) {
                         Some(item.depth)
@@ -288,9 +304,12 @@ impl PickerDelegate for OutlineViewDelegate {
                 .highlighted_rows::<OutlineRowHighlights>()
                 .next();
             if let Some((rows, _)) = highlight {
-                active_editor.change_selections(Some(Autoscroll::center()), window, cx, |s| {
-                    s.select_ranges([rows.start..rows.start])
-                });
+                active_editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::center()),
+                    window,
+                    cx,
+                    |s| s.select_ranges([rows.start..rows.start]),
+                );
                 active_editor.clear_row_highlights::<OutlineRowHighlights>();
                 window.focus(&active_editor.focus_handle(cx));
             }
@@ -375,7 +394,7 @@ mod tests {
     use language::{Language, LanguageConfig, LanguageMatcher};
     use project::{FakeFs, Project};
     use serde_json::json;
-    use util::path;
+    use util::{path, rel_path::rel_path};
     use workspace::{AppState, Workspace};
 
     #[gpui::test]
@@ -416,7 +435,7 @@ mod tests {
             .unwrap();
         let editor = workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.open_path((worktree_id, "a.rs"), None, true, window, cx)
+                workspace.open_path((worktree_id, rel_path("a.rs")), None, true, window, cx)
             })
             .await
             .unwrap()
@@ -556,11 +575,8 @@ mod tests {
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
             let state = AppState::test(cx);
-            language::init(cx);
             crate::init(cx);
             editor::init(cx);
-            workspace::init_settings(cx);
-            Project::init_settings(cx);
             state
         })
     }
@@ -657,7 +673,7 @@ mod tests {
         let selections = editor.update(cx, |editor, cx| {
             editor
                 .selections
-                .all::<rope::Point>(cx)
+                .all::<rope::Point>(&editor.display_snapshot(cx))
                 .into_iter()
                 .map(|s| s.start..s.end)
                 .collect::<Vec<_>>()

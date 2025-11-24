@@ -9,17 +9,17 @@ use std::sync::Arc;
 use clap::Parser;
 use dialoguer::FuzzySelect;
 use gpui::{
-    AnyView, App, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, px, size,
+    AnyView, App, Bounds, Context, Render, Window, WindowBounds, WindowOptions,
+    colors::{Colors, GlobalColors},
+    div, px, size,
 };
 use log::LevelFilter;
-use project::Project;
 use reqwest_client::ReqwestClient;
 use settings::{KeymapFile, Settings};
 use simplelog::SimpleLogger;
 use strum::IntoEnumIterator;
-use theme::{ThemeRegistry, ThemeSettings};
+use theme::ThemeSettings;
 use ui::prelude::*;
-use workspace;
 
 use crate::app_menus::app_menus;
 use crate::assets::Assets;
@@ -68,6 +68,8 @@ fn main() {
     gpui::Application::new().with_assets(Assets).run(move |cx| {
         load_embedded_fonts(cx).unwrap();
 
+        cx.set_global(GlobalColors(Arc::new(Colors::default())));
+
         let http_client = ReqwestClient::user_agent("zed_storybook").unwrap();
         cx.set_http_client(Arc::new(http_client));
 
@@ -76,15 +78,12 @@ fn main() {
 
         let selector = story_selector;
 
-        let theme_registry = ThemeRegistry::global(cx);
         let mut theme_settings = ThemeSettings::get_global(cx).clone();
-        theme_settings.active_theme = theme_registry.get(&theme_name).unwrap();
+        theme_settings.theme =
+            theme::ThemeSelection::Static(settings::ThemeName(theme_name.into()));
         ThemeSettings::override_global(theme_settings, cx);
 
-        language::init(cx);
         editor::init(cx);
-        Project::init_settings(cx);
-        workspace::init_settings(cx);
         init(cx);
         load_storybook_keymap(cx);
         cx.set_menus(app_menus());
@@ -124,7 +123,7 @@ impl Render for StoryWrapper {
             .flex()
             .flex_col()
             .size_full()
-            .font_family("Zed Plex Mono")
+            .font_family(".ZedMono")
             .child(self.story.clone())
     }
 }

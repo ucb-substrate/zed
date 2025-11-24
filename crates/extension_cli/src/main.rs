@@ -2,7 +2,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use ::fs::{CopyOptions, Fs, RealFs, copy_recursive};
@@ -13,6 +12,7 @@ use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
 use language::LanguageConfig;
 use reqwest_client::ReqwestClient;
 use rpc::ExtensionProvides;
+use tokio::process::Command;
 use tree_sitter::{Language, Query, WasmStore};
 
 #[derive(Parser, Debug)]
@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
         .current_dir(&output_dir)
         .args(["-czvf", "archive.tar.gz", "-C", "archive", "."])
         .output()
+        .await
         .context("failed to run tar")?;
     if !tar_output.status.success() {
         bail!(
@@ -144,8 +145,8 @@ fn extension_provides(manifest: &ExtensionManifest) -> BTreeSet<ExtensionProvide
         provides.insert(ExtensionProvides::ContextServers);
     }
 
-    if !manifest.indexed_docs_providers.is_empty() {
-        provides.insert(ExtensionProvides::IndexedDocsProviders);
+    if !manifest.agent_servers.is_empty() {
+        provides.insert(ExtensionProvides::AgentServers);
     }
 
     if manifest.snippets.is_some() {
@@ -238,6 +239,21 @@ async fn copy_extension_resources(
         .with_context(|| "failed to copy icons")?;
     }
 
+    for (_, agent_entry) in &manifest.agent_servers {
+        if let Some(icon_path) = &agent_entry.icon {
+            let source_icon = extension_path.join(icon_path);
+            let dest_icon = output_dir.join(icon_path);
+
+            // Create parent directory if needed
+            if let Some(parent) = dest_icon.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            fs::copy(&source_icon, &dest_icon)
+                .with_context(|| format!("failed to copy agent server icon '{}'", icon_path))?;
+        }
+    }
+
     if !manifest.languages.is_empty() {
         let output_languages_dir = output_dir.join("languages");
         fs::create_dir_all(&output_languages_dir)?;
@@ -257,6 +273,54 @@ async fn copy_extension_resources(
                 format!("failed to copy language dir '{}'", language_path.display())
             })?;
         }
+    }
+
+    if !manifest.debug_adapters.is_empty() {
+        for (debug_adapter, entry) in &manifest.debug_adapters {
+            let schema_path = entry.schema_path.clone().unwrap_or_else(|| {
+                PathBuf::from("debug_adapter_schemas".to_owned())
+                    .join(debug_adapter.as_ref())
+                    .with_extension("json")
+            });
+            let parent = schema_path
+                .parent()
+                .with_context(|| format!("invalid empty schema path for {debug_adapter}"))?;
+            fs::create_dir_all(output_dir.join(parent))?;
+            copy_recursive(
+                fs.as_ref(),
+                &extension_path.join(&schema_path),
+                &output_dir.join(&schema_path),
+                CopyOptions {
+                    overwrite: true,
+                    ignore_if_exists: false,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to copy debug adapter schema '{}'",
+                    schema_path.display()
+                )
+            })?;
+        }
+    }
+
+    if let Some(snippets_path) = manifest.snippets.as_ref() {
+        let parent = snippets_path.parent();
+        if let Some(parent) = parent.filter(|p| p.components().next().is_some()) {
+            fs::create_dir_all(output_dir.join(parent))?;
+        }
+        copy_recursive(
+            fs.as_ref(),
+            &extension_path.join(&snippets_path),
+            &output_dir.join(&snippets_path),
+            CopyOptions {
+                overwrite: true,
+                ignore_if_exists: false,
+            },
+        )
+        .await
+        .with_context(|| format!("failed to copy snippets from '{}'", snippets_path.display()))?;
     }
 
     Ok(())

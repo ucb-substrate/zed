@@ -2,11 +2,11 @@
   "nodes": {
     "crane": {
       "locked": {
-        "lastModified": 1748047550,
-        "narHash": "sha256-t0qLLqb4C1rdtiY8IFRH5KIapTY/n3Lqt57AmxEv9mk=",
+        "lastModified": 1762538466,
+        "narHash": "sha256-8zrIPl6J+wLm9MH5ksHcW7BUHo7jSNOu0/hA0ohOOaM=",
         "owner": "ipetkov",
         "repo": "crane",
-        "rev": "b718a78696060df6280196a6f992d04c87a16aef",
+        "rev": "0cea393fffb39575c46b7a0318386467272182fe",
         "type": "github"
       },
       "original": {
@@ -17,11 +17,11 @@
     },
     "flake-compat": {
       "locked": {
-        "lastModified": 1747046372,
-        "narHash": "sha256-CIVLLkVgvHYbgI2UpXvIIBJ12HWgX+fjA8Xf8PUmqCY=",
+        "lastModified": 1761588595,
+        "narHash": "sha256-XKUZz9zewJNUj46b4AJdiRZJAvSZ0Dqj2BNfXvFlJC4=",
         "owner": "edolstra",
         "repo": "flake-compat",
-        "rev": "9100a0f413b0c601e0533d1d94ffd501ce2e7885",
+        "rev": "f387cd2afec9419c8ee37694406ca490c3f34ee5",
         "type": "github"
       },
       "original": {
@@ -33,10 +33,10 @@
     "nixpkgs": {
       "locked": {
         "lastModified": 315532800,
-        "narHash": "sha256-3c6Axl3SGIXCixGtpSJaMXLkkSRihHDlLaGewDEgha0=",
-        "rev": "3108eaa516ae22c2360928589731a4f1581526ef",
+        "narHash": "sha256-5CwQ80ucRHiqVbMEEbTFnjz70/axSJ0aliyzSaFSkmY=",
+        "rev": "f6b44b2401525650256b977063dbcf830f762369",
         "type": "tarball",
-        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-25.11pre806109.3108eaa516ae/nixexprs.tar.xz"
+        "url": "https://releases.nixos.org/nixpkgs/nixpkgs-25.11pre891648.f6b44b240152/nixexprs.tar.xz"
       },
       "original": {
         "type": "tarball",
@@ -58,11 +58,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1748227081,
-        "narHash": "sha256-RLnN7LBxhEdCJ6+rIL9sbhjBVDaR6jG377M/CLP/fmE=",
+        "lastModified": 1762915112,
+        "narHash": "sha256-d9j1g8nKmYDHy+/bIOPQTh9IwjRliqaTM0QLHMV92Ic=",
         "owner": "oxalica",
         "repo": "rust-overlay",
-        "rev": "1cbe817fd8c64a9f77ba4d7861a4839b0b15983e",
+        "rev": "aa1e85921cfa04de7b6914982a94621fbec5cc02",
         "type": "github"
       },
       "original": {

@@ -2,43 +2,58 @@ use anyhow::{Context as _, Result};
 use collections::{BTreeMap, HashMap, btree_map, hash_map};
 use ec4rs::{ConfigParser, PropertiesSource, Section};
 use fs::Fs;
-use futures::{FutureExt, StreamExt, channel::mpsc, future::LocalBoxFuture};
-use gpui::{App, AsyncApp, BorrowAppContext, Global, Task, UpdateGlobal};
+use futures::{
+    FutureExt, StreamExt,
+    channel::{mpsc, oneshot},
+    future::LocalBoxFuture,
+};
+use gpui::{App, AsyncApp, BorrowAppContext, Global, SharedString, Task, UpdateGlobal};
 
 use paths::{EDITORCONFIG_NAME, local_settings_file_relative_path, task_file_name};
-use schemars::{JsonSchema, r#gen::SchemaGenerator, schema::RootSchema};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use schemars::{JsonSchema, json_schema};
 use serde_json::Value;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId, type_name},
     fmt::Debug,
     ops::Range,
-    path::{Path, PathBuf},
+    path::PathBuf,
+    rc::Rc,
     str::{self, FromStr},
-    sync::{Arc, LazyLock},
+    sync::Arc,
 };
-use streaming_iterator::StreamingIterator;
-use tree_sitter::Query;
-use util::RangeExt;
-
-use util::{ResultExt as _, merge_non_null_json_value_into};
+use util::{
+    ResultExt as _,
+    rel_path::RelPath,
+    schemars::{DefaultDenyUnknownFields, replace_subschema},
+};
 
 pub type EditorconfigProperties = ec4rs::Properties;
 
-use crate::{SettingsJsonSchemaParams, VsCodeSettings, WorktreeId};
+use crate::{
+    ActiveSettingsProfileName, FontFamilyName, IconThemeName, LanguageSettingsContent,
+    LanguageToSettingsMap, ThemeName, VsCodeSettings, WorktreeId, fallible_options,
+    merge_from::MergeFrom,
+    settings_content::{
+        ExtensionsSettingsContent, ProjectSettingsContent, SettingsContent, UserSettingsContent,
+    },
+};
 
-/// A value that can be defined as a user setting.
-///
-/// Settings can be loaded from a combination of multiple JSON files.
-pub trait Settings: 'static + Send + Sync {
+use settings_json::{infer_json_indent_size, parse_json_with_comments, update_value_in_json_text};
+
+pub trait SettingsKey: 'static + Send + Sync {
     /// The name of a key within the JSON file from which this setting should
     /// be deserialized. If this is `None`, then the setting will be deserialized
     /// from the root object.
     const KEY: Option<&'static str>;
 
     const FALLBACK_KEY: Option<&'static str> = None;
+}
 
+/// A value that can be defined as a user setting.
+///
+/// Settings can be loaded from a combination of multiple JSON files.
+pub trait Settings: 'static + Send + Sync + Sized {
     /// The name of the keys in the [`FileContent`](Self::FileContent) that should
     /// always be written to a settings file, even if their value matches the default
     /// value.
@@ -48,38 +63,19 @@ pub trait Settings: 'static + Send + Sync {
     /// user settings match the current version of the settings.
     const PRESERVED_KEYS: Option<&'static [&'static str]> = None;
 
-    /// The type that is stored in an individual JSON file.
-    type FileContent: Clone + Default + Serialize + DeserializeOwned + JsonSchema;
-
-    /// The logic for combining together values from one or more JSON files into the
-    /// final value for this setting.
-    fn load(sources: SettingsSources<Self::FileContent>, cx: &mut App) -> Result<Self>
-    where
-        Self: Sized;
-
-    fn json_schema(
-        generator: &mut SchemaGenerator,
-        _: &SettingsJsonSchemaParams,
-        _: &App,
-    ) -> RootSchema {
-        generator.root_schema_for::<Self::FileContent>()
-    }
-
-    fn missing_default() -> anyhow::Error {
-        anyhow::anyhow!("missing default")
-    }
-
-    /// Use [the helpers in the vscode_import module](crate::vscode_import) to apply known
-    /// equivalent settings from a vscode config to our config
-    fn import_from_vscode(vscode: &VsCodeSettings, current: &mut Self::FileContent);
+    /// Read the value from default.json.
+    ///
+    /// This function *should* panic if default values are missing,
+    /// and you should add a default to default.json for documentation.
+    fn from_settings(content: &SettingsContent) -> Self;
 
     #[track_caller]
     fn register(cx: &mut App)
     where
         Self: Sized,
     {
-        SettingsStore::update_global(cx, |store, cx| {
-            store.register_setting::<Self>(cx);
+        SettingsStore::update_global(cx, |store, _| {
+            store.register_setting::<Self>();
         });
     }
 
@@ -100,6 +96,18 @@ pub trait Settings: 'static + Send + Sync {
     }
 
     #[track_caller]
+    fn try_get(cx: &App) -> Option<&Self>
+    where
+        Self: Sized,
+    {
+        if cx.has_global::<SettingsStore>() {
+            cx.global::<SettingsStore>().try_get(None)
+        } else {
+            None
+        }
+    }
+
+    #[track_caller]
     fn try_read_global<R>(cx: &AsyncApp, f: impl FnOnce(&Self) -> R) -> Option<R>
     where
         Self: Sized,
@@ -116,86 +124,78 @@ pub trait Settings: 'static + Send + Sync {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct SettingsSources<'a, T> {
-    /// The default Zed settings.
-    pub default: &'a T,
-    /// Global settings (loaded before user settings).
-    pub global: Option<&'a T>,
-    /// Settings provided by extensions.
-    pub extensions: Option<&'a T>,
-    /// The user settings.
-    pub user: Option<&'a T>,
-    /// The user settings for the current release channel.
-    pub release_channel: Option<&'a T>,
-    /// The server's settings.
-    pub server: Option<&'a T>,
-    /// The project settings, ordered from least specific to most specific.
-    pub project: &'a [&'a T],
+pub struct RegisteredSetting {
+    pub settings_value: fn() -> Box<dyn AnySettingValue>,
+    pub from_settings: fn(&SettingsContent) -> Box<dyn Any>,
+    pub id: fn() -> TypeId,
 }
 
-impl<'a, T: Serialize> SettingsSources<'a, T> {
-    /// Returns an iterator over the default settings as well as all settings customizations.
-    pub fn defaults_and_customizations(&self) -> impl Iterator<Item = &T> {
-        [self.default].into_iter().chain(self.customizations())
-    }
-
-    /// Returns an iterator over all of the settings customizations.
-    pub fn customizations(&self) -> impl Iterator<Item = &T> {
-        self.global
-            .into_iter()
-            .chain(self.extensions)
-            .chain(self.user)
-            .chain(self.release_channel)
-            .chain(self.server)
-            .chain(self.project.iter().copied())
-    }
-
-    /// Returns the settings after performing a JSON merge of the provided customizations.
-    ///
-    /// Customizations later in the iterator win out over the earlier ones.
-    pub fn json_merge_with<O: DeserializeOwned>(
-        customizations: impl Iterator<Item = &'a T>,
-    ) -> Result<O> {
-        let mut merged = Value::Null;
-        for value in customizations {
-            merge_non_null_json_value_into(serde_json::to_value(value).unwrap(), &mut merged);
-        }
-        Ok(serde_json::from_value(merged)?)
-    }
-
-    /// Returns the settings after performing a JSON merge of the customizations into the
-    /// default settings.
-    ///
-    /// More-specific customizations win out over the less-specific ones.
-    pub fn json_merge<O: DeserializeOwned>(&'a self) -> Result<O> {
-        Self::json_merge_with(self.defaults_and_customizations())
-    }
-}
+inventory::collect!(RegisteredSetting);
 
 #[derive(Clone, Copy, Debug)]
 pub struct SettingsLocation<'a> {
     pub worktree_id: WorktreeId,
-    pub path: &'a Path,
+    pub path: &'a RelPath,
 }
 
-/// A set of strongly-typed setting values defined via multiple config files.
 pub struct SettingsStore {
     setting_values: HashMap<TypeId, Box<dyn AnySettingValue>>,
-    raw_default_settings: Value,
-    raw_global_settings: Option<Value>,
-    raw_user_settings: Value,
-    raw_server_settings: Option<Value>,
-    raw_extension_settings: Value,
-    raw_local_settings: BTreeMap<(WorktreeId, Arc<Path>), Value>,
-    raw_editorconfig_settings: BTreeMap<(WorktreeId, Arc<Path>), (String, Option<Editorconfig>)>,
-    tab_size_callback: Option<(
-        TypeId,
-        Box<dyn Fn(&dyn Any) -> Option<usize> + Send + Sync + 'static>,
-    )>,
+    default_settings: Rc<SettingsContent>,
+    user_settings: Option<UserSettingsContent>,
+    global_settings: Option<Box<SettingsContent>>,
+
+    extension_settings: Option<Box<SettingsContent>>,
+    server_settings: Option<Box<SettingsContent>>,
+
+    merged_settings: Rc<SettingsContent>,
+
+    local_settings: BTreeMap<(WorktreeId, Arc<RelPath>), SettingsContent>,
+    raw_editorconfig_settings: BTreeMap<(WorktreeId, Arc<RelPath>), (String, Option<Editorconfig>)>,
+
     _setting_file_updates: Task<()>,
     setting_file_updates_tx:
         mpsc::UnboundedSender<Box<dyn FnOnce(AsyncApp) -> LocalBoxFuture<'static, Result<()>>>>,
+    file_errors: BTreeMap<SettingsFile, SettingsParseResult>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SettingsFile {
+    Default,
+    Global,
+    User,
+    Server,
+    /// Represents project settings in ssh projects as well as local projects
+    Project((WorktreeId, Arc<RelPath>)),
+}
+
+impl PartialOrd for SettingsFile {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Sorted in order of precedence
+impl Ord for SettingsFile {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use SettingsFile::*;
+        use std::cmp::Ordering;
+        match (self, other) {
+            (User, User) => Ordering::Equal,
+            (Server, Server) => Ordering::Equal,
+            (Default, Default) => Ordering::Equal,
+            (Project((id1, rel_path1)), Project((id2, rel_path2))) => id1
+                .cmp(id2)
+                .then_with(|| rel_path1.cmp(rel_path2).reverse()),
+            (Project(_), _) => Ordering::Less,
+            (_, Project(_)) => Ordering::Greater,
+            (Server, _) => Ordering::Less,
+            (_, Server) => Ordering::Greater,
+            (User, _) => Ordering::Less,
+            (_, User) => Ordering::Greater,
+            (Global, _) => Ordering::Less,
+            (_, Global) => Ordering::Greater,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -228,69 +228,71 @@ pub enum LocalSettingsKind {
 
 impl Global for SettingsStore {}
 
+#[doc(hidden)]
 #[derive(Debug)]
-struct SettingValue<T> {
-    global_value: Option<T>,
-    local_values: Vec<(WorktreeId, Arc<Path>, T)>,
+pub struct SettingValue<T> {
+    #[doc(hidden)]
+    pub global_value: Option<T>,
+    #[doc(hidden)]
+    pub local_values: Vec<(WorktreeId, Arc<RelPath>, T)>,
 }
 
-trait AnySettingValue: 'static + Send + Sync {
-    fn key(&self) -> Option<&'static str>;
+#[doc(hidden)]
+pub trait AnySettingValue: 'static + Send + Sync {
     fn setting_type_name(&self) -> &'static str;
-    fn deserialize_setting(&self, json: &Value) -> Result<DeserializedSetting> {
-        self.deserialize_setting_with_key(json).1
-    }
-    fn deserialize_setting_with_key(
-        &self,
-        json: &Value,
-    ) -> (Option<&'static str>, Result<DeserializedSetting>);
-    fn load_setting(
-        &self,
-        sources: SettingsSources<DeserializedSetting>,
-        cx: &mut App,
-    ) -> Result<Box<dyn Any>>;
+
+    fn from_settings(&self, s: &SettingsContent) -> Box<dyn Any>;
+
     fn value_for_path(&self, path: Option<SettingsLocation>) -> &dyn Any;
-    fn all_local_values(&self) -> Vec<(WorktreeId, Arc<Path>, &dyn Any)>;
+    fn all_local_values(&self) -> Vec<(WorktreeId, Arc<RelPath>, &dyn Any)>;
     fn set_global_value(&mut self, value: Box<dyn Any>);
-    fn set_local_value(&mut self, root_id: WorktreeId, path: Arc<Path>, value: Box<dyn Any>);
-    fn json_schema(
-        &self,
-        generator: &mut SchemaGenerator,
-        _: &SettingsJsonSchemaParams,
-        cx: &App,
-    ) -> RootSchema;
-    fn edits_for_update(
-        &self,
-        raw_settings: &serde_json::Value,
-        tab_size: usize,
-        vscode_settings: &VsCodeSettings,
-        text: &mut String,
-        edits: &mut Vec<(Range<usize>, String)>,
-    );
+    fn set_local_value(&mut self, root_id: WorktreeId, path: Arc<RelPath>, value: Box<dyn Any>);
 }
 
-struct DeserializedSetting(Box<dyn Any>);
+/// Parameters that are used when generating some JSON schemas at runtime.
+pub struct SettingsJsonSchemaParams<'a> {
+    pub language_names: &'a [String],
+    pub font_names: &'a [String],
+    pub theme_names: &'a [SharedString],
+    pub icon_theme_names: &'a [SharedString],
+}
 
 impl SettingsStore {
-    pub fn new(cx: &App) -> Self {
+    pub fn new(cx: &App, default_settings: &str) -> Self {
         let (setting_file_updates_tx, mut setting_file_updates_rx) = mpsc::unbounded();
-        Self {
+        let default_settings: Rc<SettingsContent> =
+            parse_json_with_comments(default_settings).unwrap();
+        let mut this = Self {
             setting_values: Default::default(),
-            raw_default_settings: serde_json::json!({}),
-            raw_global_settings: None,
-            raw_user_settings: serde_json::json!({}),
-            raw_server_settings: None,
-            raw_extension_settings: serde_json::json!({}),
-            raw_local_settings: Default::default(),
+            default_settings: default_settings.clone(),
+            global_settings: None,
+            server_settings: None,
+            user_settings: None,
+            extension_settings: None,
+
+            merged_settings: default_settings,
+            local_settings: BTreeMap::default(),
             raw_editorconfig_settings: BTreeMap::default(),
-            tab_size_callback: Default::default(),
             setting_file_updates_tx,
             _setting_file_updates: cx.spawn(async move |cx| {
                 while let Some(setting_file_update) = setting_file_updates_rx.next().await {
                     (setting_file_update)(cx.clone()).await.log_err();
                 }
             }),
-        }
+            file_errors: BTreeMap::default(),
+        };
+
+        this.load_settings_types();
+
+        this
+    }
+
+    pub fn observe_active_settings_profile_name(cx: &mut App) -> gpui::Subscription {
+        cx.observe_global::<ActiveSettingsProfileName>(|cx| {
+            Self::update_global(cx, |store, cx| {
+                store.recompute_values(None, cx);
+            });
+        })
     }
 
     pub fn update<C, R>(cx: &mut C, f: impl FnOnce(&mut Self, &mut C) -> R) -> R
@@ -301,67 +303,35 @@ impl SettingsStore {
     }
 
     /// Add a new type of setting to the store.
-    pub fn register_setting<T: Settings>(&mut self, cx: &mut App) {
-        let setting_type_id = TypeId::of::<T>();
-        let entry = self.setting_values.entry(setting_type_id);
+    pub fn register_setting<T: Settings>(&mut self) {
+        self.register_setting_internal(&RegisteredSetting {
+            settings_value: || {
+                Box::new(SettingValue::<T> {
+                    global_value: None,
+                    local_values: Vec::new(),
+                })
+            },
+            from_settings: |content| Box::new(T::from_settings(content)),
+            id: || TypeId::of::<T>(),
+        });
+    }
+
+    fn load_settings_types(&mut self) {
+        for registered_setting in inventory::iter::<RegisteredSetting>() {
+            self.register_setting_internal(registered_setting);
+        }
+    }
+
+    fn register_setting_internal(&mut self, registered_setting: &RegisteredSetting) {
+        let entry = self.setting_values.entry((registered_setting.id)());
 
         if matches!(entry, hash_map::Entry::Occupied(_)) {
             return;
         }
 
-        let setting_value = entry.or_insert(Box::new(SettingValue::<T> {
-            global_value: None,
-            local_values: Vec::new(),
-        }));
-
-        if let Some(default_settings) = setting_value
-            .deserialize_setting(&self.raw_default_settings)
-            .log_err()
-        {
-            let user_value = setting_value
-                .deserialize_setting(&self.raw_user_settings)
-                .log_err();
-
-            let mut release_channel_value = None;
-            if let Some(release_settings) = &self
-                .raw_user_settings
-                .get(release_channel::RELEASE_CHANNEL.dev_name())
-            {
-                release_channel_value = setting_value
-                    .deserialize_setting(release_settings)
-                    .log_err();
-            }
-
-            let server_value = self
-                .raw_server_settings
-                .as_ref()
-                .and_then(|server_setting| {
-                    setting_value.deserialize_setting(server_setting).log_err()
-                });
-
-            let extension_value = setting_value
-                .deserialize_setting(&self.raw_extension_settings)
-                .log_err();
-
-            if let Some(setting) = setting_value
-                .load_setting(
-                    SettingsSources {
-                        default: &default_settings,
-                        global: None,
-                        extensions: extension_value.as_ref(),
-                        user: user_value.as_ref(),
-                        release_channel: release_channel_value.as_ref(),
-                        server: server_value.as_ref(),
-                        project: &[],
-                    },
-                    cx,
-                )
-                .context("A default setting must be added to the `default.json` file")
-                .log_err()
-            {
-                setting_value.set_global_value(setting);
-            }
-        }
+        let setting_value = entry.or_insert((registered_setting.settings_value)());
+        let value = (registered_setting.from_settings)(&self.merged_settings);
+        setting_value.set_global_value(value);
     }
 
     /// Get the value of a setting.
@@ -377,8 +347,18 @@ impl SettingsStore {
             .expect("no default value for setting type")
     }
 
+    /// Get the value of a setting.
+    ///
+    /// Does not panic
+    pub fn try_get<T: Settings>(&self, path: Option<SettingsLocation>) -> Option<&T> {
+        self.setting_values
+            .get(&TypeId::of::<T>())
+            .map(|value| value.value_for_path(path))
+            .and_then(|value| value.downcast_ref::<T>())
+    }
+
     /// Get all values from project specific settings
-    pub fn get_all_locals<T: Settings>(&self) -> Vec<(WorktreeId, Arc<Path>, &T)> {
+    pub fn get_all_locals<T: Settings>(&self) -> Vec<(WorktreeId, Arc<RelPath>, &T)> {
         self.setting_values
             .get(&TypeId::of::<T>())
             .unwrap_or_else(|| panic!("unregistered setting type {}", type_name::<T>()))
@@ -405,26 +385,29 @@ impl SettingsStore {
             .set_global_value(Box::new(value))
     }
 
-    /// Get the user's settings as a raw JSON value.
+    /// Get the user's settings content.
     ///
     /// For user-facing functionality use the typed setting interface.
     /// (e.g. ProjectSettings::get_global(cx))
-    pub fn raw_user_settings(&self) -> &Value {
-        &self.raw_user_settings
+    pub fn raw_user_settings(&self) -> Option<&UserSettingsContent> {
+        self.user_settings.as_ref()
     }
 
-    /// Access the raw JSON value of the global settings.
-    pub fn raw_global_settings(&self) -> Option<&Value> {
-        self.raw_global_settings.as_ref()
+    /// Get the default settings content as a raw JSON value.
+    pub fn raw_default_settings(&self) -> &SettingsContent {
+        &self.default_settings
+    }
+
+    /// Get the configured settings profile names.
+    pub fn configured_settings_profiles(&self) -> impl Iterator<Item = &str> {
+        self.user_settings
+            .iter()
+            .flat_map(|settings| settings.profiles.keys().map(|k| k.as_str()))
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn test(cx: &mut App) -> Self {
-        let mut this = Self::new(cx);
-        this.set_default_settings(&crate::test_settings(), cx)
-            .unwrap();
-        this.set_user_settings("{}", cx).unwrap();
-        this
+        Self::new(cx, &crate::test_settings())
     }
 
     /// Updates the value of a setting in the user's global configuration.
@@ -432,126 +415,301 @@ impl SettingsStore {
     /// This is only for tests. Normally, settings are only loaded from
     /// JSON files.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn update_user_settings<T: Settings>(
+    pub fn update_user_settings(
         &mut self,
         cx: &mut App,
-        update: impl FnOnce(&mut T::FileContent),
+        update: impl FnOnce(&mut SettingsContent),
     ) {
-        let old_text = serde_json::to_string(&self.raw_user_settings).unwrap();
-        let new_text = self.new_text_for_update::<T>(old_text, update);
-        self.set_user_settings(&new_text, cx).unwrap();
+        let mut content = self.user_settings.clone().unwrap_or_default().content;
+        update(&mut content);
+        let new_text = serde_json::to_string(&UserSettingsContent {
+            content,
+            ..Default::default()
+        })
+        .unwrap();
+        _ = self.set_user_settings(&new_text, cx);
     }
 
     pub async fn load_settings(fs: &Arc<dyn Fs>) -> Result<String> {
         match fs.load(paths::settings_file()).await {
             result @ Ok(_) => result,
             Err(err) => {
-                if let Some(e) = err.downcast_ref::<std::io::Error>() {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Ok(crate::initial_user_settings_content().to_string());
-                    }
+                if let Some(e) = err.downcast_ref::<std::io::Error>()
+                    && e.kind() == std::io::ErrorKind::NotFound
+                {
+                    return Ok(crate::initial_user_settings_content().to_string());
                 }
                 Err(err)
             }
         }
     }
 
-    pub async fn load_global_settings(fs: &Arc<dyn Fs>) -> Result<String> {
-        match fs.load(paths::global_settings_file()).await {
-            result @ Ok(_) => result,
-            Err(err) => {
-                if let Some(e) = err.downcast_ref::<std::io::Error>() {
-                    if e.kind() == std::io::ErrorKind::NotFound {
-                        return Ok("{}".to_string());
-                    }
-                }
-                Err(err)
-            }
-        }
-    }
-
-    pub fn update_settings_file<T: Settings>(
+    fn update_settings_file_inner(
         &self,
         fs: Arc<dyn Fs>,
-        update: impl 'static + Send + FnOnce(&mut T::FileContent, &App),
+        update: impl 'static + Send + FnOnce(String, AsyncApp) -> Result<String>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let (tx, rx) = oneshot::channel::<Result<()>>();
+        self.setting_file_updates_tx
+            .unbounded_send(Box::new(move |cx: AsyncApp| {
+                async move {
+                    let res = async move {
+                        let old_text = Self::load_settings(&fs).await?;
+                        let new_text = update(old_text, cx)?;
+                        let settings_path = paths::settings_file().as_path();
+                        if fs.is_file(settings_path).await {
+                            let resolved_path =
+                                fs.canonicalize(settings_path).await.with_context(|| {
+                                    format!(
+                                        "Failed to canonicalize settings path {:?}",
+                                        settings_path
+                                    )
+                                })?;
+
+                            fs.atomic_write(resolved_path.clone(), new_text)
+                                .await
+                                .with_context(|| {
+                                    format!("Failed to write settings to file {:?}", resolved_path)
+                                })?;
+                        } else {
+                            fs.atomic_write(settings_path.to_path_buf(), new_text)
+                                .await
+                                .with_context(|| {
+                                    format!("Failed to write settings to file {:?}", settings_path)
+                                })?;
+                        }
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    let new_res = match &res {
+                        Ok(_) => anyhow::Ok(()),
+                        Err(e) => Err(anyhow::anyhow!("Failed to write settings to file {:?}", e)),
+                    };
+
+                    _ = tx.send(new_res);
+                    res
+                }
+                .boxed_local()
+            }))
+            .map_err(|err| anyhow::format_err!("Failed to update settings file: {}", err))
+            .log_with_level(log::Level::Warn);
+        return rx;
+    }
+
+    pub fn update_settings_file(
+        &self,
+        fs: Arc<dyn Fs>,
+        update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
     ) {
-        self.setting_file_updates_tx
-            .unbounded_send(Box::new(move |cx: AsyncApp| {
-                async move {
-                    let old_text = Self::load_settings(&fs).await?;
-                    let new_text = cx.read_global(|store: &SettingsStore, cx| {
-                        store.new_text_for_update::<T>(old_text, |content| update(content, cx))
-                    })?;
-                    let settings_path = paths::settings_file().as_path();
-                    if fs.is_file(settings_path).await {
-                        let resolved_path =
-                            fs.canonicalize(settings_path).await.with_context(|| {
-                                format!("Failed to canonicalize settings path {:?}", settings_path)
-                            })?;
-
-                        fs.atomic_write(resolved_path.clone(), new_text)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to write settings to file {:?}", resolved_path)
-                            })?;
-                    } else {
-                        fs.atomic_write(settings_path.to_path_buf(), new_text)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to write settings to file {:?}", settings_path)
-                            })?;
-                    }
-
-                    anyhow::Ok(())
-                }
-                .boxed_local()
-            }))
-            .ok();
+        _ = self.update_settings_file_inner(fs, move |old_text: String, cx: AsyncApp| {
+            cx.read_global(|store: &SettingsStore, cx| {
+                store.new_text_for_update(old_text, |content| update(content, cx))
+            })
+        });
     }
 
-    pub fn import_vscode_settings(&self, fs: Arc<dyn Fs>, vscode_settings: VsCodeSettings) {
-        self.setting_file_updates_tx
-            .unbounded_send(Box::new(move |cx: AsyncApp| {
-                async move {
-                    let old_text = Self::load_settings(&fs).await?;
-                    let new_text = cx.read_global(|store: &SettingsStore, _cx| {
-                        store.get_vscode_edits(old_text, &vscode_settings)
-                    })?;
-                    let settings_path = paths::settings_file().as_path();
-                    if fs.is_file(settings_path).await {
-                        let resolved_path =
-                            fs.canonicalize(settings_path).await.with_context(|| {
-                                format!("Failed to canonicalize settings path {:?}", settings_path)
-                            })?;
-
-                        fs.atomic_write(resolved_path.clone(), new_text)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to write settings to file {:?}", resolved_path)
-                            })?;
-                    } else {
-                        fs.atomic_write(settings_path.to_path_buf(), new_text)
-                            .await
-                            .with_context(|| {
-                                format!("Failed to write settings to file {:?}", settings_path)
-                            })?;
-                    }
-
-                    anyhow::Ok(())
-                }
-                .boxed_local()
-            }))
-            .ok();
+    pub fn import_vscode_settings(
+        &self,
+        fs: Arc<dyn Fs>,
+        vscode_settings: VsCodeSettings,
+    ) -> oneshot::Receiver<Result<()>> {
+        self.update_settings_file_inner(fs, move |old_text: String, cx: AsyncApp| {
+            cx.read_global(|store: &SettingsStore, _cx| {
+                store.get_vscode_edits(old_text, &vscode_settings)
+            })
+        })
     }
 
+    pub fn get_all_files(&self) -> Vec<SettingsFile> {
+        let mut files = Vec::from_iter(
+            self.local_settings
+                .keys()
+                // rev because these are sorted by path, so highest precedence is last
+                .rev()
+                .cloned()
+                .map(SettingsFile::Project),
+        );
+
+        if self.server_settings.is_some() {
+            files.push(SettingsFile::Server);
+        }
+        // ignoring profiles
+        // ignoring os profiles
+        // ignoring release channel profiles
+        // ignoring global
+        // ignoring extension
+
+        if self.user_settings.is_some() {
+            files.push(SettingsFile::User);
+        }
+        files.push(SettingsFile::Default);
+        files
+    }
+
+    pub fn get_content_for_file(&self, file: SettingsFile) -> Option<&SettingsContent> {
+        match file {
+            SettingsFile::User => self
+                .user_settings
+                .as_ref()
+                .map(|settings| settings.content.as_ref()),
+            SettingsFile::Default => Some(self.default_settings.as_ref()),
+            SettingsFile::Server => self.server_settings.as_deref(),
+            SettingsFile::Project(ref key) => self.local_settings.get(key),
+            SettingsFile::Global => self.global_settings.as_deref(),
+        }
+    }
+
+    pub fn get_overrides_for_field<T>(
+        &self,
+        target_file: SettingsFile,
+        get: fn(&SettingsContent) -> &Option<T>,
+    ) -> Vec<SettingsFile> {
+        let all_files = self.get_all_files();
+        let mut found_file = false;
+        let mut overrides = Vec::new();
+
+        for file in all_files.into_iter().rev() {
+            if !found_file {
+                found_file = file == target_file;
+                continue;
+            }
+
+            if let SettingsFile::Project((wt_id, ref path)) = file
+                && let SettingsFile::Project((target_wt_id, ref target_path)) = target_file
+                && (wt_id != target_wt_id || !target_path.starts_with(path))
+            {
+                // if requesting value from a local file, don't return values from local files in different worktrees
+                continue;
+            }
+
+            let Some(content) = self.get_content_for_file(file.clone()) else {
+                continue;
+            };
+            if get(content).is_some() {
+                overrides.push(file);
+            }
+        }
+
+        overrides
+    }
+
+    /// Checks the given file, and files that the passed file overrides for the given field.
+    /// Returns the first file found that contains the value.
+    /// The value will only be None if no file contains the value.
+    /// I.e. if no file contains the value, returns `(File::Default, None)`
+    pub fn get_value_from_file<'a, T: 'a>(
+        &'a self,
+        target_file: SettingsFile,
+        pick: fn(&'a SettingsContent) -> Option<T>,
+    ) -> (SettingsFile, Option<T>) {
+        self.get_value_from_file_inner(target_file, pick, true)
+    }
+
+    /// Same as `Self::get_value_from_file` except that it does not include the current file.
+    /// Therefore it returns the value that was potentially overloaded by the target file.
+    pub fn get_value_up_to_file<'a, T: 'a>(
+        &'a self,
+        target_file: SettingsFile,
+        pick: fn(&'a SettingsContent) -> Option<T>,
+    ) -> (SettingsFile, Option<T>) {
+        self.get_value_from_file_inner(target_file, pick, false)
+    }
+
+    fn get_value_from_file_inner<'a, T: 'a>(
+        &'a self,
+        target_file: SettingsFile,
+        pick: fn(&'a SettingsContent) -> Option<T>,
+        include_target_file: bool,
+    ) -> (SettingsFile, Option<T>) {
+        // todo(settings_ui): Add a metadata field for overriding the "overrides" tag, for contextually different settings
+        //  e.g. disable AI isn't overridden, or a vec that gets extended instead or some such
+
+        // todo(settings_ui) cache all files
+        let all_files = self.get_all_files();
+        let mut found_file = false;
+
+        for file in all_files.into_iter() {
+            if !found_file && file != SettingsFile::Default {
+                if file != target_file {
+                    continue;
+                }
+                found_file = true;
+                if !include_target_file {
+                    continue;
+                }
+            }
+
+            if let SettingsFile::Project((worktree_id, ref path)) = file
+                && let SettingsFile::Project((target_worktree_id, ref target_path)) = target_file
+                && (worktree_id != target_worktree_id || !target_path.starts_with(&path))
+            {
+                // if requesting value from a local file, don't return values from local files in different worktrees
+                continue;
+            }
+
+            let Some(content) = self.get_content_for_file(file.clone()) else {
+                continue;
+            };
+            if let Some(value) = pick(content) {
+                return (file, Some(value));
+            }
+        }
+
+        (SettingsFile::Default, None)
+    }
+
+    #[inline(always)]
+    fn parse_and_migrate_zed_settings<SettingsContentType: serde::de::DeserializeOwned>(
+        &mut self,
+        user_settings_content: &str,
+        file: SettingsFile,
+    ) -> (Option<SettingsContentType>, SettingsParseResult) {
+        let mut migration_status = MigrationStatus::NotNeeded;
+        let (settings, parse_status) = if user_settings_content.is_empty() {
+            fallible_options::parse_json("{}")
+        } else {
+            let migration_res = migrator::migrate_settings(user_settings_content);
+            migration_status = match &migration_res {
+                Ok(Some(_)) => MigrationStatus::Succeeded,
+                Ok(None) => MigrationStatus::NotNeeded,
+                Err(err) => MigrationStatus::Failed {
+                    error: err.to_string(),
+                },
+            };
+            let content = match &migration_res {
+                Ok(Some(content)) => content,
+                Ok(None) => user_settings_content,
+                Err(_) => user_settings_content,
+            };
+            fallible_options::parse_json(content)
+        };
+
+        let result = SettingsParseResult {
+            parse_status,
+            migration_status,
+        };
+        self.file_errors.insert(file, result.clone());
+        return (settings, result);
+    }
+
+    pub fn error_for_file(&self, file: SettingsFile) -> Option<SettingsParseResult> {
+        self.file_errors
+            .get(&file)
+            .filter(|parse_result| parse_result.requires_user_action())
+            .cloned()
+    }
+}
+
+impl SettingsStore {
     /// Updates the value of a setting in a JSON file, returning the new text
     /// for that JSON file.
-    pub fn new_text_for_update<T: Settings>(
+    pub fn new_text_for_update(
         &self,
         old_text: String,
-        update: impl FnOnce(&mut T::FileContent),
+        update: impl FnOnce(&mut SettingsContent),
     ) -> String {
-        let edits = self.edits_for_update::<T>(&old_text, update);
+        let edits = self.edits_for_update(&old_text, update);
         let mut new_text = old_text;
         for (range, replacement) in edits.into_iter() {
             new_text.replace_range(range, &replacement);
@@ -559,54 +717,30 @@ impl SettingsStore {
         new_text
     }
 
-    pub fn get_vscode_edits(&self, mut old_text: String, vscode: &VsCodeSettings) -> String {
-        let mut new_text = old_text.clone();
-        let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-        let raw_settings = parse_json_with_comments::<Value>(&old_text).unwrap_or_default();
-        let tab_size = self.json_tab_size();
-        for v in self.setting_values.values() {
-            v.edits_for_update(&raw_settings, tab_size, vscode, &mut old_text, &mut edits);
-        }
-        for (range, replacement) in edits.into_iter() {
-            new_text.replace_range(range, &replacement);
-        }
-        new_text
+    pub fn get_vscode_edits(&self, old_text: String, vscode: &VsCodeSettings) -> String {
+        self.new_text_for_update(old_text, |content| {
+            content.merge_from(&vscode.settings_content())
+        })
     }
 
     /// Updates the value of a setting in a JSON file, returning a list
     /// of edits to apply to the JSON file.
-    pub fn edits_for_update<T: Settings>(
+    pub fn edits_for_update(
         &self,
         text: &str,
-        update: impl FnOnce(&mut T::FileContent),
+        update: impl FnOnce(&mut SettingsContent),
     ) -> Vec<(Range<usize>, String)> {
-        let setting_type_id = TypeId::of::<T>();
-
-        let preserved_keys = T::PRESERVED_KEYS.unwrap_or_default();
-
-        let setting = self
-            .setting_values
-            .get(&setting_type_id)
-            .unwrap_or_else(|| panic!("unregistered setting type {}", type_name::<T>()));
-        let raw_settings = parse_json_with_comments::<Value>(text).unwrap_or_default();
-        let (key, deserialized_setting) = setting.deserialize_setting_with_key(&raw_settings);
-        let old_content = match deserialized_setting {
-            Ok(content) => content.0.downcast::<T::FileContent>().unwrap(),
-            Err(_) => Box::<<T as Settings>::FileContent>::default(),
-        };
+        let old_content: UserSettingsContent =
+            parse_json_with_comments(text).log_err().unwrap_or_default();
         let mut new_content = old_content.clone();
-        update(&mut new_content);
+        update(&mut new_content.content);
 
         let old_value = serde_json::to_value(&old_content).unwrap();
         let new_value = serde_json::to_value(new_content).unwrap();
 
         let mut key_path = Vec::new();
-        if let Some(key) = key {
-            key_path.push(key);
-        }
-
         let mut edits = Vec::new();
-        let tab_size = self.json_tab_size();
+        let tab_size = infer_json_indent_size(&text);
         let mut text = text.to_string();
         update_value_in_json_text(
             &mut text,
@@ -614,35 +748,9 @@ impl SettingsStore {
             tab_size,
             &old_value,
             &new_value,
-            preserved_keys,
             &mut edits,
         );
         edits
-    }
-
-    /// Configure the tab sized when updating JSON files.
-    pub fn set_json_tab_size_callback<T: Settings>(
-        &mut self,
-        get_tab_size: fn(&T) -> Option<usize>,
-    ) {
-        self.tab_size_callback = Some((
-            TypeId::of::<T>(),
-            Box::new(move |value| get_tab_size(value.downcast_ref::<T>().unwrap())),
-        ));
-    }
-
-    fn json_tab_size(&self) -> usize {
-        const DEFAULT_JSON_TAB_SIZE: usize = 2;
-
-        if let Some((setting_type_id, callback)) = &self.tab_size_callback {
-            let setting_value = self.setting_values.get(setting_type_id).unwrap();
-            let value = setting_value.value_for_path(None);
-            if let Some(value) = callback(value) {
-                return value;
-            }
-        }
-
-        DEFAULT_JSON_TAB_SIZE
     }
 
     /// Sets the default settings via a JSON string.
@@ -653,47 +761,47 @@ impl SettingsStore {
         default_settings_content: &str,
         cx: &mut App,
     ) -> Result<()> {
-        let settings: Value = parse_json_with_comments(default_settings_content)?;
-        anyhow::ensure!(settings.is_object(), "settings must be an object");
-        self.raw_default_settings = settings;
-        self.recompute_values(None, cx)?;
+        self.default_settings = parse_json_with_comments(default_settings_content)?;
+        self.recompute_values(None, cx);
         Ok(())
     }
 
     /// Sets the user settings via a JSON string.
+    #[must_use]
     pub fn set_user_settings(
         &mut self,
         user_settings_content: &str,
         cx: &mut App,
-    ) -> Result<Value> {
-        let settings: Value = if user_settings_content.is_empty() {
-            parse_json_with_comments("{}")?
-        } else {
-            parse_json_with_comments(user_settings_content)?
-        };
+    ) -> SettingsParseResult {
+        let (settings, parse_result) = self.parse_and_migrate_zed_settings::<UserSettingsContent>(
+            user_settings_content,
+            SettingsFile::User,
+        );
 
-        anyhow::ensure!(settings.is_object(), "settings must be an object");
-        self.raw_user_settings = settings.clone();
-        self.recompute_values(None, cx)?;
-        Ok(settings)
+        if let Some(settings) = settings {
+            self.user_settings = Some(settings);
+            self.recompute_values(None, cx);
+        }
+        return parse_result;
     }
 
     /// Sets the global settings via a JSON string.
+    #[must_use]
     pub fn set_global_settings(
         &mut self,
         global_settings_content: &str,
         cx: &mut App,
-    ) -> Result<Value> {
-        let settings: Value = if global_settings_content.is_empty() {
-            parse_json_with_comments("{}")?
-        } else {
-            parse_json_with_comments(global_settings_content)?
-        };
+    ) -> SettingsParseResult {
+        let (settings, parse_result) = self.parse_and_migrate_zed_settings::<SettingsContent>(
+            global_settings_content,
+            SettingsFile::Global,
+        );
 
-        anyhow::ensure!(settings.is_object(), "settings must be an object");
-        self.raw_global_settings = Some(settings.clone());
-        self.recompute_values(None, cx)?;
-        Ok(settings)
+        if let Some(settings) = settings {
+            self.global_settings = Some(Box::new(settings));
+            self.recompute_values(None, cx);
+        }
+        return parse_result;
     }
 
     pub fn set_server_settings(
@@ -701,21 +809,16 @@ impl SettingsStore {
         server_settings_content: &str,
         cx: &mut App,
     ) -> Result<()> {
-        let settings: Option<Value> = if server_settings_content.is_empty() {
+        let settings: Option<SettingsContent> = if server_settings_content.is_empty() {
             None
         } else {
             parse_json_with_comments(server_settings_content)?
         };
 
-        anyhow::ensure!(
-            settings
-                .as_ref()
-                .map(|value| value.is_object())
-                .unwrap_or(true),
-            "settings must be an object"
-        );
-        self.raw_server_settings = settings;
-        self.recompute_values(None, cx)?;
+        // Rewrite the server settings into a content type
+        self.server_settings = settings.map(|settings| Box::new(settings));
+
+        self.recompute_values(None, cx);
         Ok(())
     }
 
@@ -723,7 +826,7 @@ impl SettingsStore {
     pub fn set_local_settings(
         &mut self,
         root_id: WorktreeId,
-        directory_path: Arc<Path>,
+        directory_path: Arc<RelPath>,
         kind: LocalSettingsKind,
         settings_content: Option<&str>,
         cx: &mut App,
@@ -738,46 +841,64 @@ impl SettingsStore {
             (LocalSettingsKind::Tasks, _) => {
                 return Err(InvalidSettingsError::Tasks {
                     message: "Attempted to submit tasks into the settings store".to_string(),
-                    path: directory_path.join(task_file_name()),
+                    path: directory_path
+                        .join(RelPath::unix(task_file_name()).unwrap())
+                        .as_std_path()
+                        .to_path_buf(),
                 });
             }
             (LocalSettingsKind::Debug, _) => {
                 return Err(InvalidSettingsError::Debug {
                     message: "Attempted to submit debugger config into the settings store"
                         .to_string(),
-                    path: directory_path.join(task_file_name()),
+                    path: directory_path
+                        .join(RelPath::unix(task_file_name()).unwrap())
+                        .as_std_path()
+                        .to_path_buf(),
                 });
             }
             (LocalSettingsKind::Settings, None) => {
                 zed_settings_changed = self
-                    .raw_local_settings
+                    .local_settings
                     .remove(&(root_id, directory_path.clone()))
-                    .is_some()
+                    .is_some();
+                self.file_errors
+                    .remove(&SettingsFile::Project((root_id, directory_path.clone())));
             }
             (LocalSettingsKind::Editorconfig, None) => {
                 self.raw_editorconfig_settings
                     .remove(&(root_id, directory_path.clone()));
             }
             (LocalSettingsKind::Settings, Some(settings_contents)) => {
-                let new_settings =
-                    parse_json_with_comments::<Value>(settings_contents).map_err(|e| {
-                        InvalidSettingsError::LocalSettings {
-                            path: directory_path.join(local_settings_file_relative_path()),
-                            message: e.to_string(),
-                        }
-                    })?;
-                match self
-                    .raw_local_settings
-                    .entry((root_id, directory_path.clone()))
-                {
-                    btree_map::Entry::Vacant(v) => {
-                        v.insert(new_settings);
-                        zed_settings_changed = true;
-                    }
-                    btree_map::Entry::Occupied(mut o) => {
-                        if o.get() != &new_settings {
-                            o.insert(new_settings);
+                let (new_settings, parse_result) = self
+                    .parse_and_migrate_zed_settings::<ProjectSettingsContent>(
+                        settings_contents,
+                        SettingsFile::Project((root_id, directory_path.clone())),
+                    );
+                match parse_result.parse_status {
+                    ParseStatus::Success => Ok(()),
+                    ParseStatus::Failed { error } => Err(InvalidSettingsError::LocalSettings {
+                        path: directory_path.join(local_settings_file_relative_path()),
+                        message: error,
+                    }),
+                }?;
+                if let Some(new_settings) = new_settings {
+                    match self.local_settings.entry((root_id, directory_path.clone())) {
+                        btree_map::Entry::Vacant(v) => {
+                            v.insert(SettingsContent {
+                                project: new_settings,
+                                ..Default::default()
+                            });
                             zed_settings_changed = true;
+                        }
+                        btree_map::Entry::Occupied(mut o) => {
+                            if &o.get().project != &new_settings {
+                                o.insert(SettingsContent {
+                                    project: new_settings,
+                                    ..Default::default()
+                                });
+                                zed_settings_changed = true;
+                            }
                         }
                     }
                 }
@@ -795,7 +916,8 @@ impl SettingsStore {
                             v.insert((editorconfig_contents.to_owned(), None));
                             return Err(InvalidSettingsError::Editorconfig {
                                 message: e.to_string(),
-                                path: directory_path.join(EDITORCONFIG_NAME),
+                                path: directory_path
+                                    .join(RelPath::unix(EDITORCONFIG_NAME).unwrap()),
                             });
                         }
                     },
@@ -812,7 +934,8 @@ impl SettingsStore {
                                     o.insert((editorconfig_contents.to_owned(), None));
                                     return Err(InvalidSettingsError::Editorconfig {
                                         message: e.to_string(),
-                                        path: directory_path.join(EDITORCONFIG_NAME),
+                                        path: directory_path
+                                            .join(RelPath::unix(EDITORCONFIG_NAME).unwrap()),
                                     });
                                 }
                             }
@@ -823,52 +946,60 @@ impl SettingsStore {
         };
 
         if zed_settings_changed {
-            self.recompute_values(Some((root_id, &directory_path)), cx)?;
+            self.recompute_values(Some((root_id, &directory_path)), cx);
         }
         Ok(())
     }
 
-    pub fn set_extension_settings<T: Serialize>(&mut self, content: T, cx: &mut App) -> Result<()> {
-        let settings: Value = serde_json::to_value(content)?;
-        anyhow::ensure!(settings.is_object(), "settings must be an object");
-        self.raw_extension_settings = settings;
-        self.recompute_values(None, cx)?;
+    pub fn set_extension_settings(
+        &mut self,
+        content: ExtensionsSettingsContent,
+        cx: &mut App,
+    ) -> Result<()> {
+        self.extension_settings = Some(Box::new(SettingsContent {
+            project: ProjectSettingsContent {
+                all_languages: content.all_languages,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        self.recompute_values(None, cx);
         Ok(())
     }
 
     /// Add or remove a set of local settings via a JSON string.
     pub fn clear_local_settings(&mut self, root_id: WorktreeId, cx: &mut App) -> Result<()> {
-        self.raw_local_settings
+        self.local_settings
             .retain(|(worktree_id, _), _| worktree_id != &root_id);
-        self.recompute_values(Some((root_id, "".as_ref())), cx)?;
+        self.recompute_values(Some((root_id, RelPath::empty())), cx);
         Ok(())
     }
 
     pub fn local_settings(
         &self,
         root_id: WorktreeId,
-    ) -> impl '_ + Iterator<Item = (Arc<Path>, String)> {
-        self.raw_local_settings
+    ) -> impl '_ + Iterator<Item = (Arc<RelPath>, &ProjectSettingsContent)> {
+        self.local_settings
             .range(
-                (root_id, Path::new("").into())
+                (root_id, RelPath::empty().into())
                     ..(
                         WorktreeId::from_usize(root_id.to_usize() + 1),
-                        Path::new("").into(),
+                        RelPath::empty().into(),
                     ),
             )
-            .map(|((_, path), content)| (path.clone(), serde_json::to_string(content).unwrap()))
+            .map(|((_, path), content)| (path.clone(), &content.project))
     }
 
     pub fn local_editorconfig_settings(
         &self,
         root_id: WorktreeId,
-    ) -> impl '_ + Iterator<Item = (Arc<Path>, String, Option<Editorconfig>)> {
+    ) -> impl '_ + Iterator<Item = (Arc<RelPath>, String, Option<Editorconfig>)> {
         self.raw_editorconfig_settings
             .range(
-                (root_id, Path::new("").into())
+                (root_id, RelPath::empty().into())
                     ..(
                         WorktreeId::from_usize(root_id.to_usize() + 1),
-                        Path::new("").into(),
+                        RelPath::empty().into(),
                     ),
             )
             .map(|((_, path), (content, parsed_content))| {
@@ -876,248 +1007,130 @@ impl SettingsStore {
             })
     }
 
-    pub fn json_schema(&self, schema_params: &SettingsJsonSchemaParams, cx: &App) -> Value {
-        use schemars::{
-            r#gen::SchemaSettings,
-            schema::{Schema, SchemaObject},
-        };
+    pub fn json_schema(&self, params: &SettingsJsonSchemaParams) -> Value {
+        let mut generator = schemars::generate::SchemaSettings::draft2019_09()
+            .with_transform(DefaultDenyUnknownFields)
+            .into_generator();
 
-        let settings = SchemaSettings::draft07().with(|settings| {
-            settings.option_add_null_type = true;
+        UserSettingsContent::json_schema(&mut generator);
+
+        let language_settings_content_ref = generator
+            .subschema_for::<LanguageSettingsContent>()
+            .to_value();
+
+        replace_subschema::<LanguageToSettingsMap>(&mut generator, || {
+            json_schema!({
+                "type": "object",
+                "properties": params
+                    .language_names
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            language_settings_content_ref.clone(),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>(),
+                "errorMessage": "No language with this name is installed."
+            })
         });
-        let mut generator = SchemaGenerator::new(settings);
-        let mut combined_schema = RootSchema::default();
 
-        for setting_value in self.setting_values.values() {
-            let setting_schema = setting_value.json_schema(&mut generator, schema_params, cx);
-            combined_schema
-                .definitions
-                .extend(setting_schema.definitions);
+        replace_subschema::<FontFamilyName>(&mut generator, || {
+            json_schema!({
+                "type": "string",
+                "enum": params.font_names,
+            })
+        });
 
-            let target_schema = if let Some(key) = setting_value.key() {
-                let key_schema = combined_schema
-                    .schema
-                    .object()
-                    .properties
-                    .entry(key.to_string())
-                    .or_insert_with(|| Schema::Object(SchemaObject::default()));
-                if let Schema::Object(key_schema) = key_schema {
-                    key_schema
-                } else {
-                    continue;
-                }
-            } else {
-                &mut combined_schema.schema
-            };
+        replace_subschema::<ThemeName>(&mut generator, || {
+            json_schema!({
+                "type": "string",
+                "enum": params.theme_names,
+            })
+        });
 
-            merge_schema(target_schema, setting_schema.schema);
-        }
+        replace_subschema::<IconThemeName>(&mut generator, || {
+            json_schema!({
+                "type": "string",
+                "enum": params.icon_theme_names,
+            })
+        });
 
-        fn merge_schema(target: &mut SchemaObject, mut source: SchemaObject) {
-            let source_subschemas = source.subschemas();
-            let target_subschemas = target.subschemas();
-            if let Some(all_of) = source_subschemas.all_of.take() {
-                target_subschemas
-                    .all_of
-                    .get_or_insert(Vec::new())
-                    .extend(all_of);
-            }
-            if let Some(any_of) = source_subschemas.any_of.take() {
-                target_subschemas
-                    .any_of
-                    .get_or_insert(Vec::new())
-                    .extend(any_of);
-            }
-            if let Some(one_of) = source_subschemas.one_of.take() {
-                target_subschemas
-                    .one_of
-                    .get_or_insert(Vec::new())
-                    .extend(one_of);
-            }
-
-            if let Some(source) = source.object {
-                let target_properties = &mut target.object().properties;
-                for (key, value) in source.properties {
-                    match target_properties.entry(key) {
-                        btree_map::Entry::Vacant(e) => {
-                            e.insert(value);
-                        }
-                        btree_map::Entry::Occupied(e) => {
-                            if let (Schema::Object(target), Schema::Object(src)) =
-                                (e.into_mut(), value)
-                            {
-                                merge_schema(target, src);
-                            }
-                        }
-                    }
-                }
-            }
-
-            overwrite(&mut target.instance_type, source.instance_type);
-            overwrite(&mut target.string, source.string);
-            overwrite(&mut target.number, source.number);
-            overwrite(&mut target.reference, source.reference);
-            overwrite(&mut target.array, source.array);
-            overwrite(&mut target.enum_values, source.enum_values);
-
-            fn overwrite<T>(target: &mut Option<T>, source: Option<T>) {
-                if let Some(source) = source {
-                    *target = Some(source);
-                }
-            }
-        }
-
-        for release_stage in ["dev", "nightly", "stable", "preview"] {
-            let schema = combined_schema.schema.clone();
-            combined_schema
-                .schema
-                .object()
-                .properties
-                .insert(release_stage.to_string(), schema.into());
-        }
-
-        serde_json::to_value(&combined_schema).unwrap()
+        generator
+            .root_schema_for::<UserSettingsContent>()
+            .to_value()
     }
 
     fn recompute_values(
         &mut self,
-        changed_local_path: Option<(WorktreeId, &Path)>,
+        changed_local_path: Option<(WorktreeId, &RelPath)>,
         cx: &mut App,
-    ) -> std::result::Result<(), InvalidSettingsError> {
+    ) {
         // Reload the global and local values for every setting.
-        let mut project_settings_stack = Vec::<DeserializedSetting>::new();
-        let mut paths_stack = Vec::<Option<(WorktreeId, &Path)>>::new();
-        for setting_value in self.setting_values.values_mut() {
-            let default_settings = setting_value
-                .deserialize_setting(&self.raw_default_settings)
-                .map_err(|e| InvalidSettingsError::DefaultSettings {
-                    message: e.to_string(),
-                })?;
+        let mut project_settings_stack = Vec::<SettingsContent>::new();
+        let mut paths_stack = Vec::<Option<(WorktreeId, &RelPath)>>::new();
 
-            let global_settings = self
-                .raw_global_settings
-                .as_ref()
-                .and_then(|setting| setting_value.deserialize_setting(setting).log_err());
-
-            let extension_settings = setting_value
-                .deserialize_setting(&self.raw_extension_settings)
-                .log_err();
-
-            let user_settings = match setting_value.deserialize_setting(&self.raw_user_settings) {
-                Ok(settings) => Some(settings),
-                Err(error) => {
-                    return Err(InvalidSettingsError::UserSettings {
-                        message: error.to_string(),
-                    });
-                }
-            };
-
-            let server_settings = self
-                .raw_server_settings
-                .as_ref()
-                .and_then(|setting| setting_value.deserialize_setting(setting).log_err());
-
-            let mut release_channel_settings = None;
-            if let Some(release_settings) = &self
-                .raw_user_settings
-                .get(release_channel::RELEASE_CHANNEL.dev_name())
-            {
-                if let Some(release_settings) = setting_value
-                    .deserialize_setting(release_settings)
-                    .log_err()
-                {
-                    release_channel_settings = Some(release_settings);
-                }
+        if changed_local_path.is_none() {
+            let mut merged = self.default_settings.as_ref().clone();
+            merged.merge_from_option(self.extension_settings.as_deref());
+            merged.merge_from_option(self.global_settings.as_deref());
+            if let Some(user_settings) = self.user_settings.as_ref() {
+                merged.merge_from(&user_settings.content);
+                merged.merge_from_option(user_settings.for_release_channel());
+                merged.merge_from_option(user_settings.for_os());
+                merged.merge_from_option(user_settings.for_profile(cx));
             }
+            merged.merge_from_option(self.server_settings.as_deref());
+            self.merged_settings = Rc::new(merged);
 
-            // If the global settings file changed, reload the global value for the field.
-            if changed_local_path.is_none() {
-                if let Some(value) = setting_value
-                    .load_setting(
-                        SettingsSources {
-                            default: &default_settings,
-                            global: global_settings.as_ref(),
-                            extensions: extension_settings.as_ref(),
-                            user: user_settings.as_ref(),
-                            release_channel: release_channel_settings.as_ref(),
-                            server: server_settings.as_ref(),
-                            project: &[],
-                        },
-                        cx,
-                    )
-                    .log_err()
-                {
-                    setting_value.set_global_value(value);
-                }
-            }
-
-            // Reload the local values for the setting.
-            paths_stack.clear();
-            project_settings_stack.clear();
-            for ((root_id, directory_path), local_settings) in &self.raw_local_settings {
-                // Build a stack of all of the local values for that setting.
-                while let Some(prev_entry) = paths_stack.last() {
-                    if let Some((prev_root_id, prev_path)) = prev_entry {
-                        if root_id != prev_root_id || !directory_path.starts_with(prev_path) {
-                            paths_stack.pop();
-                            project_settings_stack.pop();
-                            continue;
-                        }
-                    }
-                    break;
-                }
-
-                match setting_value.deserialize_setting(local_settings) {
-                    Ok(local_settings) => {
-                        paths_stack.push(Some((*root_id, directory_path.as_ref())));
-                        project_settings_stack.push(local_settings);
-
-                        // If a local settings file changed, then avoid recomputing local
-                        // settings for any path outside of that directory.
-                        if changed_local_path.map_or(
-                            false,
-                            |(changed_root_id, changed_local_path)| {
-                                *root_id != changed_root_id
-                                    || !directory_path.starts_with(changed_local_path)
-                            },
-                        ) {
-                            continue;
-                        }
-
-                        if let Some(value) = setting_value
-                            .load_setting(
-                                SettingsSources {
-                                    default: &default_settings,
-                                    global: global_settings.as_ref(),
-                                    extensions: extension_settings.as_ref(),
-                                    user: user_settings.as_ref(),
-                                    release_channel: release_channel_settings.as_ref(),
-                                    server: server_settings.as_ref(),
-                                    project: &project_settings_stack.iter().collect::<Vec<_>>(),
-                                },
-                                cx,
-                            )
-                            .log_err()
-                        {
-                            setting_value.set_local_value(*root_id, directory_path.clone(), value);
-                        }
-                    }
-                    Err(error) => {
-                        return Err(InvalidSettingsError::LocalSettings {
-                            path: directory_path.join(local_settings_file_relative_path()),
-                            message: error.to_string(),
-                        });
-                    }
-                }
+            for setting_value in self.setting_values.values_mut() {
+                let value = setting_value.from_settings(&self.merged_settings);
+                setting_value.set_global_value(value);
             }
         }
-        Ok(())
+
+        for ((root_id, directory_path), local_settings) in &self.local_settings {
+            // Build a stack of all of the local values for that setting.
+            while let Some(prev_entry) = paths_stack.last() {
+                if let Some((prev_root_id, prev_path)) = prev_entry
+                    && (root_id != prev_root_id || !directory_path.starts_with(prev_path))
+                {
+                    paths_stack.pop();
+                    project_settings_stack.pop();
+                    continue;
+                }
+                break;
+            }
+
+            paths_stack.push(Some((*root_id, directory_path.as_ref())));
+            let mut merged_local_settings = if let Some(deepest) = project_settings_stack.last() {
+                (*deepest).clone()
+            } else {
+                self.merged_settings.as_ref().clone()
+            };
+            merged_local_settings.merge_from(local_settings);
+
+            project_settings_stack.push(merged_local_settings);
+
+            // If a local settings file changed, then avoid recomputing local
+            // settings for any path outside of that directory.
+            if changed_local_path.is_some_and(|(changed_root_id, changed_local_path)| {
+                *root_id != changed_root_id || !directory_path.starts_with(changed_local_path)
+            }) {
+                continue;
+            }
+
+            for setting_value in self.setting_values.values_mut() {
+                let value = setting_value.from_settings(&project_settings_stack.last().unwrap());
+                setting_value.set_local_value(*root_id, directory_path.clone(), value);
+            }
+        }
     }
 
     pub fn editorconfig_properties(
         &self,
         for_worktree: WorktreeId,
-        for_path: &Path,
+        for_path: &RelPath,
     ) -> Option<EditorconfigProperties> {
         let mut properties = EditorconfigProperties::new();
 
@@ -1133,7 +1146,9 @@ impl SettingsStore {
                 properties = EditorconfigProperties::new();
             }
             for section in parsed_editorconfig.sections {
-                section.apply_to(&mut properties, for_path).log_err()?;
+                section
+                    .apply_to(&mut properties, for_path.as_std_path())
+                    .log_err()?;
             }
         }
 
@@ -1142,13 +1157,103 @@ impl SettingsStore {
     }
 }
 
+/// The result of parsing settings, including any migration attempts
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsParseResult {
+    /// The result of parsing the settings file (possibly after migration)
+    pub parse_status: ParseStatus,
+    /// The result of attempting to migrate the settings file
+    pub migration_status: MigrationStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseStatus {
+    /// Settings were parsed successfully
+    Success,
+    /// Settings failed to parse
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationStatus {
+    /// No migration was needed - settings are up to date
+    NotNeeded,
+    /// Settings were automatically migrated in memory, but the file needs to be updated
+    Succeeded,
+    /// Migration was attempted but failed. Original settings were parsed instead.
+    Failed { error: String },
+}
+
+impl Default for SettingsParseResult {
+    fn default() -> Self {
+        Self {
+            parse_status: ParseStatus::Success,
+            migration_status: MigrationStatus::NotNeeded,
+        }
+    }
+}
+
+impl SettingsParseResult {
+    pub fn unwrap(self) -> bool {
+        self.result().unwrap()
+    }
+
+    pub fn expect(self, message: &str) -> bool {
+        self.result().expect(message)
+    }
+
+    /// Formats the ParseResult as a Result type. This is a lossy conversion
+    pub fn result(self) -> Result<bool> {
+        let migration_result = match self.migration_status {
+            MigrationStatus::NotNeeded => Ok(false),
+            MigrationStatus::Succeeded => Ok(true),
+            MigrationStatus::Failed { error } => {
+                Err(anyhow::format_err!(error)).context("Failed to migrate settings")
+            }
+        };
+
+        let parse_result = match self.parse_status {
+            ParseStatus::Success => Ok(()),
+            ParseStatus::Failed { error } => {
+                Err(anyhow::format_err!(error)).context("Failed to parse settings")
+            }
+        };
+
+        match (migration_result, parse_result) {
+            (migration_result @ Ok(_), Ok(())) => migration_result,
+            (Err(migration_err), Ok(())) => Err(migration_err),
+            (_, Err(parse_err)) => Err(parse_err),
+        }
+    }
+
+    /// Returns true if there were any errors migrating and parsing the settings content or if migration was required but there were no errors
+    pub fn requires_user_action(&self) -> bool {
+        matches!(self.parse_status, ParseStatus::Failed { .. })
+            || matches!(
+                self.migration_status,
+                MigrationStatus::Succeeded | MigrationStatus::Failed { .. }
+            )
+    }
+
+    pub fn ok(self) -> Option<bool> {
+        self.result().ok()
+    }
+
+    pub fn parse_error(&self) -> Option<String> {
+        match &self.parse_status {
+            ParseStatus::Failed { error } => Some(error.clone()),
+            ParseStatus::Success => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvalidSettingsError {
-    LocalSettings { path: PathBuf, message: String },
+    LocalSettings { path: Arc<RelPath>, message: String },
     UserSettings { message: String },
     ServerSettings { message: String },
     DefaultSettings { message: String },
-    Editorconfig { path: PathBuf, message: String },
+    Editorconfig { path: Arc<RelPath>, message: String },
     Tasks { path: PathBuf, message: String },
     Debug { path: PathBuf, message: String },
 }
@@ -1181,80 +1286,23 @@ impl Debug for SettingsStore {
                     .map(|value| value.setting_type_name())
                     .collect::<Vec<_>>(),
             )
-            .field("default_settings", &self.raw_default_settings)
-            .field("user_settings", &self.raw_user_settings)
-            .field("local_settings", &self.raw_local_settings)
+            .field("default_settings", &self.default_settings)
+            .field("user_settings", &self.user_settings)
+            .field("local_settings", &self.local_settings)
             .finish_non_exhaustive()
     }
 }
 
 impl<T: Settings> AnySettingValue for SettingValue<T> {
-    fn key(&self) -> Option<&'static str> {
-        T::KEY
+    fn from_settings(&self, s: &SettingsContent) -> Box<dyn Any> {
+        Box::new(T::from_settings(s)) as _
     }
 
     fn setting_type_name(&self) -> &'static str {
         type_name::<T>()
     }
 
-    fn load_setting(
-        &self,
-        values: SettingsSources<DeserializedSetting>,
-        cx: &mut App,
-    ) -> Result<Box<dyn Any>> {
-        Ok(Box::new(T::load(
-            SettingsSources {
-                default: values.default.0.downcast_ref::<T::FileContent>().unwrap(),
-                global: values
-                    .global
-                    .map(|value| value.0.downcast_ref::<T::FileContent>().unwrap()),
-                extensions: values
-                    .extensions
-                    .map(|value| value.0.downcast_ref::<T::FileContent>().unwrap()),
-                user: values
-                    .user
-                    .map(|value| value.0.downcast_ref::<T::FileContent>().unwrap()),
-                release_channel: values
-                    .release_channel
-                    .map(|value| value.0.downcast_ref::<T::FileContent>().unwrap()),
-                server: values
-                    .server
-                    .map(|value| value.0.downcast_ref::<T::FileContent>().unwrap()),
-                project: values
-                    .project
-                    .iter()
-                    .map(|value| value.0.downcast_ref().unwrap())
-                    .collect::<SmallVec<[_; 3]>>()
-                    .as_slice(),
-            },
-            cx,
-        )?))
-    }
-
-    fn deserialize_setting_with_key(
-        &self,
-        mut json: &Value,
-    ) -> (Option<&'static str>, Result<DeserializedSetting>) {
-        let mut key = None;
-        if let Some(k) = T::KEY {
-            if let Some(value) = json.get(k) {
-                json = value;
-                key = Some(k);
-            } else if let Some((k, value)) = T::FALLBACK_KEY.and_then(|k| Some((k, json.get(k)?))) {
-                json = value;
-                key = Some(k);
-            } else {
-                let value = T::FileContent::default();
-                return (T::KEY, Ok(DeserializedSetting(Box::new(value))));
-            }
-        }
-        let value = T::FileContent::deserialize(json)
-            .map(|value| DeserializedSetting(Box::new(value)))
-            .map_err(anyhow::Error::from);
-        (key, value)
-    }
-
-    fn all_local_values(&self) -> Vec<(WorktreeId, Arc<Path>, &dyn Any)> {
+    fn all_local_values(&self) -> Vec<(WorktreeId, Arc<RelPath>, &dyn Any)> {
         self.local_values
             .iter()
             .map(|(id, path, value)| (*id, path.clone(), value as _))
@@ -1269,6 +1317,7 @@ impl<T: Settings> AnySettingValue for SettingValue<T> {
                 }
             }
         }
+
         self.global_value
             .as_ref()
             .unwrap_or_else(|| panic!("no default value for setting {}", self.setting_type_name()))
@@ -1278,7 +1327,7 @@ impl<T: Settings> AnySettingValue for SettingValue<T> {
         self.global_value = Some(*value.downcast().unwrap());
     }
 
-    fn set_local_value(&mut self, root_id: WorktreeId, path: Arc<Path>, value: Box<dyn Any>) {
+    fn set_local_value(&mut self, root_id: WorktreeId, path: Arc<RelPath>, value: Box<dyn Any>) {
         let value = *value.downcast().unwrap();
         match self
             .local_values
@@ -1288,400 +1337,134 @@ impl<T: Settings> AnySettingValue for SettingValue<T> {
             Err(ix) => self.local_values.insert(ix, (root_id, path, value)),
         }
     }
-
-    fn json_schema(
-        &self,
-        generator: &mut SchemaGenerator,
-        params: &SettingsJsonSchemaParams,
-        cx: &App,
-    ) -> RootSchema {
-        T::json_schema(generator, params, cx)
-    }
-
-    fn edits_for_update(
-        &self,
-        raw_settings: &serde_json::Value,
-        tab_size: usize,
-        vscode_settings: &VsCodeSettings,
-        text: &mut String,
-        edits: &mut Vec<(Range<usize>, String)>,
-    ) {
-        let (key, deserialized_setting) = self.deserialize_setting_with_key(raw_settings);
-        let old_content = match deserialized_setting {
-            Ok(content) => content.0.downcast::<T::FileContent>().unwrap(),
-            Err(_) => Box::<<T as Settings>::FileContent>::default(),
-        };
-        let mut new_content = old_content.clone();
-        T::import_from_vscode(vscode_settings, &mut new_content);
-
-        let old_value = serde_json::to_value(&old_content).unwrap();
-        let new_value = serde_json::to_value(new_content).unwrap();
-
-        let mut key_path = Vec::new();
-        if let Some(key) = key {
-            key_path.push(key);
-        }
-
-        update_value_in_json_text(
-            text,
-            &mut key_path,
-            tab_size,
-            &old_value,
-            &new_value,
-            T::PRESERVED_KEYS.unwrap_or_default(),
-            edits,
-        );
-    }
-}
-
-fn update_value_in_json_text<'a>(
-    text: &mut String,
-    key_path: &mut Vec<&'a str>,
-    tab_size: usize,
-    old_value: &'a Value,
-    new_value: &'a Value,
-    preserved_keys: &[&str],
-    edits: &mut Vec<(Range<usize>, String)>,
-) {
-    // If the old and new values are both objects, then compare them key by key,
-    // preserving the comments and formatting of the unchanged parts. Otherwise,
-    // replace the old value with the new value.
-    if let (Value::Object(old_object), Value::Object(new_object)) = (old_value, new_value) {
-        for (key, old_sub_value) in old_object.iter() {
-            key_path.push(key);
-            if let Some(new_sub_value) = new_object.get(key) {
-                // Key exists in both old and new, recursively update
-                update_value_in_json_text(
-                    text,
-                    key_path,
-                    tab_size,
-                    old_sub_value,
-                    new_sub_value,
-                    preserved_keys,
-                    edits,
-                );
-            } else {
-                // Key was removed from new object, remove the entire key-value pair
-                let (range, replacement) = replace_value_in_json_text(text, key_path, 0, None);
-                text.replace_range(range.clone(), &replacement);
-                edits.push((range, replacement));
-            }
-            key_path.pop();
-        }
-        for (key, new_sub_value) in new_object.iter() {
-            key_path.push(key);
-            if !old_object.contains_key(key) {
-                update_value_in_json_text(
-                    text,
-                    key_path,
-                    tab_size,
-                    &Value::Null,
-                    new_sub_value,
-                    preserved_keys,
-                    edits,
-                );
-            }
-            key_path.pop();
-        }
-    } else if key_path
-        .last()
-        .map_or(false, |key| preserved_keys.contains(key))
-        || old_value != new_value
-    {
-        let mut new_value = new_value.clone();
-        if let Some(new_object) = new_value.as_object_mut() {
-            new_object.retain(|_, v| !v.is_null());
-        }
-        let (range, replacement) =
-            replace_value_in_json_text(text, key_path, tab_size, Some(&new_value));
-        text.replace_range(range.clone(), &replacement);
-        edits.push((range, replacement));
-    }
-}
-
-fn replace_value_in_json_text(
-    text: &str,
-    key_path: &[&str],
-    tab_size: usize,
-    new_value: Option<&Value>,
-) -> (Range<usize>, String) {
-    static PAIR_QUERY: LazyLock<Query> = LazyLock::new(|| {
-        Query::new(
-            &tree_sitter_json::LANGUAGE.into(),
-            "(pair key: (string) @key value: (_) @value)",
-        )
-        .expect("Failed to create PAIR_QUERY")
-    });
-
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&tree_sitter_json::LANGUAGE.into())
-        .unwrap();
-    let syntax_tree = parser.parse(text, None).unwrap();
-
-    let mut cursor = tree_sitter::QueryCursor::new();
-
-    let mut depth = 0;
-    let mut last_value_range = 0..0;
-    let mut first_key_start = None;
-    let mut existing_value_range = 0..text.len();
-    let mut matches = cursor.matches(&PAIR_QUERY, syntax_tree.root_node(), text.as_bytes());
-    while let Some(mat) = matches.next() {
-        if mat.captures.len() != 2 {
-            continue;
-        }
-
-        let key_range = mat.captures[0].node.byte_range();
-        let value_range = mat.captures[1].node.byte_range();
-
-        // Don't enter sub objects until we find an exact
-        // match for the current keypath
-        if last_value_range.contains_inclusive(&value_range) {
-            continue;
-        }
-
-        last_value_range = value_range.clone();
-
-        if key_range.start > existing_value_range.end {
-            break;
-        }
-
-        first_key_start.get_or_insert(key_range.start);
-
-        let found_key = text
-            .get(key_range.clone())
-            .map(|key_text| {
-                depth < key_path.len() && key_text == format!("\"{}\"", key_path[depth])
-            })
-            .unwrap_or(false);
-
-        if found_key {
-            existing_value_range = value_range;
-            // Reset last value range when increasing in depth
-            last_value_range = existing_value_range.start..existing_value_range.start;
-            depth += 1;
-
-            if depth == key_path.len() {
-                break;
-            }
-
-            first_key_start = None;
-        }
-    }
-
-    // We found the exact key we want
-    if depth == key_path.len() {
-        if let Some(new_value) = new_value {
-            let new_val = to_pretty_json(new_value, tab_size, tab_size * depth);
-            (existing_value_range, new_val)
-        } else {
-            let mut removal_start = first_key_start.unwrap_or(existing_value_range.start);
-            let mut removal_end = existing_value_range.end;
-
-            // Find the actual key position by looking for the key in the pair
-            // We need to extend the range to include the key, not just the value
-            if let Some(key_start) = text[..existing_value_range.start].rfind('"') {
-                if let Some(prev_key_start) = text[..key_start].rfind('"') {
-                    removal_start = prev_key_start;
-                } else {
-                    removal_start = key_start;
-                }
-            }
-
-            // Look backward for a preceding comma first
-            let preceding_text = text.get(0..removal_start).unwrap_or("");
-            if let Some(comma_pos) = preceding_text.rfind(',') {
-                // Check if there are only whitespace characters between the comma and our key
-                let between_comma_and_key = text.get(comma_pos + 1..removal_start).unwrap_or("");
-                if between_comma_and_key.trim().is_empty() {
-                    removal_start = comma_pos;
-                }
-            }
-
-            if let Some(remaining_text) = text.get(existing_value_range.end..) {
-                let mut chars = remaining_text.char_indices();
-                while let Some((offset, ch)) = chars.next() {
-                    if ch == ',' {
-                        removal_end = existing_value_range.end + offset + 1;
-                        // Also consume whitespace after the comma
-                        while let Some((_, next_ch)) = chars.next() {
-                            if next_ch.is_whitespace() {
-                                removal_end += next_ch.len_utf8();
-                            } else {
-                                break;
-                            }
-                        }
-                        break;
-                    } else if !ch.is_whitespace() {
-                        break;
-                    }
-                }
-            }
-            (removal_start..removal_end, String::new())
-        }
-    } else {
-        // We have key paths, construct the sub objects
-        let new_key = key_path[depth];
-
-        // We don't have the key, construct the nested objects
-        let mut new_value =
-            serde_json::to_value(new_value.unwrap_or(&serde_json::Value::Null)).unwrap();
-        for key in key_path[(depth + 1)..].iter().rev() {
-            new_value = serde_json::json!({ key.to_string(): new_value });
-        }
-
-        if let Some(first_key_start) = first_key_start {
-            let mut row = 0;
-            let mut column = 0;
-            for (ix, char) in text.char_indices() {
-                if ix == first_key_start {
-                    break;
-                }
-                if char == '\n' {
-                    row += 1;
-                    column = 0;
-                } else {
-                    column += char.len_utf8();
-                }
-            }
-
-            if row > 0 {
-                // depth is 0 based, but division needs to be 1 based.
-                let new_val = to_pretty_json(&new_value, column / (depth + 1), column);
-                let space = ' ';
-                let content = format!("\"{new_key}\": {new_val},\n{space:width$}", width = column);
-                (first_key_start..first_key_start, content)
-            } else {
-                let new_val = serde_json::to_string(&new_value).unwrap();
-                let mut content = format!(r#""{new_key}": {new_val},"#);
-                content.push(' ');
-                (first_key_start..first_key_start, content)
-            }
-        } else {
-            new_value = serde_json::json!({ new_key.to_string(): new_value });
-            let indent_prefix_len = 4 * depth;
-            let mut new_val = to_pretty_json(&new_value, 4, indent_prefix_len);
-            if depth == 0 {
-                new_val.push('\n');
-            }
-
-            (existing_value_range, new_val)
-        }
-    }
-}
-
-fn to_pretty_json(value: &impl Serialize, indent_size: usize, indent_prefix_len: usize) -> String {
-    const SPACES: [u8; 32] = [b' '; 32];
-
-    debug_assert!(indent_size <= SPACES.len());
-    debug_assert!(indent_prefix_len <= SPACES.len());
-
-    let mut output = Vec::new();
-    let mut ser = serde_json::Serializer::with_formatter(
-        &mut output,
-        serde_json::ser::PrettyFormatter::with_indent(&SPACES[0..indent_size.min(SPACES.len())]),
-    );
-
-    value.serialize(&mut ser).unwrap();
-    let text = String::from_utf8(output).unwrap();
-
-    let mut adjusted_text = String::new();
-    for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
-            adjusted_text.push_str(str::from_utf8(&SPACES[0..indent_prefix_len]).unwrap());
-        }
-        adjusted_text.push_str(line);
-        adjusted_text.push('\n');
-    }
-    adjusted_text.pop();
-    adjusted_text
-}
-
-pub fn parse_json_with_comments<T: DeserializeOwned>(content: &str) -> Result<T> {
-    Ok(serde_json_lenient::from_str(content)?)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::VsCodeSettingsSource;
+    use std::num::NonZeroU32;
+
+    use crate::{
+        ClosePosition, ItemSettingsContent, VsCodeSettingsSource, default_settings,
+        settings_content::LanguageSettingsContent, test_settings,
+    };
 
     use super::*;
-    use serde_derive::Deserialize;
     use unindent::Unindent;
+    use util::rel_path::rel_path;
+
+    #[derive(Debug, PartialEq)]
+    struct AutoUpdateSetting {
+        auto_update: bool,
+    }
+
+    impl Settings for AutoUpdateSetting {
+        fn from_settings(content: &SettingsContent) -> Self {
+            AutoUpdateSetting {
+                auto_update: content.auto_update.unwrap(),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ItemSettings {
+        close_position: ClosePosition,
+        git_status: bool,
+    }
+
+    impl Settings for ItemSettings {
+        fn from_settings(content: &SettingsContent) -> Self {
+            let content = content.tabs.clone().unwrap();
+            ItemSettings {
+                close_position: content.close_position.unwrap(),
+                git_status: content.git_status.unwrap(),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct DefaultLanguageSettings {
+        tab_size: NonZeroU32,
+        preferred_line_length: u32,
+    }
+
+    impl Settings for DefaultLanguageSettings {
+        fn from_settings(content: &SettingsContent) -> Self {
+            let content = &content.project.all_languages.defaults;
+            DefaultLanguageSettings {
+                tab_size: content.tab_size.unwrap(),
+                preferred_line_length: content.preferred_line_length.unwrap(),
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct ThemeSettings {
+        buffer_font_family: FontFamilyName,
+        buffer_font_fallbacks: Vec<FontFamilyName>,
+    }
+
+    impl Settings for ThemeSettings {
+        fn from_settings(content: &SettingsContent) -> Self {
+            let content = content.theme.clone();
+            ThemeSettings {
+                buffer_font_family: content.buffer_font_family.unwrap(),
+                buffer_font_fallbacks: content.buffer_font_fallbacks.unwrap(),
+            }
+        }
+    }
 
     #[gpui::test]
     fn test_settings_store_basic(cx: &mut App) {
-        let mut store = SettingsStore::new(cx);
-        store.register_setting::<UserSettings>(cx);
-        store.register_setting::<TurboSetting>(cx);
-        store.register_setting::<MultiKeySettings>(cx);
-        store
-            .set_default_settings(
-                r#"{
-                    "turbo": false,
-                    "user": {
-                        "name": "John Doe",
-                        "age": 30,
-                        "staff": false
-                    }
-                }"#,
-                cx,
-            )
-            .unwrap();
+        let mut store = SettingsStore::new(cx, &default_settings());
+        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ItemSettings>();
+        store.register_setting::<DefaultLanguageSettings>();
 
-        assert_eq!(store.get::<TurboSetting>(None), &TurboSetting(false));
         assert_eq!(
-            store.get::<UserSettings>(None),
-            &UserSettings {
-                name: "John Doe".to_string(),
-                age: 30,
-                staff: false,
-            }
+            store.get::<AutoUpdateSetting>(None),
+            &AutoUpdateSetting { auto_update: true }
         );
         assert_eq!(
-            store.get::<MultiKeySettings>(None),
-            &MultiKeySettings {
-                key1: String::new(),
-                key2: String::new(),
-            }
+            store.get::<ItemSettings>(None).close_position,
+            ClosePosition::Right
         );
 
         store
             .set_user_settings(
                 r#"{
-                    "turbo": true,
-                    "user": { "age": 31 },
-                    "key1": "a"
+                    "auto_update": false,
+                    "tabs": {
+                      "close_position": "left"
+                    }
                 }"#,
                 cx,
             )
             .unwrap();
 
-        assert_eq!(store.get::<TurboSetting>(None), &TurboSetting(true));
         assert_eq!(
-            store.get::<UserSettings>(None),
-            &UserSettings {
-                name: "John Doe".to_string(),
-                age: 31,
-                staff: false
-            }
+            store.get::<AutoUpdateSetting>(None),
+            &AutoUpdateSetting { auto_update: false }
+        );
+        assert_eq!(
+            store.get::<ItemSettings>(None).close_position,
+            ClosePosition::Left
         );
 
         store
             .set_local_settings(
                 WorktreeId::from_usize(1),
-                Path::new("/root1").into(),
+                rel_path("root1").into(),
                 LocalSettingsKind::Settings,
-                Some(r#"{ "user": { "staff": true } }"#),
+                Some(r#"{ "tab_size": 5 }"#),
                 cx,
             )
             .unwrap();
         store
             .set_local_settings(
                 WorktreeId::from_usize(1),
-                Path::new("/root1/subdir").into(),
+                rel_path("root1/subdir").into(),
                 LocalSettingsKind::Settings,
-                Some(r#"{ "user": { "name": "Jane Doe" } }"#),
+                Some(r#"{ "preferred_line_length": 50 }"#),
                 cx,
             )
             .unwrap();
@@ -1689,129 +1472,109 @@ mod tests {
         store
             .set_local_settings(
                 WorktreeId::from_usize(1),
-                Path::new("/root2").into(),
+                rel_path("root2").into(),
                 LocalSettingsKind::Settings,
-                Some(r#"{ "user": { "age": 42 }, "key2": "b" }"#),
+                Some(r#"{ "tab_size": 9, "auto_update": true}"#),
                 cx,
             )
             .unwrap();
 
         assert_eq!(
-            store.get::<UserSettings>(Some(SettingsLocation {
+            store.get::<DefaultLanguageSettings>(Some(SettingsLocation {
                 worktree_id: WorktreeId::from_usize(1),
-                path: Path::new("/root1/something"),
+                path: rel_path("root1/something"),
             })),
-            &UserSettings {
-                name: "John Doe".to_string(),
-                age: 31,
-                staff: true
+            &DefaultLanguageSettings {
+                preferred_line_length: 80,
+                tab_size: 5.try_into().unwrap(),
             }
         );
         assert_eq!(
-            store.get::<UserSettings>(Some(SettingsLocation {
+            store.get::<DefaultLanguageSettings>(Some(SettingsLocation {
                 worktree_id: WorktreeId::from_usize(1),
-                path: Path::new("/root1/subdir/something")
+                path: rel_path("root1/subdir/something"),
             })),
-            &UserSettings {
-                name: "Jane Doe".to_string(),
-                age: 31,
-                staff: true
+            &DefaultLanguageSettings {
+                preferred_line_length: 50,
+                tab_size: 5.try_into().unwrap(),
             }
         );
         assert_eq!(
-            store.get::<UserSettings>(Some(SettingsLocation {
+            store.get::<DefaultLanguageSettings>(Some(SettingsLocation {
                 worktree_id: WorktreeId::from_usize(1),
-                path: Path::new("/root2/something")
+                path: rel_path("root2/something"),
             })),
-            &UserSettings {
-                name: "John Doe".to_string(),
-                age: 42,
-                staff: false
+            &DefaultLanguageSettings {
+                preferred_line_length: 80,
+                tab_size: 9.try_into().unwrap(),
             }
         );
         assert_eq!(
-            store.get::<MultiKeySettings>(Some(SettingsLocation {
+            store.get::<AutoUpdateSetting>(Some(SettingsLocation {
                 worktree_id: WorktreeId::from_usize(1),
-                path: Path::new("/root2/something")
+                path: rel_path("root2/something")
             })),
-            &MultiKeySettings {
-                key1: "a".to_string(),
-                key2: "b".to_string(),
-            }
+            &AutoUpdateSetting { auto_update: false }
         );
     }
 
     #[gpui::test]
     fn test_setting_store_assign_json_before_register(cx: &mut App) {
-        let mut store = SettingsStore::new(cx);
+        let mut store = SettingsStore::new(cx, &test_settings());
         store
-            .set_default_settings(
-                r#"{
-                    "turbo": true,
-                    "user": {
-                        "name": "John Doe",
-                        "age": 30,
-                        "staff": false
-                    },
-                    "key1": "x"
-                }"#,
-                cx,
-            )
+            .set_user_settings(r#"{ "auto_update": false }"#, cx)
             .unwrap();
-        store
-            .set_user_settings(r#"{ "turbo": false }"#, cx)
-            .unwrap();
-        store.register_setting::<UserSettings>(cx);
-        store.register_setting::<TurboSetting>(cx);
+        store.register_setting::<AutoUpdateSetting>();
 
-        assert_eq!(store.get::<TurboSetting>(None), &TurboSetting(false));
         assert_eq!(
-            store.get::<UserSettings>(None),
-            &UserSettings {
-                name: "John Doe".to_string(),
-                age: 30,
-                staff: false,
-            }
+            store.get::<AutoUpdateSetting>(None),
+            &AutoUpdateSetting { auto_update: false }
         );
+    }
 
-        store.register_setting::<MultiKeySettings>(cx);
-        assert_eq!(
-            store.get::<MultiKeySettings>(None),
-            &MultiKeySettings {
-                key1: "x".into(),
-                key2: String::new(),
-            }
-        );
+    #[track_caller]
+    fn check_settings_update(
+        store: &mut SettingsStore,
+        old_json: String,
+        update: fn(&mut SettingsContent),
+        expected_new_json: String,
+        cx: &mut App,
+    ) {
+        store.set_user_settings(&old_json, cx).ok();
+        let edits = store.edits_for_update(&old_json, update);
+        let mut new_json = old_json;
+        for (range, replacement) in edits.into_iter() {
+            new_json.replace_range(range, &replacement);
+        }
+        pretty_assertions::assert_eq!(new_json, expected_new_json);
     }
 
     #[gpui::test]
     fn test_setting_store_update(cx: &mut App) {
-        let mut store = SettingsStore::new(cx);
-        store.register_setting::<MultiKeySettings>(cx);
-        store.register_setting::<UserSettings>(cx);
-        store.register_setting::<LanguageSettings>(cx);
+        let mut store = SettingsStore::new(cx, &test_settings());
 
         // entries added and updated
-        check_settings_update::<LanguageSettings>(
+        check_settings_update(
             &mut store,
             r#"{
                 "languages": {
                     "JSON": {
-                        "language_setting_1": true
+                        "auto_indent": true
                     }
                 }
             }"#
             .unindent(),
             |settings| {
                 settings
-                    .languages
+                    .languages_mut()
                     .get_mut("JSON")
                     .unwrap()
-                    .language_setting_1 = Some(false);
-                settings.languages.insert(
+                    .auto_indent = Some(false);
+
+                settings.languages_mut().insert(
                     "Rust".into(),
-                    LanguageSettingEntry {
-                        language_setting_2: Some(true),
+                    LanguageSettingsContent {
+                        auto_indent: Some(true),
                         ..Default::default()
                     },
                 );
@@ -1819,10 +1582,10 @@ mod tests {
             r#"{
                 "languages": {
                     "Rust": {
-                        "language_setting_2": true
+                        "auto_indent": true
                     },
                     "JSON": {
-                        "language_setting_1": false
+                        "auto_indent": false
                     }
                 }
             }"#
@@ -1831,7 +1594,7 @@ mod tests {
         );
 
         // entries removed
-        check_settings_update::<LanguageSettings>(
+        check_settings_update(
             &mut store,
             r#"{
                 "languages": {
@@ -1845,7 +1608,7 @@ mod tests {
             }"#
             .unindent(),
             |settings| {
-                settings.languages.remove("JSON").unwrap();
+                settings.languages_mut().remove("JSON").unwrap();
             },
             r#"{
                 "languages": {
@@ -1858,7 +1621,7 @@ mod tests {
             cx,
         );
 
-        check_settings_update::<LanguageSettings>(
+        check_settings_update(
             &mut store,
             r#"{
                 "languages": {
@@ -1872,7 +1635,7 @@ mod tests {
             }"#
             .unindent(),
             |settings| {
-                settings.languages.remove("Rust").unwrap();
+                settings.languages_mut().remove("Rust").unwrap();
             },
             r#"{
                 "languages": {
@@ -1886,40 +1649,42 @@ mod tests {
         );
 
         // weird formatting
-        check_settings_update::<UserSettings>(
+        check_settings_update(
             &mut store,
             r#"{
-                "user":   { "age": 36, "name": "Max", "staff": true }
-            }"#
+                "tabs":   { "close_position": "left", "name": "Max"  }
+                }"#
             .unindent(),
-            |settings| settings.age = Some(37),
+            |settings| {
+                settings.tabs.as_mut().unwrap().close_position = Some(ClosePosition::Left);
+            },
             r#"{
-                "user":   { "age": 37, "name": "Max", "staff": true }
-            }"#
+                "tabs":   { "close_position": "left", "name": "Max"  }
+                }"#
             .unindent(),
             cx,
         );
 
         // single-line formatting, other keys
-        check_settings_update::<MultiKeySettings>(
+        check_settings_update(
             &mut store,
-            r#"{ "one": 1, "two": 2 }"#.unindent(),
-            |settings| settings.key1 = Some("x".into()),
-            r#"{ "key1": "x", "one": 1, "two": 2 }"#.unindent(),
+            r#"{ "one": 1, "two": 2 }"#.to_owned(),
+            |settings| settings.auto_update = Some(true),
+            r#"{ "auto_update": true, "one": 1, "two": 2 }"#.to_owned(),
             cx,
         );
 
         // empty object
-        check_settings_update::<UserSettings>(
+        check_settings_update(
             &mut store,
             r#"{
-                "user": {}
+                "tabs": {}
             }"#
             .unindent(),
-            |settings| settings.age = Some(37),
+            |settings| settings.tabs.as_mut().unwrap().close_position = Some(ClosePosition::Left),
             r#"{
-                "user": {
-                    "age": 37
+                "tabs": {
+                    "close_position": "left"
                 }
             }"#
             .unindent(),
@@ -1927,31 +1692,36 @@ mod tests {
         );
 
         // no content
-        check_settings_update::<UserSettings>(
+        check_settings_update(
             &mut store,
             r#""#.unindent(),
-            |settings| settings.age = Some(37),
+            |settings| {
+                settings.tabs = Some(ItemSettingsContent {
+                    git_status: Some(true),
+                    ..Default::default()
+                })
+            },
             r#"{
-                "user": {
-                    "age": 37
-                }
+              "tabs": {
+                "git_status": true
+              }
             }
             "#
             .unindent(),
             cx,
         );
 
-        check_settings_update::<UserSettings>(
+        check_settings_update(
             &mut store,
             r#"{
             }
             "#
             .unindent(),
-            |settings| settings.age = Some(37),
+            |settings| settings.title_bar.get_or_insert_default().show_branch_name = Some(true),
             r#"{
-                "user": {
-                    "age": 37
-                }
+              "title_bar": {
+                "show_branch_name": true
+              }
             }
             "#
             .unindent(),
@@ -1961,11 +1731,11 @@ mod tests {
 
     #[gpui::test]
     fn test_vscode_import(cx: &mut App) {
-        let mut store = SettingsStore::new(cx);
-        store.register_setting::<UserSettings>(cx);
-        store.register_setting::<JournalSettings>(cx);
-        store.register_setting::<LanguageSettings>(cx);
-        store.register_setting::<MultiKeySettings>(cx);
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+        store.register_setting::<ItemSettings>();
+        store.register_setting::<AutoUpdateSetting>();
+        store.register_setting::<ThemeSettings>();
 
         // create settings that werent present
         check_vscode_import(
@@ -1974,11 +1744,10 @@ mod tests {
             }
             "#
             .unindent(),
-            r#" { "user.age": 37 } "#.to_owned(),
+            r#" { "editor.tabSize": 37 } "#.to_owned(),
             r#"{
-                "user": {
-                    "age": 37
-                }
+              "base_keymap": "VSCode",
+              "tab_size": 37
             }
             "#
             .unindent(),
@@ -1989,19 +1758,15 @@ mod tests {
         check_vscode_import(
             &mut store,
             r#"{
-                "user": {
-                    "staff": true,
-                    "age": 37
-                }
+                "preferred_line_length": 99,
             }
             "#
             .unindent(),
-            r#"{ "user.age": 42 }"#.to_owned(),
+            r#"{ "editor.tabSize": 42 }"#.to_owned(),
             r#"{
-                "user": {
-                    "staff": true,
-                    "age": 42
-                }
+                "base_keymap": "VSCode",
+                "tab_size": 42,
+                "preferred_line_length": 99,
             }
             "#
             .unindent(),
@@ -2012,19 +1777,16 @@ mod tests {
         check_vscode_import(
             &mut store,
             r#"{
-                "user": {
-                    "staff": true,
-                    "age": 37
-                }
+                "preferred_line_length": 99,
+                "tab_size": 42
             }
             "#
             .unindent(),
             r#"{}"#.to_owned(),
             r#"{
-                "user": {
-                    "staff": true,
-                    "age": 37
-                }
+                "base_keymap": "VSCode",
+                "preferred_line_length": 99,
+                "tab_size": 42
             }
             "#
             .unindent(),
@@ -2035,105 +1797,50 @@ mod tests {
         check_vscode_import(
             &mut store,
             r#"{
-                "journal": {
-                "hour_format": "hour12"
-                }
             }
             "#
             .unindent(),
-            r#"{ "time_format": "24" }"#.to_owned(),
+            r#"{ "git.decorations.enabled": true }"#.to_owned(),
             r#"{
-                "journal": {
-                "hour_format": "hour24"
-                }
-            }
-            "#
-            .unindent(),
-            cx,
-        );
-
-        // Multiple keys for one setting
-        check_vscode_import(
-            &mut store,
-            r#"{
-                "key1": "value"
-            }
-            "#
-            .unindent(),
-            r#"{
-                "key_1_first": "hello",
-                "key_1_second": "world"
-            }"#
-            .to_owned(),
-            r#"{
-                "key1": "hello world"
+              "project_panel": {
+                "git_status": true
+              },
+              "outline_panel": {
+                "git_status": true
+              },
+              "base_keymap": "VSCode",
+              "tabs": {
+                "git_status": true
+              }
             }
             "#
             .unindent(),
             cx,
         );
 
-        // Merging lists together entries added and updated
+        // font-family
         check_vscode_import(
             &mut store,
             r#"{
-                "languages": {
-                    "JSON": {
-                        "language_setting_1": true
-                    },
-                    "Rust": {
-                        "language_setting_2": true
-                    }
-                }
-            }"#
+            }
+            "#
             .unindent(),
+            r#"{ "editor.fontFamily": "Cascadia Code, 'Consolas', Courier New" }"#.to_owned(),
             r#"{
-                "vscode_languages": [
-                    {
-                        "name": "JavaScript",
-                        "language_setting_1": true
-                    },
-                    {
-                        "name": "Rust",
-                        "language_setting_2": false
-                    }
-                ]
-            }"#
-            .to_owned(),
-            r#"{
-                "languages": {
-                    "JavaScript": {
-                        "language_setting_1": true
-                    },
-                    "JSON": {
-                        "language_setting_1": true
-                    },
-                    "Rust": {
-                        "language_setting_2": false
-                    }
-                }
-            }"#
+              "base_keymap": "VSCode",
+              "buffer_font_fallbacks": [
+                "Consolas",
+                "Courier New"
+              ],
+              "buffer_font_family": "Cascadia Code"
+            }
+            "#
             .unindent(),
             cx,
         );
     }
 
-    fn check_settings_update<T: Settings>(
-        store: &mut SettingsStore,
-        old_json: String,
-        update: fn(&mut T::FileContent),
-        expected_new_json: String,
-        cx: &mut App,
-    ) {
-        store.set_user_settings(&old_json, cx).ok();
-        let edits = store.edits_for_update::<T>(&old_json, update);
-        let mut new_json = old_json;
-        for (range, replacement) in edits.into_iter() {
-            new_json.replace_range(range, &replacement);
-        }
-        pretty_assertions::assert_eq!(new_json, expected_new_json);
-    }
-
+    #[track_caller]
     fn check_vscode_import(
         store: &mut SettingsStore,
         old: String,
@@ -2149,145 +1856,44 @@ mod tests {
         pretty_assertions::assert_eq!(new, expected);
     }
 
-    #[derive(Debug, PartialEq, Deserialize)]
-    struct UserSettings {
-        name: String,
-        age: u32,
-        staff: bool,
-    }
+    #[gpui::test]
+    fn test_update_git_settings(cx: &mut App) {
+        let store = SettingsStore::new(cx, &test_settings());
 
-    #[derive(Default, Clone, Serialize, Deserialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    struct UserSettingsContent {
-        name: Option<String>,
-        age: Option<u32>,
-        staff: Option<bool>,
-    }
-
-    impl Settings for UserSettings {
-        const KEY: Option<&'static str> = Some("user");
-        type FileContent = UserSettingsContent;
-
-        fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-            sources.json_merge()
-        }
-
-        fn import_from_vscode(vscode: &VsCodeSettings, current: &mut Self::FileContent) {
-            vscode.u32_setting("user.age", &mut current.age);
-        }
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct TurboSetting(bool);
-
-    impl Settings for TurboSetting {
-        const KEY: Option<&'static str> = Some("turbo");
-        type FileContent = Option<bool>;
-
-        fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-            sources.json_merge()
-        }
-
-        fn import_from_vscode(_vscode: &VsCodeSettings, _current: &mut Self::FileContent) {}
-    }
-
-    #[derive(Clone, Debug, PartialEq, Deserialize)]
-    struct MultiKeySettings {
-        #[serde(default)]
-        key1: String,
-        #[serde(default)]
-        key2: String,
-    }
-
-    #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    struct MultiKeySettingsJson {
-        key1: Option<String>,
-        key2: Option<String>,
-    }
-
-    impl Settings for MultiKeySettings {
-        const KEY: Option<&'static str> = None;
-
-        type FileContent = MultiKeySettingsJson;
-
-        fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-            sources.json_merge()
-        }
-
-        fn import_from_vscode(vscode: &VsCodeSettings, current: &mut Self::FileContent) {
-            let first_value = vscode.read_string("key_1_first");
-            let second_value = vscode.read_string("key_1_second");
-
-            if let Some((first, second)) = first_value.zip(second_value) {
-                current.key1 = Some(format!("{} {}", first, second));
+        let actual = store.new_text_for_update("{}".to_string(), |current| {
+            current
+                .git
+                .get_or_insert_default()
+                .inline_blame
+                .get_or_insert_default()
+                .enabled = Some(true);
+        });
+        pretty_assertions::assert_str_eq!(
+            actual,
+            r#"{
+              "git": {
+                "inline_blame": {
+                  "enabled": true
+                }
+              }
             }
-        }
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct JournalSettings {
-        pub path: String,
-        pub hour_format: HourFormat,
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-    #[serde(rename_all = "snake_case")]
-    enum HourFormat {
-        Hour12,
-        Hour24,
-    }
-
-    #[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    struct JournalSettingsJson {
-        pub path: Option<String>,
-        pub hour_format: Option<HourFormat>,
-    }
-
-    impl Settings for JournalSettings {
-        const KEY: Option<&'static str> = Some("journal");
-
-        type FileContent = JournalSettingsJson;
-
-        fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-            sources.json_merge()
-        }
-
-        fn import_from_vscode(vscode: &VsCodeSettings, current: &mut Self::FileContent) {
-            vscode.enum_setting("time_format", &mut current.hour_format, |s| match s {
-                "12" => Some(HourFormat::Hour12),
-                "24" => Some(HourFormat::Hour24),
-                _ => None,
-            });
-        }
+            "#
+            .unindent()
+        );
     }
 
     #[gpui::test]
     fn test_global_settings(cx: &mut App) {
-        let mut store = SettingsStore::new(cx);
-        store.register_setting::<UserSettings>(cx);
-        store
-            .set_default_settings(
-                r#"{
-                    "user": {
-                        "name": "John Doe",
-                        "age": 30,
-                        "staff": false
-                    }
-                }"#,
-                cx,
-            )
-            .unwrap();
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<ItemSettings>();
 
         // Set global settings - these should override defaults but not user settings
         store
             .set_global_settings(
                 r#"{
-                    "user": {
-                        "name": "Global User",
-                        "age": 35,
-                        "staff": true
+                    "tabs": {
+                        "close_position": "right",
+                        "git_status": true,
                     }
                 }"#,
                 cx,
@@ -2296,11 +1902,10 @@ mod tests {
 
         // Before user settings, global settings should apply
         assert_eq!(
-            store.get::<UserSettings>(None),
-            &UserSettings {
-                name: "Global User".to_string(),
-                age: 35,
-                staff: true,
+            store.get::<ItemSettings>(None),
+            &ItemSettings {
+                close_position: ClosePosition::Right,
+                git_status: true,
             }
         );
 
@@ -2308,8 +1913,8 @@ mod tests {
         store
             .set_user_settings(
                 r#"{
-                    "user": {
-                        "age": 40
+                    "tabs": {
+                        "close_position": "left"
                     }
                 }"#,
                 cx,
@@ -2318,60 +1923,373 @@ mod tests {
 
         // User settings should override global settings
         assert_eq!(
-            store.get::<UserSettings>(None),
-            &UserSettings {
-                name: "Global User".to_string(), // Name from global settings
-                age: 40,                         // Age from user settings
-                staff: true,                     // Staff from global settings
+            store.get::<ItemSettings>(None),
+            &ItemSettings {
+                close_position: ClosePosition::Left,
+                git_status: true, // Staff from global settings
             }
         );
     }
 
-    #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-    struct LanguageSettings {
-        #[serde(default)]
-        languages: HashMap<String, LanguageSettingEntry>,
-    }
+    #[gpui::test]
+    fn test_get_value_for_field_basic(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
 
-    #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-    #[schemars(deny_unknown_fields)]
-    struct LanguageSettingEntry {
-        language_setting_1: Option<bool>,
-        language_setting_2: Option<bool>,
-    }
+        store
+            .set_user_settings(r#"{"preferred_line_length": 0}"#, cx)
+            .unwrap();
+        let local = (WorktreeId::from_usize(0), RelPath::empty().into_arc());
+        store
+            .set_local_settings(
+                local.0,
+                local.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
 
-    impl Settings for LanguageSettings {
-        const KEY: Option<&'static str> = None;
-
-        type FileContent = Self;
-
-        fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> Result<Self> {
-            sources.json_merge()
+        fn get(content: &SettingsContent) -> Option<&u32> {
+            content
+                .project
+                .all_languages
+                .defaults
+                .preferred_line_length
+                .as_ref()
         }
 
-        fn import_from_vscode(vscode: &VsCodeSettings, current: &mut Self::FileContent) {
-            current.languages.extend(
-                vscode
-                    .read_value("vscode_languages")
-                    .and_then(|value| value.as_array())
-                    .map(|languages| {
-                        languages
-                            .iter()
-                            .filter_map(|value| value.as_object())
-                            .filter_map(|item| {
-                                let mut rest = item.clone();
-                                let name = rest.remove("name")?.as_str()?.to_string();
-                                let entry = serde_json::from_value::<LanguageSettingEntry>(
-                                    serde_json::Value::Object(rest),
-                                )
-                                .ok()?;
+        let default_value = *get(&store.default_settings).unwrap();
 
-                                Some((name, entry))
-                            })
-                    })
-                    .into_iter()
-                    .flatten(),
-            );
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local.clone()), get),
+            (SettingsFile::User, Some(&0))
+        );
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::User, get),
+            (SettingsFile::User, Some(&0))
+        );
+        store.set_user_settings(r#"{}"#, cx).unwrap();
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local.clone()), get),
+            (SettingsFile::Default, Some(&default_value))
+        );
+        store
+            .set_local_settings(
+                local.0,
+                local.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 80}"#),
+                cx,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local.clone()), get),
+            (SettingsFile::Project(local), Some(&80))
+        );
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::User, get),
+            (SettingsFile::Default, Some(&default_value))
+        );
+    }
+
+    #[gpui::test]
+    fn test_get_value_for_field_local_worktrees_dont_interfere(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+        store.register_setting::<AutoUpdateSetting>();
+
+        let local_1 = (WorktreeId::from_usize(0), RelPath::empty().into_arc());
+
+        let local_1_child = (
+            WorktreeId::from_usize(0),
+            RelPath::new(
+                std::path::Path::new("child1"),
+                util::paths::PathStyle::Posix,
+            )
+            .unwrap()
+            .into_arc(),
+        );
+
+        let local_2 = (WorktreeId::from_usize(1), RelPath::empty().into_arc());
+        let local_2_child = (
+            WorktreeId::from_usize(1),
+            RelPath::new(
+                std::path::Path::new("child2"),
+                util::paths::PathStyle::Posix,
+            )
+            .unwrap()
+            .into_arc(),
+        );
+
+        fn get(content: &SettingsContent) -> Option<&u32> {
+            content
+                .project
+                .all_languages
+                .defaults
+                .preferred_line_length
+                .as_ref()
         }
+
+        store
+            .set_local_settings(
+                local_1.0,
+                local_1.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 1}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                local_1_child.0,
+                local_1_child.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                local_2.0,
+                local_2.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 2}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                local_2_child.0,
+                local_2_child.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
+
+        // each local child should only inherit from it's parent
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local_2_child), get),
+            (SettingsFile::Project(local_2), Some(&2))
+        );
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local_1_child.clone()), get),
+            (SettingsFile::Project(local_1.clone()), Some(&1))
+        );
+
+        // adjacent children should be treated as siblings not inherit from each other
+        let local_1_adjacent_child = (local_1.0, rel_path("adjacent_child").into_arc());
+        store
+            .set_local_settings(
+                local_1_adjacent_child.0,
+                local_1_adjacent_child.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                local_1_child.0,
+                local_1_child.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 3}"#),
+                cx,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local_1_adjacent_child.clone()), get),
+            (SettingsFile::Project(local_1.clone()), Some(&1))
+        );
+        store
+            .set_local_settings(
+                local_1_adjacent_child.0,
+                local_1_adjacent_child.1,
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 3}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                local_1_child.0,
+                local_1_child.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_value_from_file(SettingsFile::Project(local_1_child), get),
+            (SettingsFile::Project(local_1), Some(&1))
+        );
+    }
+
+    #[gpui::test]
+    fn test_get_overrides_for_field(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &test_settings());
+        store.register_setting::<DefaultLanguageSettings>();
+
+        let wt0_root = (WorktreeId::from_usize(0), RelPath::empty().into_arc());
+        let wt0_child1 = (WorktreeId::from_usize(0), rel_path("child1").into_arc());
+        let wt0_child2 = (WorktreeId::from_usize(0), rel_path("child2").into_arc());
+
+        let wt1_root = (WorktreeId::from_usize(1), RelPath::empty().into_arc());
+        let wt1_subdir = (WorktreeId::from_usize(1), rel_path("subdir").into_arc());
+
+        fn get(content: &SettingsContent) -> &Option<u32> {
+            &content.project.all_languages.defaults.preferred_line_length
+        }
+
+        store
+            .set_user_settings(r#"{"preferred_line_length": 100}"#, cx)
+            .unwrap();
+
+        store
+            .set_local_settings(
+                wt0_root.0,
+                wt0_root.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 80}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                wt0_child1.0,
+                wt0_child1.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 120}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                wt0_child2.0,
+                wt0_child2.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
+
+        store
+            .set_local_settings(
+                wt1_root.0,
+                wt1_root.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 90}"#),
+                cx,
+            )
+            .unwrap();
+        store
+            .set_local_settings(
+                wt1_subdir.0,
+                wt1_subdir.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{}"#),
+                cx,
+            )
+            .unwrap();
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Default, get);
+        assert_eq!(
+            overrides,
+            vec![
+                SettingsFile::User,
+                SettingsFile::Project(wt0_root.clone()),
+                SettingsFile::Project(wt0_child1.clone()),
+                SettingsFile::Project(wt1_root.clone()),
+            ]
+        );
+
+        let overrides = store.get_overrides_for_field(SettingsFile::User, get);
+        assert_eq!(
+            overrides,
+            vec![
+                SettingsFile::Project(wt0_root.clone()),
+                SettingsFile::Project(wt0_child1.clone()),
+                SettingsFile::Project(wt1_root.clone()),
+            ]
+        );
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Project(wt0_root), get);
+        assert_eq!(overrides, vec![]);
+
+        let overrides =
+            store.get_overrides_for_field(SettingsFile::Project(wt0_child1.clone()), get);
+        assert_eq!(overrides, vec![]);
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Project(wt0_child2), get);
+        assert_eq!(overrides, vec![]);
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Project(wt1_root), get);
+        assert_eq!(overrides, vec![]);
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Project(wt1_subdir), get);
+        assert_eq!(overrides, vec![]);
+
+        let wt0_deep_child = (
+            WorktreeId::from_usize(0),
+            rel_path("child1/subdir").into_arc(),
+        );
+        store
+            .set_local_settings(
+                wt0_deep_child.0,
+                wt0_deep_child.1.clone(),
+                LocalSettingsKind::Settings,
+                Some(r#"{"preferred_line_length": 140}"#),
+                cx,
+            )
+            .unwrap();
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Project(wt0_deep_child), get);
+        assert_eq!(overrides, vec![]);
+
+        let overrides = store.get_overrides_for_field(SettingsFile::Project(wt0_child1), get);
+        assert_eq!(overrides, vec![]);
+    }
+
+    #[test]
+    fn test_file_ord() {
+        let wt0_root =
+            SettingsFile::Project((WorktreeId::from_usize(0), RelPath::empty().into_arc()));
+        let wt0_child1 =
+            SettingsFile::Project((WorktreeId::from_usize(0), rel_path("child1").into_arc()));
+        let wt0_child2 =
+            SettingsFile::Project((WorktreeId::from_usize(0), rel_path("child2").into_arc()));
+
+        let wt1_root =
+            SettingsFile::Project((WorktreeId::from_usize(1), RelPath::empty().into_arc()));
+        let wt1_subdir =
+            SettingsFile::Project((WorktreeId::from_usize(1), rel_path("subdir").into_arc()));
+
+        let mut files = vec![
+            &wt1_root,
+            &SettingsFile::Default,
+            &wt0_root,
+            &wt1_subdir,
+            &wt0_child2,
+            &SettingsFile::Server,
+            &wt0_child1,
+            &SettingsFile::User,
+        ];
+
+        files.sort();
+        pretty_assertions::assert_eq!(
+            files,
+            vec![
+                &wt0_child2,
+                &wt0_child1,
+                &wt0_root,
+                &wt1_subdir,
+                &wt1_root,
+                &SettingsFile::Server,
+                &SettingsFile::User,
+                &SettingsFile::Default,
+            ]
+        )
     }
 }

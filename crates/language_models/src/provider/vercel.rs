@@ -1,157 +1,90 @@
-use anyhow::{Context as _, Result, anyhow};
-use collections::{BTreeMap, HashMap};
-use credentials_provider::CredentialsProvider;
-
-use futures::Stream;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{AnyView, App, AsyncApp, Context, Entity, Subscription, Task, Window};
+use anyhow::{Result, anyhow};
+use collections::BTreeMap;
+use futures::{FutureExt, StreamExt, future, future::BoxFuture};
+use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::HttpClient;
 use language_model::{
     AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
     LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
     LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
-    RateLimiter, Role, StopReason,
+    LanguageModelToolChoice, RateLimiter, Role,
 };
-use menu;
-use open_ai::{ImageUrl, ResponseStreamEvent, stream_completion};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use open_ai::ResponseStreamEvent;
+pub use settings::VercelAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore};
-use std::pin::Pin;
-use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use strum::IntoEnumIterator;
-use vercel::Model;
-
-use ui::{ElevationIndex, List, Tooltip, prelude::*};
-use ui_input::SingleLineInput;
+use ui::{List, prelude::*};
+use ui_input::InputField;
 use util::ResultExt;
+use vercel::{Model, VERCEL_API_URL};
+use zed_env_vars::{EnvVar, env_var};
 
-use crate::{AllLanguageModelSettings, ui::InstructionListItem};
+use crate::{
+    api_key::ApiKeyState,
+    ui::{ConfiguredApiCard, InstructionListItem},
+};
 
-const PROVIDER_ID: &str = "vercel";
-const PROVIDER_NAME: &str = "Vercel";
+const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("vercel");
+const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("Vercel");
 
-#[derive(Default, Clone, Debug, PartialEq)]
+const API_KEY_ENV_VAR_NAME: &str = "VERCEL_API_KEY";
+static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VercelSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
-    pub needs_setting_migration: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AvailableModel {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub max_tokens: u64,
-    pub max_output_tokens: Option<u64>,
-    pub max_completion_tokens: Option<u64>,
 }
 
 pub struct VercelLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
 }
 
 pub struct State {
-    api_key: Option<String>,
-    api_key_from_env: bool,
-    _subscription: Subscription,
+    api_key_state: ApiKeyState,
 }
-
-const VERCEL_API_KEY_VAR: &str = "VERCEL_API_KEY";
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key.is_some()
+        self.api_key_state.has_key()
     }
 
-    fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let settings = &AllLanguageModelSettings::get_global(cx).vercel;
-        let api_url = if settings.api_url.is_empty() {
-            vercel::VERCEL_API_URL.to_string()
-        } else {
-            settings.api_url.clone()
-        };
-        cx.spawn(async move |this, cx| {
-            credentials_provider
-                .delete_credentials(&api_url, &cx)
-                .await
-                .log_err();
-            this.update(cx, |this, cx| {
-                this.api_key = None;
-                this.api_key_from_env = false;
-                cx.notify();
-            })
-        })
+    fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let api_url = VercelLanguageModelProvider::api_url(cx);
+        self.api_key_state
+            .store(api_url, api_key, |this| &mut this.api_key_state, cx)
     }
 
-    fn set_api_key(&mut self, api_key: String, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let settings = &AllLanguageModelSettings::get_global(cx).vercel;
-        let api_url = if settings.api_url.is_empty() {
-            vercel::VERCEL_API_URL.to_string()
-        } else {
-            settings.api_url.clone()
-        };
-        cx.spawn(async move |this, cx| {
-            credentials_provider
-                .write_credentials(&api_url, "Bearer", api_key.as_bytes(), &cx)
-                .await
-                .log_err();
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                cx.notify();
-            })
-        })
-    }
-
-    fn authenticate(&self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        if self.is_authenticated() {
-            return Task::ready(Ok(()));
-        }
-
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let settings = &AllLanguageModelSettings::get_global(cx).vercel;
-        let api_url = if settings.api_url.is_empty() {
-            vercel::VERCEL_API_URL.to_string()
-        } else {
-            settings.api_url.clone()
-        };
-        cx.spawn(async move |this, cx| {
-            let (api_key, from_env) = if let Ok(api_key) = std::env::var(VERCEL_API_KEY_VAR) {
-                (api_key, true)
-            } else {
-                let (_, api_key) = credentials_provider
-                    .read_credentials(&api_url, &cx)
-                    .await?
-                    .ok_or(AuthenticateError::CredentialsNotFound)?;
-                (
-                    String::from_utf8(api_key).context("invalid {PROVIDER_NAME} API key")?,
-                    false,
-                )
-            };
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                this.api_key_from_env = from_env;
-                cx.notify();
-            })?;
-
-            Ok(())
-        })
+    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        let api_url = VercelLanguageModelProvider::api_url(cx);
+        self.api_key_state.load_if_needed(
+            api_url,
+            &API_KEY_ENV_VAR,
+            |this| &mut this.api_key_state,
+            cx,
+        )
     }
 }
 
 impl VercelLanguageModelProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, cx: &mut App) -> Self {
-        let state = cx.new(|cx| State {
-            api_key: None,
-            api_key_from_env: false,
-            _subscription: cx.observe_global::<SettingsStore>(|_this: &mut State, cx| {
+        let state = cx.new(|cx| {
+            cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
+                let api_url = Self::api_url(cx);
+                this.api_key_state.handle_url_change(
+                    api_url,
+                    &API_KEY_ENV_VAR,
+                    |this| &mut this.api_key_state,
+                    cx,
+                );
                 cx.notify();
-            }),
+            })
+            .detach();
+            State {
+                api_key_state: ApiKeyState::new(Self::api_url(cx)),
+            }
         });
 
         Self { http_client, state }
@@ -166,23 +99,36 @@ impl VercelLanguageModelProvider {
             request_limiter: RateLimiter::new(4),
         })
     }
+
+    fn settings(cx: &App) -> &VercelSettings {
+        &crate::AllLanguageModelSettings::get_global(cx).vercel
+    }
+
+    fn api_url(cx: &App) -> SharedString {
+        let api_url = &Self::settings(cx).api_url;
+        if api_url.is_empty() {
+            VERCEL_API_URL.into()
+        } else {
+            SharedString::new(api_url.as_str())
+        }
+    }
 }
 
 impl LanguageModelProviderState for VercelLanguageModelProvider {
     type ObservableEntity = State;
 
-    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+    fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
         Some(self.state.clone())
     }
 }
 
 impl LanguageModelProvider for VercelLanguageModelProvider {
     fn id(&self) -> LanguageModelProviderId {
-        LanguageModelProviderId(PROVIDER_ID.into())
+        PROVIDER_ID
     }
 
     fn name(&self) -> LanguageModelProviderName {
-        LanguageModelProviderName(PROVIDER_NAME.into())
+        PROVIDER_NAME
     }
 
     fn icon(&self) -> IconName {
@@ -200,18 +146,13 @@ impl LanguageModelProvider for VercelLanguageModelProvider {
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
         let mut models = BTreeMap::default();
 
-        // Add base models from vercel::Model::iter()
         for model in vercel::Model::iter() {
             if !matches!(model, vercel::Model::Custom { .. }) {
                 models.insert(model.id().to_string(), model);
             }
         }
 
-        // Override with available models from settings
-        for model in &AllLanguageModelSettings::get_global(cx)
-            .vercel
-            .available_models
-        {
+        for model in &Self::settings(cx).available_models {
             models.insert(
                 model.name.clone(),
                 vercel::Model::Custom {
@@ -238,20 +179,26 @@ impl LanguageModelProvider for VercelLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(&self, window: &mut Window, cx: &mut App) -> AnyView {
+    fn configuration_view(
+        &self,
+        _target_agent: language_model::ConfigurationViewTargetAgent,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyView {
         cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
             .into()
     }
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
-        self.state.update(cx, |state, cx| state.reset_api_key(cx))
+        self.state
+            .update(cx, |state, cx| state.set_api_key(None, cx))
     }
 }
 
 pub struct VercelLanguageModel {
     id: LanguageModelId,
     model: vercel::Model,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
 }
@@ -264,21 +211,26 @@ impl VercelLanguageModel {
     ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<ResponseStreamEvent>>>>
     {
         let http_client = self.http_client.clone();
-        let Ok((api_key, api_url)) = cx.read_entity(&self.state, |state, cx| {
-            let settings = &AllLanguageModelSettings::get_global(cx).vercel;
-            let api_url = if settings.api_url.is_empty() {
-                vercel::VERCEL_API_URL.to_string()
-            } else {
-                settings.api_url.clone()
-            };
-            (state.api_key.clone(), api_url)
+
+        let Ok((api_key, api_url)) = self.state.read_with(cx, |state, cx| {
+            let api_url = VercelLanguageModelProvider::api_url(cx);
+            (state.api_key_state.key(&api_url), api_url)
         }) else {
-            return futures::future::ready(Err(anyhow!("App state dropped"))).boxed();
+            return future::ready(Err(anyhow!("App state dropped"))).boxed();
         };
 
         let future = self.request_limiter.stream(async move {
-            let api_key = api_key.context("Missing Vercel API Key")?;
-            let request = stream_completion(http_client.as_ref(), &api_url, &api_key, request);
+            let provider = PROVIDER_NAME;
+            let Some(api_key) = api_key else {
+                return Err(LanguageModelCompletionError::NoApiKey { provider });
+            };
+            let request = open_ai::stream_completion(
+                http_client.as_ref(),
+                provider.0.as_str(),
+                &api_url,
+                &api_key,
+                request,
+            );
             let response = request.await?;
             Ok(response)
         });
@@ -297,11 +249,11 @@ impl LanguageModel for VercelLanguageModel {
     }
 
     fn provider_id(&self) -> LanguageModelProviderId {
-        LanguageModelProviderId(PROVIDER_ID.into())
+        PROVIDER_ID
     }
 
     fn provider_name(&self) -> LanguageModelProviderName {
-        LanguageModelProviderName(PROVIDER_NAME.into())
+        PROVIDER_NAME
     }
 
     fn supports_tools(&self) -> bool {
@@ -309,14 +261,14 @@ impl LanguageModel for VercelLanguageModel {
     }
 
     fn supports_images(&self) -> bool {
-        false
+        true
     }
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
         match choice {
-            LanguageModelToolChoice::Auto => true,
-            LanguageModelToolChoice::Any => true,
-            LanguageModelToolChoice::None => true,
+            LanguageModelToolChoice::Auto
+            | LanguageModelToolChoice::Any
+            | LanguageModelToolChoice::None => true,
         }
     }
 
@@ -354,262 +306,21 @@ impl LanguageModel for VercelLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let request = into_vercel(request, &self.model, self.max_output_tokens());
+        let request = crate::provider::open_ai::into_open_ai(
+            request,
+            self.model.id(),
+            self.model.supports_parallel_tool_calls(),
+            self.model.supports_prompt_cache_key(),
+            self.max_output_tokens(),
+            None,
+        );
         let completions = self.stream_completion(request, cx);
         async move {
-            let mapper = VercelEventMapper::new();
+            let mapper = crate::provider::open_ai::OpenAiEventMapper::new();
             Ok(mapper.map_stream(completions.await?).boxed())
         }
         .boxed()
     }
-}
-
-pub fn into_vercel(
-    request: LanguageModelRequest,
-    model: &vercel::Model,
-    max_output_tokens: Option<u64>,
-) -> open_ai::Request {
-    let stream = !model.id().starts_with("o1-");
-
-    let mut messages = Vec::new();
-    for message in request.messages {
-        for content in message.content {
-            match content {
-                MessageContent::Text(text) | MessageContent::Thinking { text, .. } => {
-                    add_message_content_part(
-                        open_ai::MessagePart::Text { text: text },
-                        message.role,
-                        &mut messages,
-                    )
-                }
-                MessageContent::RedactedThinking(_) => {}
-                MessageContent::Image(image) => {
-                    add_message_content_part(
-                        open_ai::MessagePart::Image {
-                            image_url: ImageUrl {
-                                url: image.to_base64_url(),
-                                detail: None,
-                            },
-                        },
-                        message.role,
-                        &mut messages,
-                    );
-                }
-                MessageContent::ToolUse(tool_use) => {
-                    let tool_call = open_ai::ToolCall {
-                        id: tool_use.id.to_string(),
-                        content: open_ai::ToolCallContent::Function {
-                            function: open_ai::FunctionContent {
-                                name: tool_use.name.to_string(),
-                                arguments: serde_json::to_string(&tool_use.input)
-                                    .unwrap_or_default(),
-                            },
-                        },
-                    };
-
-                    if let Some(open_ai::RequestMessage::Assistant { tool_calls, .. }) =
-                        messages.last_mut()
-                    {
-                        tool_calls.push(tool_call);
-                    } else {
-                        messages.push(open_ai::RequestMessage::Assistant {
-                            content: None,
-                            tool_calls: vec![tool_call],
-                        });
-                    }
-                }
-                MessageContent::ToolResult(tool_result) => {
-                    let content = match &tool_result.content {
-                        LanguageModelToolResultContent::Text(text) => {
-                            vec![open_ai::MessagePart::Text {
-                                text: text.to_string(),
-                            }]
-                        }
-                        LanguageModelToolResultContent::Image(image) => {
-                            vec![open_ai::MessagePart::Image {
-                                image_url: ImageUrl {
-                                    url: image.to_base64_url(),
-                                    detail: None,
-                                },
-                            }]
-                        }
-                    };
-
-                    messages.push(open_ai::RequestMessage::Tool {
-                        content: content.into(),
-                        tool_call_id: tool_result.tool_use_id.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    open_ai::Request {
-        model: model.id().into(),
-        messages,
-        stream,
-        stop: request.stop,
-        temperature: request.temperature.unwrap_or(1.0),
-        max_completion_tokens: max_output_tokens,
-        parallel_tool_calls: if model.supports_parallel_tool_calls() && !request.tools.is_empty() {
-            // Disable parallel tool calls, as the Agent currently expects a maximum of one per turn.
-            Some(false)
-        } else {
-            None
-        },
-        tools: request
-            .tools
-            .into_iter()
-            .map(|tool| open_ai::ToolDefinition::Function {
-                function: open_ai::FunctionDefinition {
-                    name: tool.name,
-                    description: Some(tool.description),
-                    parameters: Some(tool.input_schema),
-                },
-            })
-            .collect(),
-        tool_choice: request.tool_choice.map(|choice| match choice {
-            LanguageModelToolChoice::Auto => open_ai::ToolChoice::Auto,
-            LanguageModelToolChoice::Any => open_ai::ToolChoice::Required,
-            LanguageModelToolChoice::None => open_ai::ToolChoice::None,
-        }),
-    }
-}
-
-fn add_message_content_part(
-    new_part: open_ai::MessagePart,
-    role: Role,
-    messages: &mut Vec<open_ai::RequestMessage>,
-) {
-    match (role, messages.last_mut()) {
-        (Role::User, Some(open_ai::RequestMessage::User { content }))
-        | (
-            Role::Assistant,
-            Some(open_ai::RequestMessage::Assistant {
-                content: Some(content),
-                ..
-            }),
-        )
-        | (Role::System, Some(open_ai::RequestMessage::System { content, .. })) => {
-            content.push_part(new_part);
-        }
-        _ => {
-            messages.push(match role {
-                Role::User => open_ai::RequestMessage::User {
-                    content: open_ai::MessageContent::from(vec![new_part]),
-                },
-                Role::Assistant => open_ai::RequestMessage::Assistant {
-                    content: Some(open_ai::MessageContent::from(vec![new_part])),
-                    tool_calls: Vec::new(),
-                },
-                Role::System => open_ai::RequestMessage::System {
-                    content: open_ai::MessageContent::from(vec![new_part]),
-                },
-            });
-        }
-    }
-}
-
-pub struct VercelEventMapper {
-    tool_calls_by_index: HashMap<usize, RawToolCall>,
-}
-
-impl VercelEventMapper {
-    pub fn new() -> Self {
-        Self {
-            tool_calls_by_index: HashMap::default(),
-        }
-    }
-
-    pub fn map_stream(
-        mut self,
-        events: Pin<Box<dyn Send + Stream<Item = Result<ResponseStreamEvent>>>>,
-    ) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
-    {
-        events.flat_map(move |event| {
-            futures::stream::iter(match event {
-                Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::Other(anyhow!(error)))],
-            })
-        })
-    }
-
-    pub fn map_event(
-        &mut self,
-        event: ResponseStreamEvent,
-    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
-        let Some(choice) = event.choices.first() else {
-            return Vec::new();
-        };
-
-        let mut events = Vec::new();
-        if let Some(content) = choice.delta.content.clone() {
-            events.push(Ok(LanguageModelCompletionEvent::Text(content)));
-        }
-
-        if let Some(tool_calls) = choice.delta.tool_calls.as_ref() {
-            for tool_call in tool_calls {
-                let entry = self.tool_calls_by_index.entry(tool_call.index).or_default();
-
-                if let Some(tool_id) = tool_call.id.clone() {
-                    entry.id = tool_id;
-                }
-
-                if let Some(function) = tool_call.function.as_ref() {
-                    if let Some(name) = function.name.clone() {
-                        entry.name = name;
-                    }
-
-                    if let Some(arguments) = function.arguments.clone() {
-                        entry.arguments.push_str(&arguments);
-                    }
-                }
-            }
-        }
-
-        match choice.finish_reason.as_deref() {
-            Some("stop") => {
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-            }
-            Some("tool_calls") => {
-                events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
-                    match serde_json::Value::from_str(&tool_call.arguments) {
-                        Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
-                            LanguageModelToolUse {
-                                id: tool_call.id.clone().into(),
-                                name: tool_call.name.as_str().into(),
-                                is_input_complete: true,
-                                input,
-                                raw_input: tool_call.arguments.clone(),
-                            },
-                        )),
-                        Err(error) => Err(LanguageModelCompletionError::BadInputJson {
-                            id: tool_call.id.into(),
-                            tool_name: tool_call.name.as_str().into(),
-                            raw_input: tool_call.arguments.into(),
-                            json_parse_error: error.to_string(),
-                        }),
-                    }
-                }));
-
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
-            }
-            Some(stop_reason) => {
-                log::error!("Unexpected Vercel stop_reason: {stop_reason:?}",);
-                events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
-            }
-            None => {}
-        }
-
-        events
-    }
-}
-
-#[derive(Default)]
-struct RawToolCall {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 pub fn count_vercel_tokens(
@@ -647,7 +358,7 @@ pub fn count_vercel_tokens(
             }
             // Map Vercel models to appropriate OpenAI models for token counting
             // since Vercel uses OpenAI-compatible API
-            Model::VZero => {
+            Model::VZeroOnePointFiveMedium => {
                 // Vercel v0 is similar to GPT-4o, so use gpt-4o for token counting
                 tiktoken_rs::num_tokens_from_messages("gpt-4o", &messages)
             }
@@ -658,15 +369,15 @@ pub fn count_vercel_tokens(
 }
 
 struct ConfigurationView {
-    api_key_editor: Entity<SingleLineInput>,
-    state: gpui::Entity<State>,
+    api_key_editor: Entity<InputField>,
+    state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
-    fn new(state: gpui::Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let api_key_editor = cx.new(|cx| {
-            SingleLineInput::new(
+            InputField::new(
                 window,
                 cx,
                 "v1:0000000000000000000000000000000000000000000000000",
@@ -705,45 +416,35 @@ impl ConfigurationView {
     }
 
     fn save_api_key(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let api_key = self
-            .api_key_editor
-            .read(cx)
-            .editor()
-            .read(cx)
-            .text(cx)
-            .trim()
-            .to_string();
-
-        // Don't proceed if no API key is provided and we're not authenticated
-        if api_key.is_empty() && !self.state.read(cx).is_authenticated() {
+        let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
+        if api_key.is_empty() {
             return;
         }
+
+        // url changes can cause the editor to be displayed again
+        self.api_key_editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
 
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key(api_key, cx))?
+                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))?
                 .await
         })
         .detach_and_log_err(cx);
-
-        cx.notify();
     }
 
     fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.api_key_editor.update(cx, |input, cx| {
-            input.editor.update(cx, |editor, cx| {
-                editor.set_text("", window, cx);
-            });
-        });
+        self.api_key_editor
+            .update(cx, |input, cx| input.set_text("", window, cx));
 
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
-            state.update(cx, |state, cx| state.reset_api_key(cx))?.await
+            state
+                .update(cx, |state, cx| state.set_api_key(None, cx))?
+                .await
         })
         .detach_and_log_err(cx);
-
-        cx.notify();
     }
 
     fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
@@ -753,7 +454,17 @@ impl ConfigurationView {
 
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_from_env;
+        let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
+        let configured_card_label = if env_var_set {
+            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
+        } else {
+            let api_url = VercelLanguageModelProvider::api_url(cx);
+            if api_url == VERCEL_API_URL {
+                "API key configured".to_string()
+            } else {
+                format!("API key configured for {}", api_url)
+            }
+        };
 
         let api_key_section = if self.should_render_editor(cx) {
             v_flex()
@@ -773,7 +484,7 @@ impl Render for ConfigurationView {
                 .child(self.api_key_editor.clone())
                 .child(
                     Label::new(format!(
-                        "You can also assign the {VERCEL_API_KEY_VAR} environment variable and restart Zed."
+                        "You can also assign the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed."
                     ))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
@@ -783,85 +494,21 @@ impl Render for ConfigurationView {
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
-                .into_any()
+                .into_any_element()
         } else {
-            h_flex()
-                .mt_1()
-                .p_1()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(Label::new(if env_var_set {
-                            format!("API key set in {VERCEL_API_KEY_VAR} environment variable.")
-                        } else {
-                            "API key configured.".to_string()
-                        })),
-                )
-                .child(
-                    Button::new("reset-api-key", "Reset API Key")
-                        .label_size(LabelSize::Small)
-                        .icon(IconName::Undo)
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
-                        .layer(ElevationIndex::ModalSurface)
-                        .when(env_var_set, |this| {
-                            this.tooltip(Tooltip::text(format!("To reset your API key, unset the {VERCEL_API_KEY_VAR} environment variable.")))
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
-                )
-                .into_any()
+            ConfiguredApiCard::new(configured_card_label)
+                .disabled(env_var_set)
+                .when(env_var_set, |this| {
+                    this.tooltip_label(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."))
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
+                .into_any_element()
         };
 
         if self.load_credentials_task.is_some() {
             div().child(Label::new("Loading credentials…")).into_any()
         } else {
             v_flex().size_full().child(api_key_section).into_any()
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use gpui::TestAppContext;
-    use language_model::LanguageModelRequestMessage;
-
-    use super::*;
-
-    #[gpui::test]
-    fn tiktoken_rs_support(cx: &TestAppContext) {
-        let request = LanguageModelRequest {
-            thread_id: None,
-            prompt_id: None,
-            intent: None,
-            mode: None,
-            messages: vec![LanguageModelRequestMessage {
-                role: Role::User,
-                content: vec![MessageContent::Text("message".into())],
-                cache: false,
-            }],
-            tools: vec![],
-            tool_choice: None,
-            stop: vec![],
-            temperature: None,
-        };
-
-        // Validate that all models are supported by tiktoken-rs
-        for model in Model::iter() {
-            let count = cx
-                .executor()
-                .block(count_vercel_tokens(
-                    request.clone(),
-                    model,
-                    &cx.app.borrow(),
-                ))
-                .unwrap();
-            assert!(count > 0);
         }
     }
 }

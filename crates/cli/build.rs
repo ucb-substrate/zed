@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 use std::process::Command;
 
 fn main() {
@@ -21,5 +22,8 @@ fn main() {
         let git_sha = git_sha.trim();
 
         println!("cargo:rustc-env=ZED_COMMIT_SHA={git_sha}");
+    }
+    if let Some(build_identifier) = option_env!("GITHUB_RUN_NUMBER") {
+        println!("cargo:rustc-env=ZED_BUILD_ID={build_identifier}");
     }
 }

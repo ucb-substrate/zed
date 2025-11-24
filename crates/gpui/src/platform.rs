@@ -13,8 +13,7 @@ mod mac;
         any(target_os = "linux", target_os = "freebsd"),
         any(feature = "x11", feature = "wayland")
     ),
-    target_os = "windows",
-    feature = "macos-blade"
+    all(target_os = "macos", feature = "macos-blade")
 ))]
 mod blade;
 
@@ -25,8 +24,14 @@ mod test;
 mod windows;
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "freebsd"),
-    any(feature = "wayland", feature = "x11"),
+    feature = "screen-capture",
+    any(
+        target_os = "windows",
+        all(
+            any(target_os = "linux", target_os = "freebsd"),
+            any(feature = "wayland", feature = "x11"),
+        )
+    )
 ))]
 pub(crate) mod scap_screen_capture;
 
@@ -34,16 +39,15 @@ use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, ScaledPixels, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SvgSize, Task, TaskLabel, Window,
-    WindowControlArea, hash, point, px, size,
+    Point, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph,
+    ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TaskLabel, TaskTiming,
+    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
 use futures::channel::oneshot;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
-use parking::Unparker;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use schemars::JsonSchema;
 use seahash::SeaHasher;
@@ -72,14 +76,16 @@ pub use keystroke::*;
 pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
 pub(crate) use mac::*;
-pub use semantic_version::SemanticVersion;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use test::*;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::*;
 
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+pub use linux::layer_shell;
+
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource};
+pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
 /// Returns a background executor for the current platform.
 pub fn background_executor() -> BackgroundExecutor {
@@ -116,6 +122,15 @@ pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
+    Rc::new(
+        WindowsPlatform::new()
+            .inspect_err(|err| show_error("Failed to launch", err.to_string()))
+            .unwrap(),
+    )
+}
+
 /// Return which compositor we're guessing we'll use.
 /// Does not attempt to connect to the given compositor
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -147,15 +162,6 @@ pub fn guess_compositor() -> &'static str {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    Rc::new(
-        WindowsPlatform::new()
-            .inspect_err(|err| show_error("Error: Zed failed to launch", err.to_string()))
-            .unwrap(),
-    )
-}
-
 pub(crate) trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
     fn foreground_executor(&self) -> ForegroundExecutor;
@@ -176,10 +182,27 @@ pub(crate) trait Platform: 'static {
         None
     }
 
+    #[cfg(feature = "screen-capture")]
     fn is_screen_capture_supported(&self) -> bool;
+    #[cfg(not(feature = "screen-capture"))]
+    fn is_screen_capture_supported(&self) -> bool {
+        false
+    }
+    #[cfg(feature = "screen-capture")]
+    fn screen_capture_sources(&self)
+    -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCaptureSource>>>>;
+    #[cfg(not(feature = "screen-capture"))]
     fn screen_capture_sources(
         &self,
-    ) -> oneshot::Receiver<Result<Vec<Box<dyn ScreenCaptureSource>>>>;
+    ) -> oneshot::Receiver<anyhow::Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
+        let (sources_tx, sources_rx) = oneshot::channel();
+        sources_tx
+            .send(Err(anyhow::anyhow!(
+                "gpui was compiled without the screen-capture feature"
+            )))
+            .ok();
+        sources_rx
+    }
 
     fn open_window(
         &self,
@@ -198,14 +221,17 @@ pub(crate) trait Platform: 'static {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
-    fn prompt_for_new_path(&self, directory: &Path) -> oneshot::Receiver<Result<Option<PathBuf>>>;
+    fn prompt_for_new_path(
+        &self,
+        directory: &Path,
+        suggested_name: Option<&str>,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>>;
     fn can_select_mixed_files_and_dirs(&self) -> bool;
     fn reveal_path(&self, path: &Path);
     fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
-    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
@@ -225,7 +251,6 @@ pub(crate) trait Platform: 'static {
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>);
     fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>);
     fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>);
-    fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
 
     fn compositor_name(&self) -> &'static str {
         ""
@@ -246,6 +271,10 @@ pub(crate) trait Platform: 'static {
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
     fn delete_credentials(&self, url: &str) -> Task<Result<()>>;
+
+    fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+    fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
+    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
@@ -262,17 +291,33 @@ pub trait PlatformDisplay: Send + Sync + Debug {
 
     /// Get the default bounds for this display to place a window
     fn default_bounds(&self) -> Bounds<Pixels> {
-        let center = self.bounds().center();
-        let offset = DEFAULT_WINDOW_SIZE / 2.0;
+        let bounds = self.bounds();
+        let center = bounds.center();
+        let clipped_window_size = DEFAULT_WINDOW_SIZE.min(&bounds.size);
+
+        let offset = clipped_window_size / 2.0;
         let origin = point(center.x - offset.width, center.y - offset.height);
-        Bounds::new(origin, DEFAULT_WINDOW_SIZE)
+        Bounds::new(origin, clipped_window_size)
     }
+}
+
+/// Metadata for a given [ScreenCaptureSource]
+#[derive(Clone)]
+pub struct SourceMetadata {
+    /// Opaque identifier of this screen.
+    pub id: u64,
+    /// Human-readable label for this source.
+    pub label: Option<SharedString>,
+    /// Whether this source is the main display.
+    pub is_main: Option<bool>,
+    /// Video resolution of this source.
+    pub resolution: Size<DevicePixels>,
 }
 
 /// A source of on-screen video content that can be captured.
 pub trait ScreenCaptureSource {
-    /// Returns the video resolution of this source.
-    fn resolution(&self) -> Result<Size<DevicePixels>>;
+    /// Returns metadata for this source.
+    fn metadata(&self) -> Result<SourceMetadata>;
 
     /// Start capture video from this source, invoking the given callback
     /// with each frame.
@@ -284,7 +329,10 @@ pub trait ScreenCaptureSource {
 }
 
 /// A video stream captured from a screen.
-pub trait ScreenCaptureStream {}
+pub trait ScreenCaptureStream {
+    /// Returns metadata for this source.
+    fn metadata(&self) -> Result<SourceMetadata>;
+}
 
 /// A frame of video captured from a screen.
 pub struct ScreenCaptureFrame(pub PlatformScreenCaptureFrame);
@@ -304,8 +352,6 @@ impl Debug for DisplayId {
         write!(f, "DisplayId({})", self.0)
     }
 }
-
-unsafe impl Send for DisplayId {}
 
 /// Which part of the window to resize
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,6 +455,8 @@ impl Tiling {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub(crate) struct RequestFrameOptions {
     pub(crate) require_presentation: bool,
+    /// Force refresh of all rendering states when true
+    pub(crate) force_render: bool,
 }
 
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
@@ -456,9 +504,27 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 
     // macOS specific methods
+    fn get_title(&self) -> String {
+        String::new()
+    }
+    fn tabbed_windows(&self) -> Option<Vec<SystemWindowTab>> {
+        None
+    }
+    fn tab_bar_visible(&self) -> bool {
+        false
+    }
     fn set_edited(&mut self, _edited: bool) {}
     fn show_character_palette(&self) {}
     fn titlebar_double_click(&self) {}
+    fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_select_next_tab(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_toggle_tab_bar(&self, _callback: Box<dyn FnMut()>) {}
+    fn merge_all_windows(&self) {}
+    fn move_tab_to_new_window(&self) {}
+    fn toggle_window_tab_overview(&self) {}
+    fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
 
     #[cfg(target_os = "windows")]
     fn get_raw_handle(&self) -> windows::HWND;
@@ -484,7 +550,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
-    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>);
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
@@ -495,13 +561,29 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 /// This type is public so that our test macro can generate and use it, but it should not
 /// be considered part of our public API.
 #[doc(hidden)]
+#[derive(Debug)]
+pub struct RunnableMeta {
+    /// Location of the runnable
+    pub location: &'static core::panic::Location<'static>,
+}
+
+#[doc(hidden)]
+pub enum RunnableVariant {
+    Meta(Runnable<RunnableMeta>),
+    Compat(Runnable),
+}
+
+/// This type is public so that our test macro can generate and use it, but it should not
+/// be considered part of our public API.
+#[doc(hidden)]
 pub trait PlatformDispatcher: Send + Sync {
+    fn get_all_timings(&self) -> Vec<ThreadTaskTimings>;
+    fn get_current_thread_timings(&self) -> Vec<TaskTiming>;
     fn is_main_thread(&self) -> bool;
-    fn dispatch(&self, runnable: Runnable, label: Option<TaskLabel>);
-    fn dispatch_on_main_thread(&self, runnable: Runnable);
-    fn dispatch_after(&self, duration: Duration, runnable: Runnable);
-    fn park(&self, timeout: Option<Duration>) -> bool;
-    fn unparker(&self) -> Unparker;
+    fn dispatch(&self, runnable: RunnableVariant, label: Option<TaskLabel>);
+    fn dispatch_on_main_thread(&self, runnable: RunnableVariant);
+    fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant);
+
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -548,7 +630,7 @@ impl PlatformTextSystem for NoopTextSystem {
     }
 
     fn font_id(&self, _descriptor: &Font) -> Result<FontId> {
-        return Ok(FontId(1));
+        Ok(FontId(1))
     }
 
     fn font_metrics(&self, _font_id: FontId) -> FontMetrics {
@@ -629,7 +711,7 @@ impl PlatformTextSystem for NoopTextSystem {
             }
         }
         let mut runs = Vec::default();
-        if glyphs.len() > 0 {
+        if !glyphs.is_empty() {
             runs.push(ShapedRun {
                 font_id: FontId(0),
                 glyphs,
@@ -647,6 +729,41 @@ impl PlatformTextSystem for NoopTextSystem {
             len: text.len(),
         }
     }
+}
+
+// Adapted from https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.cpp
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+#[allow(dead_code)]
+pub(crate) fn get_gamma_correction_ratios(gamma: f32) -> [f32; 4] {
+    const GAMMA_INCORRECT_TARGET_RATIOS: [[f32; 4]; 13] = [
+        [0.0000 / 4.0, 0.0000 / 4.0, 0.0000 / 4.0, 0.0000 / 4.0], // gamma = 1.0
+        [0.0166 / 4.0, -0.0807 / 4.0, 0.2227 / 4.0, -0.0751 / 4.0], // gamma = 1.1
+        [0.0350 / 4.0, -0.1760 / 4.0, 0.4325 / 4.0, -0.1370 / 4.0], // gamma = 1.2
+        [0.0543 / 4.0, -0.2821 / 4.0, 0.6302 / 4.0, -0.1876 / 4.0], // gamma = 1.3
+        [0.0739 / 4.0, -0.3963 / 4.0, 0.8167 / 4.0, -0.2287 / 4.0], // gamma = 1.4
+        [0.0933 / 4.0, -0.5161 / 4.0, 0.9926 / 4.0, -0.2616 / 4.0], // gamma = 1.5
+        [0.1121 / 4.0, -0.6395 / 4.0, 1.1588 / 4.0, -0.2877 / 4.0], // gamma = 1.6
+        [0.1300 / 4.0, -0.7649 / 4.0, 1.3159 / 4.0, -0.3080 / 4.0], // gamma = 1.7
+        [0.1469 / 4.0, -0.8911 / 4.0, 1.4644 / 4.0, -0.3234 / 4.0], // gamma = 1.8
+        [0.1627 / 4.0, -1.0170 / 4.0, 1.6051 / 4.0, -0.3347 / 4.0], // gamma = 1.9
+        [0.1773 / 4.0, -1.1420 / 4.0, 1.7385 / 4.0, -0.3426 / 4.0], // gamma = 2.0
+        [0.1908 / 4.0, -1.2652 / 4.0, 1.8650 / 4.0, -0.3476 / 4.0], // gamma = 2.1
+        [0.2031 / 4.0, -1.3864 / 4.0, 1.9851 / 4.0, -0.3501 / 4.0], // gamma = 2.2
+    ];
+
+    const NORM13: f32 = ((0x10000 as f64) / (255.0 * 255.0) * 4.0) as f32;
+    const NORM24: f32 = ((0x100 as f64) / (255.0) * 4.0) as f32;
+
+    let index = ((gamma * 10.0).round() as usize).clamp(10, 22) - 10;
+    let ratios = GAMMA_INCORRECT_TARGET_RATIOS[index];
+
+    [
+        ratios[0] * NORM13,
+        ratios[1] * NORM24,
+        ratios[2] * NORM13,
+        ratios[3] * NORM24,
+    ]
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -770,7 +887,6 @@ pub(crate) struct AtlasTextureId {
 pub(crate) enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
-    Path = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -913,6 +1029,11 @@ impl PlatformInputHandler {
             .ok()
             .flatten()
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.handler.accepts_text_input(window, cx)
+    }
 }
 
 /// A struct representing a selection in a text buffer, in UTF16 characters.
@@ -1021,6 +1142,11 @@ pub trait InputHandler: 'static {
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         true
     }
+
+    /// Returns whether this handler is accepting text input to be inserted.
+    fn accepts_text_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        true
+    }
 }
 
 /// The variables that can be configured when creating a new window
@@ -1046,6 +1172,12 @@ pub struct WindowOptions {
     /// Whether the window should be movable by the user
     pub is_movable: bool,
 
+    /// Whether the window should be resizable by the user
+    pub is_resizable: bool,
+
+    /// Whether the window should be minimized by the user
+    pub is_minimizable: bool,
+
     /// The display to create the window on, if this is None,
     /// the window will be created on the main display
     pub display_id: Option<DisplayId>,
@@ -1062,6 +1194,9 @@ pub struct WindowOptions {
     /// Whether to use client or server side decorations. Wayland only
     /// Note that this may be ignored.
     pub window_decorations: Option<WindowDecorations>,
+
+    /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
+    pub tabbing_identifier: Option<String>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -1088,6 +1223,14 @@ pub(crate) struct WindowParams {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub is_movable: bool,
 
+    /// Whether the window should be resizable by the user
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    pub is_resizable: bool,
+
+    /// Whether the window should be minimized by the user
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    pub is_minimizable: bool,
+
     #[cfg_attr(
         any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
         allow(dead_code)
@@ -1101,6 +1244,8 @@ pub(crate) struct WindowParams {
     pub display_id: Option<DisplayId>,
 
     pub window_min_size: Option<Size<Pixels>>,
+    #[cfg(target_os = "macos")]
+    pub tabbing_identifier: Option<String>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -1131,6 +1276,11 @@ impl WindowBounds {
             WindowBounds::Fullscreen(bounds) => *bounds,
         }
     }
+
+    /// Creates a new window bounds that centers the window on the screen.
+    pub fn centered(size: Size<Pixels>, cx: &App) -> Self {
+        WindowBounds::Windowed(Bounds::centered(None, size, cx))
+    }
 }
 
 impl Default for WindowOptions {
@@ -1146,11 +1296,14 @@ impl Default for WindowOptions {
             show: true,
             kind: WindowKind::Normal,
             is_movable: true,
+            is_resizable: true,
+            is_minimizable: true,
             display_id: None,
             window_background: WindowBackgroundAppearance::default(),
             app_id: None,
             window_min_size: None,
             window_decorations: None,
+            tabbing_identifier: None,
         }
     }
 }
@@ -1170,7 +1323,7 @@ pub struct TitlebarOptions {
 }
 
 /// The kind of window to create
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowKind {
     /// A normal application window
     Normal,
@@ -1178,17 +1331,26 @@ pub enum WindowKind {
     /// A window that appears above all other windows, usually used for alerts or popups
     /// use sparingly!
     PopUp,
+
+    /// A floating window that appears on top of its parent window
+    Floating,
+
+    /// A Wayland LayerShell window, used to draw overlays or backgrounds for applications such as
+    /// docks, notifications or wallpapers.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    LayerShell(layer_shell::LayerShellOptions),
 }
 
 /// The appearance of the window, as defined by the operating system.
 ///
 /// On macOS, this corresponds to named [`NSAppearance`](https://developer.apple.com/documentation/appkit/nsappearance)
 /// values.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum WindowAppearance {
     /// A light appearance.
     ///
     /// On macOS, this corresponds to the `aqua` appearance.
+    #[default]
     Light,
 
     /// A light appearance with vibrant colors.
@@ -1205,12 +1367,6 @@ pub enum WindowAppearance {
     ///
     /// On macOS, this corresponds to the `NSAppearanceNameVibrantDark` appearance.
     VibrantDark,
-}
-
-impl Default for WindowAppearance {
-    fn default() -> Self {
-        Self::Light
-    }
 }
 
 /// The appearance of the background of the window itself, when there is
@@ -1232,10 +1388,14 @@ pub enum WindowBackgroundAppearance {
     ///
     /// Not always supported.
     Blurred,
+    /// The Mica backdrop material, supported on Windows 11.
+    MicaBackdrop,
+    /// The Mica Alt backdrop material, supported on Windows 11.
+    MicaAltBackdrop,
 }
 
 /// The options that can be configured for a file dialog prompt
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct PathPromptOptions {
     /// Should the prompt allow files to be selected?
     pub files: bool,
@@ -1243,6 +1403,8 @@ pub struct PathPromptOptions {
     pub directories: bool,
     /// Should the prompt allow multiple files to be selected?
     pub multiple: bool,
+    /// The prompt to show to a user when selecting a path
+    pub prompt: Option<SharedString>,
 }
 
 /// What kind of prompt styling to show
@@ -1311,9 +1473,10 @@ impl From<&str> for PromptButton {
 }
 
 /// The style of the cursor (pointer)
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum CursorStyle {
     /// The default cursor
+    #[default]
     Arrow,
 
     /// A text input cursor
@@ -1400,12 +1563,6 @@ pub enum CursorStyle {
     None,
 }
 
-impl Default for CursorStyle {
-    fn default() -> Self {
-        Self::Arrow
-    }
-}
-
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
@@ -1419,6 +1576,8 @@ pub enum ClipboardEntry {
     String(ClipboardString),
     /// An image entry
     Image(Image),
+    /// A file entry
+    ExternalPaths(crate::ExternalPaths),
 }
 
 impl ClipboardItem {
@@ -1459,16 +1618,29 @@ impl ClipboardItem {
     /// Returns None if there were no ClipboardString entries.
     pub fn text(&self) -> Option<String> {
         let mut answer = String::new();
-        let mut any_entries = false;
 
         for entry in self.entries.iter() {
             if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry {
-                answer.push_str(&text);
-                any_entries = true;
+                answer.push_str(text);
             }
         }
 
-        if any_entries { Some(answer) } else { None }
+        if answer.is_empty() {
+            for entry in self.entries.iter() {
+                if let ClipboardEntry::ExternalPaths(paths) = entry {
+                    for path in &paths.0 {
+                        use std::fmt::Write as _;
+                        _ = write!(answer, "{}", path.display());
+                    }
+                }
+            }
+        }
+
+        if !answer.is_empty() {
+            Some(answer)
+        } else {
+            None
+        }
     }
 
     /// If this item is one ClipboardEntry::String, returns its metadata.
@@ -1551,6 +1723,8 @@ pub enum ImageFormat {
     Bmp,
     /// .tif or .tiff
     Tiff,
+    /// .ico
+    Ico,
 }
 
 impl ImageFormat {
@@ -1564,6 +1738,7 @@ impl ImageFormat {
             ImageFormat::Svg => "image/svg+xml",
             ImageFormat::Bmp => "image/bmp",
             ImageFormat::Tiff => "image/tiff",
+            ImageFormat::Ico => "image/ico",
         }
     }
 
@@ -1577,6 +1752,7 @@ impl ImageFormat {
             "image/svg+xml" => Some(Self::Svg),
             "image/bmp" => Some(Self::Bmp),
             "image/tiff" | "image/tif" => Some(Self::Tiff),
+            "image/ico" => Some(Self::Ico),
             _ => None,
         }
     }
@@ -1683,14 +1859,11 @@ impl Image {
             ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
             ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
             ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
             ImageFormat::Svg => {
-                let pixmap = svg_renderer.render_pixmap(&self.bytes, SvgSize::ScaleFactor(1.0))?;
-
-                let buffer =
-                    image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
-                        .unwrap();
-
-                SmallVec::from_elem(Frame::new(buffer), 1)
+                return svg_renderer
+                    .render_single_frame(&self.bytes, 1.0, false)
+                    .map_err(Into::into);
             }
         };
 

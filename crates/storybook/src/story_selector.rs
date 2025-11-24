@@ -17,20 +17,13 @@ pub enum ComponentStory {
     ContextMenu,
     Cursor,
     Focus,
-    IconButton,
-    Keybinding,
-    List,
-    ListHeader,
-    ListItem,
     OverflowScroll,
     Picker,
     Scroll,
-    Tab,
-    TabBar,
     Text,
-    ToggleButton,
     ViewportUnits,
     WithRemSize,
+    IndentGuides,
 }
 
 impl ComponentStory {
@@ -46,20 +39,13 @@ impl ComponentStory {
             Self::ContextMenu => cx.new(|_| ui::ContextMenuStory).into(),
             Self::Cursor => cx.new(|_| crate::stories::CursorStory).into(),
             Self::Focus => FocusStory::model(window, cx).into(),
-            Self::IconButton => cx.new(|_| ui::IconButtonStory).into(),
-            Self::Keybinding => cx.new(|_| ui::KeybindingStory).into(),
-            Self::List => cx.new(|_| ui::ListStory).into(),
-            Self::ListHeader => cx.new(|_| ui::ListHeaderStory).into(),
-            Self::ListItem => cx.new(|_| ui::ListItemStory).into(),
             Self::OverflowScroll => cx.new(|_| crate::stories::OverflowScrollStory).into(),
             Self::Picker => PickerStory::new(window, cx).into(),
             Self::Scroll => ScrollStory::model(cx).into(),
-            Self::Tab => cx.new(|_| ui::TabStory).into(),
-            Self::TabBar => cx.new(|_| ui::TabBarStory).into(),
             Self::Text => TextStory::model(cx).into(),
-            Self::ToggleButton => cx.new(|_| ui::ToggleButtonStory).into(),
             Self::ViewportUnits => cx.new(|_| crate::stories::ViewportUnitsStory).into(),
             Self::WithRemSize => cx.new(|_| crate::stories::WithRemSizeStory).into(),
+            Self::IndentGuides => crate::stories::IndentGuidesStory::model(window, cx).into(),
         }
     }
 }
@@ -107,15 +93,13 @@ static ALL_STORY_SELECTORS: OnceLock<Vec<StorySelector>> = OnceLock::new();
 
 impl ValueEnum for StorySelector {
     fn value_variants<'a>() -> &'a [Self] {
-        let stories = ALL_STORY_SELECTORS.get_or_init(|| {
+        (ALL_STORY_SELECTORS.get_or_init(|| {
             let component_stories = ComponentStory::iter().map(StorySelector::Component);
 
             component_stories
                 .chain(std::iter::once(StorySelector::KitchenSink))
                 .collect::<Vec<_>>()
-        });
-
-        stories
+        })) as _
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {

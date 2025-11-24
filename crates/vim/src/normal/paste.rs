@@ -1,4 +1,7 @@
-use editor::{DisplayPoint, RowExt, display_map::ToDisplayPoint, movement, scroll::Autoscroll};
+use editor::{
+    DisplayPoint, MultiBufferOffset, RowExt, SelectionEffects, display_map::ToDisplayPoint,
+    movement,
+};
 use gpui::{Action, Context, Window};
 use language::{Bias, SelectionGoal};
 use schemars::JsonSchema;
@@ -14,7 +17,8 @@ use crate::{
     state::{Mode, Register},
 };
 
-#[derive(Clone, Deserialize, JsonSchema, PartialEq, Action)]
+/// Pastes text from the specified register at the cursor position.
+#[derive(Clone, Default, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
 pub struct Paste {
@@ -31,7 +35,7 @@ impl Vim {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
 
-        self.update_editor(window, cx, |vim, editor, window, cx| {
+        self.update_editor(cx, |vim, editor, cx| {
             let text_layout_details = editor.text_layout_details(window);
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
@@ -55,7 +59,8 @@ impl Vim {
                     vim.copy_selections_content(editor, MotionKind::for_mode(vim.mode), window, cx);
                 }
 
-                let (display_map, current_selections) = editor.selections.all_adjusted_display(cx);
+                let display_map = editor.display_snapshot(cx);
+                let current_selections = editor.selections.all_adjusted_display(&display_map);
 
                 // unlike zed, if you have a multi-cursor selection from vim block mode,
                 // pasting it will paste it on subsequent lines, even if you don't yet
@@ -158,9 +163,11 @@ impl Vim {
                     let point_range = display_range.start.to_point(&display_map)
                         ..display_range.end.to_point(&display_map);
                     let anchor = if is_multiline || vim.mode == Mode::VisualLine {
-                        display_map.buffer_snapshot.anchor_before(point_range.start)
+                        display_map
+                            .buffer_snapshot()
+                            .anchor_before(point_range.start)
                     } else {
-                        display_map.buffer_snapshot.anchor_after(point_range.end)
+                        display_map.buffer_snapshot().anchor_after(point_range.end)
                     };
 
                     if *preserve {
@@ -170,7 +177,10 @@ impl Vim {
                     original_indent_columns.push(original_indent_column);
                 }
 
-                let cursor_offset = editor.selections.last::<usize>(cx).head();
+                let cursor_offset = editor
+                    .selections
+                    .last::<MultiBufferOffset>(&display_map)
+                    .head();
                 if editor
                     .buffer()
                     .read(cx)
@@ -187,7 +197,7 @@ impl Vim {
                 // and put the cursor on the first non-blank character of the first inserted line (or at the end if the first line is blank).
                 // otherwise vim will insert the next text at (or before) the current cursor position,
                 // the cursor will go to the last (or first, if is_multiline) inserted character.
-                editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
+                editor.change_selections(Default::default(), window, cx, |s| {
                     s.replace_cursors_with(|map| {
                         let mut cursors = Vec::new();
                         for (anchor, line_mode, is_multiline) in &new_selections {
@@ -235,12 +245,12 @@ impl Vim {
     ) {
         self.stop_recording(cx);
         let selected_register = self.selected_register.take();
-        self.update_editor(window, cx, |_, editor, window, cx| {
+        self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
-                editor.change_selections(None, window, cx, |s| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     s.move_with(|map, selection| {
-                        object.expand_selection(map, selection, around);
+                        object.expand_selection(map, selection, around, None);
                     });
                 });
 
@@ -252,7 +262,7 @@ impl Vim {
                 };
                 editor.insert(&text, window, cx);
                 editor.set_clip_at_line_ends(true, cx);
-                editor.change_selections(None, window, cx, |s| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     s.move_with(|map, selection| {
                         selection.start = map.clip_point(selection.start, Bias::Left);
                         selection.end = selection.start
@@ -272,11 +282,11 @@ impl Vim {
     ) {
         self.stop_recording(cx);
         let selected_register = self.selected_register.take();
-        self.update_editor(window, cx, |_, editor, window, cx| {
+        self.update_editor(cx, |_, editor, cx| {
             let text_layout_details = editor.text_layout_details(window);
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
-                editor.change_selections(None, window, cx, |s| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     s.move_with(|map, selection| {
                         motion.expand_selection(
                             map,
@@ -296,7 +306,7 @@ impl Vim {
                 };
                 editor.insert(&text, window, cx);
                 editor.set_clip_at_line_ends(true, cx);
-                editor.change_selections(None, window, cx, |s| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                     s.move_with(|map, selection| {
                         selection.start = map.clip_point(selection.start, Bias::Left);
                         selection.end = selection.start
@@ -310,17 +320,13 @@ impl Vim {
 #[cfg(test)]
 mod test {
     use crate::{
-        UseSystemClipboard, VimSettings,
         state::{Mode, Register},
         test::{NeovimBackedTestContext, VimTestContext},
     };
     use gpui::ClipboardItem;
     use indoc::indoc;
-    use language::{
-        LanguageName,
-        language_settings::{AllLanguageSettings, LanguageSettingsContent},
-    };
-    use settings::SettingsStore;
+    use language::{LanguageName, language_settings::LanguageSettingsContent};
+    use settings::{SettingsStore, UseSystemClipboard};
 
     #[gpui::test]
     async fn test_paste(cx: &mut gpui::TestAppContext) {
@@ -407,8 +413,8 @@ mod test {
         let mut cx = VimTestContext::new(cx, true).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<VimSettings>(cx, |s| {
-                s.use_system_clipboard = Some(UseSystemClipboard::Never)
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
             });
         });
 
@@ -443,8 +449,9 @@ mod test {
         let mut cx = VimTestContext::new(cx, true).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<VimSettings>(cx, |s| {
-                s.use_system_clipboard = Some(UseSystemClipboard::OnYank)
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard =
+                    Some(UseSystemClipboard::OnYank)
             });
         });
 
@@ -473,8 +480,7 @@ mod test {
             Mode::Normal,
         );
         assert_eq!(
-            cx.read_from_clipboard()
-                .map(|item| item.text().unwrap().to_string()),
+            cx.read_from_clipboard().map(|item| item.text().unwrap()),
             Some("jumps".into())
         );
         cx.simulate_keystrokes("d d p");
@@ -486,8 +492,7 @@ mod test {
             Mode::Normal,
         );
         assert_eq!(
-            cx.read_from_clipboard()
-                .map(|item| item.text().unwrap().to_string()),
+            cx.read_from_clipboard().map(|item| item.text().unwrap()),
             Some("jumps".into())
         );
         cx.write_to_clipboard(ClipboardItem::new_string("test-copy".to_string()));
@@ -710,9 +715,9 @@ mod test {
             Mode::Normal,
         );
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<AllLanguageSettings>(cx, |settings| {
-                settings.languages.insert(
-                    LanguageName::new("Rust"),
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.languages.0.insert(
+                    LanguageName::new("Rust").0,
                     LanguageSettingsContent {
                         auto_indent_on_paste: Some(false),
                         ..Default::default()
@@ -773,8 +778,8 @@ mod test {
         let mut cx = NeovimBackedTestContext::new(cx).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<VimSettings>(cx, |s| {
-                s.use_system_clipboard = Some(UseSystemClipboard::Never)
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
             });
         });
 
@@ -819,8 +824,8 @@ mod test {
         let mut cx = NeovimBackedTestContext::new(cx).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<VimSettings>(cx, |s| {
-                s.use_system_clipboard = Some(UseSystemClipboard::Never)
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
             });
         });
 
@@ -848,8 +853,8 @@ mod test {
         let mut cx = NeovimBackedTestContext::new(cx).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<VimSettings>(cx, |s| {
-                s.use_system_clipboard = Some(UseSystemClipboard::Never)
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
             });
         });
 
@@ -907,8 +912,8 @@ mod test {
         let mut cx = VimTestContext::new(cx, true).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<VimSettings>(cx, |s| {
-                s.use_system_clipboard = Some(UseSystemClipboard::Never)
+            store.update_user_settings(cx, |s| {
+                s.vim.get_or_insert_default().use_system_clipboard = Some(UseSystemClipboard::Never)
             });
         });
 

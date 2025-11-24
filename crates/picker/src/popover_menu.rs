@@ -1,9 +1,9 @@
 use gpui::{
-    AnyView, Corner, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
+    AnyView, Corner, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point,
+    Subscription,
 };
 use ui::{
-    App, ButtonCommon, FluentBuilder as _, IntoElement, PopoverMenu, PopoverMenuHandle,
-    PopoverTrigger, RenderOnce, Window, px,
+    FluentBuilder as _, IntoElement, PopoverMenu, PopoverMenuHandle, PopoverTrigger, prelude::*,
 };
 
 use crate::{Picker, PickerDelegate};
@@ -19,6 +19,7 @@ where
     tooltip: TT,
     handle: Option<PopoverMenuHandle<Picker<P>>>,
     anchor: Corner,
+    offset: Option<Point<Pixels>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -43,12 +44,21 @@ where
             trigger,
             tooltip,
             handle: None,
+            offset: Some(Point {
+                x: px(0.0),
+                y: px(-2.0),
+            }),
             anchor,
         }
     }
 
     pub fn with_handle(mut self, handle: PopoverMenuHandle<Picker<P>>) -> Self {
         self.handle = Some(handle);
+        self
+    }
+
+    pub fn offset(mut self, offset: Point<Pixels>) -> Self {
+        self.offset = Some(offset);
         self
     }
 }
@@ -80,14 +90,12 @@ where
 {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let picker = self.picker.clone();
+
         PopoverMenu::new("popover-menu")
             .menu(move |_window, _cx| Some(picker.clone()))
             .trigger_with_tooltip(self.trigger, self.tooltip)
             .anchor(self.anchor)
-            .when_some(self.handle.clone(), |menu, handle| menu.with_handle(handle))
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(-2.0),
-            })
+            .when_some(self.handle, |menu, handle| menu.with_handle(handle))
+            .when_some(self.offset, |menu, offset| menu.offset(offset))
     }
 }

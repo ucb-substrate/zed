@@ -1,8 +1,8 @@
 # Developing Extensions
 
-## Extension Capabilities
+## Extension Features
 
-Extensions can add the following capabilities to Zed:
+Extensions are able to provide the following features to Zed:
 
 - [Languages](./languages.md)
 - [Debuggers](./debugger-extensions.md)
@@ -19,9 +19,11 @@ Before starting to develop an extension for Zed, be sure to [install Rust via ru
 
 When developing an extension, you can use it in Zed without needing to publish it by installing it as a _dev extension_.
 
-From the extensions page, click the `Install Dev Extension` button and select the directory containing your extension.
+From the extensions page, click the `Install Dev Extension` button (or the {#action zed::InstallDevExtension} action) and select the directory containing your extension.
 
-If you already have a published extension with the same name installed, your dev extension will override it.
+If you need to troubleshoot, you can check the Zed.log ({#action zed::OpenLog}) for additional output. For debug output, close and relaunch zed with the `zed --foreground` from the command line which show more verbose INFO level logging.
+
+If you already have the published version of the extension installed, the published version will be uninstalled prior to the installation of the dev extension. After successful installation, the `Extensions` page will indicate that the upstream extension is "Overridden by dev extension".
 
 ## Directory Structure of a Zed Extension
 
@@ -107,6 +109,37 @@ git submodule init
 git submodule update
 ```
 
+## Update Your Extension
+
+When developing/updating your extension, you will likely need to update its content from its submodule in the extensions repository.
+To quickly fetch the latest code for only specific extension (and avoid updating all others), use the specific path:
+
+```sh
+# From the root of the repository:
+git submodule update --remote extensions/your-extension-name
+```
+
+> Note: If you need to update all submodules (e.g., if multiple extensions have changed, or for a full clean build), you can run `git submodule update` without a path, but this will take longer.
+
+## Extension License Requirements
+
+As of October 1st, 2025, extension repositories must include a license.
+The following licenses are accepted:
+
+- [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- [BSD 3-Clause](https://opensource.org/license/bsd-3-clause)
+- [GNU GPLv3](https://www.gnu.org/licenses/gpl-3.0.en.html)
+- [MIT](https://opensource.org/license/mit)
+
+This allows us to distribute the resulting binary produced from your extension code to our users.
+Without a valid license, the pull request to add or update your extension in the following steps will fail CI.
+
+Your license file should be at the root of your extension repository. Any filename that has `LICENCE` or `LICENSE` as a prefix (case insensitive) will be inspected to ensure it matches one of the accepted licenses. See the [license validation source code](https://github.com/zed-industries/extensions/blob/main/src/lib/license.js).
+
+> This license requirement applies only to your extension code itself (the code that gets compiled into the extension binary).
+> It does not apply to any tools your extension may download or interact with, such as language servers or other external dependencies.
+> If your repository contains both extension code and other projects (like a language server), you are not required to relicense those other projects—only the extension code needs to be one of the aforementioned accepted licenses.
+
 ## Publishing your extension
 
 To publish an extension, open a PR to [the `zed-industries/extensions` repo](https://github.com/zed-industries/extensions).
@@ -119,6 +152,8 @@ In your PR, do the following:
 git submodule add https://github.com/your-username/foobar-zed.git extensions/foobar
 git add extensions/foobar
 ```
+
+> All extension submodules must use HTTPS URLs and not SSH URLS (`git@github.com`).
 
 2. Add a new entry to the top-level `extensions.toml` file containing your extension:
 
@@ -147,3 +182,5 @@ In your PR do the following:
    - Make sure the `version` matches the one set in `extension.toml` at the particular commit.
 
 If you'd like to automate this process, there is a [community GitHub Action](https://github.com/huacnlee/zed-extension-action) you can use.
+
+> **Note:** If your extension repository has a different license, you'll need to update it to be one of the [accepted extension licenses](#extension-license-requirements) before publishing your update.

@@ -16,19 +16,35 @@ Clone down the [Zed repository](https://github.com/zed-industries/zed).
 
   If you prefer to install the system libraries manually, you can find the list of required packages in the `script/linux` file.
 
-## Backend dependencies
+### Backend Dependencies (optional) {#backend-dependencies}
 
-> This section is still in development. The instructions are not yet complete.
+If you are looking to develop Zed collaboration features using a local collaboration server, please see: [Local Collaboration](./local-collaboration.md) docs.
 
-If you are developing collaborative features of Zed, you'll need to install the dependencies of zed's `collab` server:
+### Linkers {#linker}
 
-- Install [Postgres](https://www.postgresql.org/download/linux/)
-- Install [Livekit](https://github.com/livekit/livekit-cli) and [Foreman](https://theforeman.org/manuals/3.9/quickstart_guide.html)
+On Linux, Rust's default linker is [LLVM's `lld`](https://blog.rust-lang.org/2025/09/18/Rust-1.90.0/). Alternative linkers, especially [Wild](https://github.com/davidlattimore/wild) and [Mold](https://github.com/rui314/mold) can significantly improve clean and incremental build time.
 
-Alternatively, if you have [Docker](https://www.docker.com/) installed you can bring up all the `collab` dependencies using Docker Compose:
+At present Zed uses Mold in CI because it's more mature. For local development Wild is recommended because it's 5-20% faster than Mold.
 
-```sh
-docker compose up -d
+These linkers can be installed with `script/install-mold` and `script/install-wild`.
+
+To use Wild as your default, add these lines to your `~/.cargo/config.toml`:
+
+```toml
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=wild"]
+
+[target.aarch64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=--ld-path=wild"]
+```
+
+To use Mold as your default:
+
+```toml
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 ```
 
 ## Building from source
@@ -102,7 +118,7 @@ Zed has two main binaries:
 
 - You will need to build `crates/cli` and make its binary available in `$PATH` with the name `zed`.
 - You will need to build `crates/zed` and put it at `$PATH/to/cli/../../libexec/zed-editor`. For example, if you are going to put the cli at `~/.local/bin/zed` put zed at `~/.local/libexec/zed-editor`. As some linux distributions (notably Arch) discourage the use of `libexec`, you can also put this binary at `$PATH/to/cli/../../lib/zed/zed-editor` (e.g. `~/.local/lib/zed/zed-editor`) instead.
-- If you are going to provide a `.desktop` file you can find a template in `crates/zed/resources/zed.desktop.in`, and use `envsubst` to populate it with the values required. This file should also be renamed to `$APP_ID.desktop` so that the file [follows the FreeDesktop standards](https://github.com/zed-industries/zed/issues/12707#issuecomment-2168742761).
+- If you are going to provide a `.desktop` file you can find a template in `crates/zed/resources/zed.desktop.in`, and use `envsubst` to populate it with the values required. This file should also be renamed to `$APP_ID.desktop` so that the file [follows the FreeDesktop standards](https://github.com/zed-industries/zed/issues/12707#issuecomment-2168742761). You should also make this desktop file executable (`chmod 755`).
 - You will need to ensure that the necessary libraries are installed. You can get the current list by [inspecting the built binary](https://github.com/zed-industries/zed/blob/935cf542aebf55122ce6ed1c91d0fe8711970c82/script/bundle-linux#L65-L67) on your system.
 - For an example of a complete build script, see [script/bundle-linux](https://github.com/zed-industries/zed/blob/935cf542aebf55122ce6ed1c91d0fe8711970c82/script/bundle-linux).
 - You can disable Zed's auto updates and provide instructions for users who try to update Zed manually by building (or running) Zed with the environment variable `ZED_UPDATE_EXPLANATION`. For example: `ZED_UPDATE_EXPLANATION="Please use flatpak to update zed."`.
@@ -148,6 +164,58 @@ $ cargo heaptrack -b zed
 ```
 
 When this zed instance is exited, terminal output will include a command to run `heaptrack_interpret` to convert the `*.raw.zst` profile to a `*.zst` file which can be passed to `heaptrack_gui` for viewing.
+
+## Perf recording
+
+How to get a flamegraph with resolved symbols from a running zed instance. Use
+when zed is using a lot of CPU. Not useful for hangs.
+
+### During the incident
+
+- Find the PID (process ID) using:
+  `ps -eo size,pid,comm | grep zed | sort | head -n 1 | cut -d ' ' -f 2`
+  Or find the pid of the command zed-editor with the most ram usage in something
+  like htop/btop/top.
+
+- Install perf:
+  On Ubuntu (derivatives) run `sudo apt install linux-tools`.
+
+- Perf Record:
+  run `sudo perf record -p <pid you just found>`, wait a few seconds to gather data then press Ctrl+C. You should now have a perf.data file
+
+- Make the output file user owned:
+  run `sudo chown $USER:$USER perf.data`
+
+- Get build info:
+  Run zed again and type `zed: about` in the command pallet to get the exact commit.
+
+The `data.perf` file can be send to zed together with the exact commit.
+
+### Later
+
+This can be done by Zed staff.
+
+- Build Zed with symbols:
+  Check out the commit found previously and modify `Cargo.toml`.
+  Apply the following diff then make a release build.
+
+```diff
+[profile.release]
+-debug = "limited"
++debug = "full"
+```
+
+- Add the symbols to perf database:
+  `pref buildid-cache -v -a <path to release zed binary>`
+
+- Resolve the symbols from the db:
+  `perf inject -i perf.data -o perf_with_symbols.data`
+
+- Install flamegraph:
+  `cargo install cargo-flamegraph`
+
+- Render the flamegraph:
+  `flamegraph --perfdata perf_with_symbols.data`
 
 ## Troubleshooting
 
