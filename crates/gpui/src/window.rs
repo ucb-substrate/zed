@@ -2620,7 +2620,7 @@ impl Window {
             border_color: quad.border_color.opacity(opacity),
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
-            border_style: quad.border_style,
+            border_styles: quad.border_styles,
         });
     }
 
@@ -4675,7 +4675,7 @@ pub struct PaintQuad {
     /// The color of the quad's borders.
     pub border_color: Hsla,
     /// The style of the quad's borders.
-    pub border_style: BorderStyle,
+    pub border_styles: Edges<BorderStyle>,
 }
 
 impl PaintQuad {
@@ -4719,7 +4719,7 @@ pub fn quad(
     background: impl Into<Background>,
     border_widths: impl Into<Edges<Pixels>>,
     border_color: impl Into<Hsla>,
-    border_style: BorderStyle,
+    border_styles: Edges<BorderStyle>,
 ) -> PaintQuad {
     PaintQuad {
         bounds,
@@ -4727,7 +4727,7 @@ pub fn quad(
         background: background.into(),
         border_widths: border_widths.into(),
         border_color: border_color.into(),
-        border_style,
+        border_styles,
     }
 }
 
@@ -4739,7 +4739,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
         background: background.into(),
         border_widths: (0.).into(),
         border_color: transparent_black(),
-        border_style: BorderStyle::default(),
+        border_styles: Edges::all(BorderStyle::default()),
     }
 }
 
@@ -4747,7 +4747,7 @@ pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>
 pub fn outline(
     bounds: impl Into<Bounds<Pixels>>,
     border_color: impl Into<Hsla>,
-    border_style: BorderStyle,
+    border_styles: Edges<BorderStyle>,
 ) -> PaintQuad {
     PaintQuad {
         bounds: bounds.into(),
@@ -4755,6 +4755,6 @@ pub fn outline(
         background: transparent_black().into(),
         border_widths: (1.).into(),
         border_color: border_color.into(),
-        border_style,
+        border_styles,
     }
 }

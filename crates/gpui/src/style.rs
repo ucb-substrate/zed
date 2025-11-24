@@ -603,7 +603,11 @@ impl Style {
 
         #[cfg(debug_assertions)]
         if self.debug || cx.has_global::<DebugBelow>() {
-            window.paint_quad(crate::outline(bounds, crate::red(), BorderStyle::default()));
+            window.paint_quad(crate::outline(
+                bounds,
+                crate::red(),
+                Edges::all(BorderStyle::default()),
+            ));
         }
 
         let rem_size = window.rem_size();
@@ -635,7 +639,7 @@ impl Style {
                 background_color.unwrap_or_default(),
                 Edges::default(),
                 border_color,
-                self.border_style,
+                Edges::all(self.border_style),
             ));
         }
 
@@ -671,7 +675,7 @@ impl Style {
                 background,
                 border_widths,
                 self.border_color.unwrap_or_default(),
-                self.border_style,
+                Edges::all(self.border_style),
             );
 
             window.with_content_mask(Some(ContentMask { bounds: top_bounds }), |window| {

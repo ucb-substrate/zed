@@ -203,6 +203,14 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
   }
 
+  // Style of the nearest border
+  uint2 border_style = uint2(
+    center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right,
+    center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom
+  );
+
+  uint border_style_nearest = corner_to_point.x < corner_to_point.y ? border_style.x : border_style.y;
+
   // Negative when inside the border
   float border_sdf = max(inner_sdf, outer_sdf);
 
@@ -211,7 +219,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     float4 border_color = input.border_color;
 
     // Dashed border logic when border_style == 1
-    if (quad.border_style == 1) {
+    if (border_style_nearest == 1) {
       // Position along the perimeter in "dash space", where each dash
       // period has length 1
       float t = 0.0;

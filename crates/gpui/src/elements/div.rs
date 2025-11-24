@@ -1839,6 +1839,8 @@ impl Interactivity {
                         && text_bounds.contains(&window.mouse_position())
                         && window.modifiers().secondary()
                     {
+                        use crate::Edges;
+
                         let secondary_held = window.modifiers().secondary();
                         window.on_key_event({
                             move |e: &crate::ModifiersChangedEvent, _phase, window, _cx| {
@@ -1896,7 +1898,7 @@ impl Interactivity {
                                 },
                             },
                             crate::red(),
-                            BorderStyle::default(),
+                            Edges::all(BorderStyle::default()),
                         ))
                     }
                 }
