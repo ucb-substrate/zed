@@ -209,7 +209,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom
   );
 
-  uint border_style_nearest = corner_to_point.x < corner_to_point.y ? border_style.x : border_style.y;
+  uint border_style_nearest = corner_to_point.x > corner_to_point.y ? border_style.x : border_style.y;
 
   // Negative when inside the border
   float border_sdf = max(inner_sdf, outer_sdf);
