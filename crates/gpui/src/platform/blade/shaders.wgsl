@@ -652,11 +652,11 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     }
     // Style of the nearest border
     var border_style = vec2<u32>(
-        center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right,
-        center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom
+        select(quad.border_styles.left, quad.border_styles.right, center_to_point.x < 0.0),
+        select(quad.border_styles.top, quad.border_styles.bottom, center_to_point.y < 0.0)
     );
 
-    var border_style_nearest = corner_to_point.x > corner_to_point.y ? border_style.x : border_style.y;
+    var border_style_nearest = select(border_style.x, border_style.y, corner_to_point.x > corner_to_point.y);
 
     // Negative when inside the border
     let border_sdf = max(inner_sdf, outer_sdf);
