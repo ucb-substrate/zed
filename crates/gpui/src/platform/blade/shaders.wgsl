@@ -87,6 +87,13 @@ struct Corners {
     bottom_left: f32,
 }
 
+struct StyleEdges {
+    top: u32,
+    right: u32,
+    bottom: u32,
+    left: u32,
+}
+
 struct Edges {
     top: f32,
     right: f32,
@@ -480,7 +487,7 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 struct Quad {
     order: u32,
-    border_style: u32,
+    border_styles: StyleEdges,
     bounds: Bounds,
     content_mask: Bounds,
     background: Background,
@@ -643,6 +650,13 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
         inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
     }
+    // Style of the nearest border
+    var border_style = vec2<u32>(
+        center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right,
+        center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom
+    );
+
+    var border_style_nearest = corner_to_point.x > corner_to_point.y ? border_style.x : border_style.y;
 
     // Negative when inside the border
     let border_sdf = max(inner_sdf, outer_sdf);
@@ -652,7 +666,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         var border_color = input.border_color;
 
         // Dashed border logic when border_style == 1
-        if (quad.border_style == 1) {
+        if (border_style_nearest == 1) {
             // Position along the perimeter in "dash space", where each dash
             // period has length 1
             var t = 0.0;
