@@ -1,14 +1,21 @@
-use std::str::FromStr;
 use std::sync::LazyLock;
+use std::{str::FromStr, sync::Arc};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
+use async_trait::async_trait;
+use futures::AsyncReadExt;
+use gpui::SharedString;
+use http_client::{AsyncBody, HttpClient, HttpRequestExt, Request};
+use itertools::Itertools as _;
 use regex::Regex;
+use serde::Deserialize;
 use url::Url;
 
 use git::{
     BuildCommitPermalinkParams, BuildPermalinkParams, GitHostingProvider, ParsedGitRemote,
     PullRequest, RemoteUrl,
 };
+use urlencoding::encode;
 
 use crate::get_host_from_git_remote_url;
 
@@ -18,6 +25,42 @@ fn pull_request_regex() -> &'static Regex {
         Regex::new(r"\(pull request #(\d+)\)").unwrap()
     });
     &PULL_REQUEST_REGEX
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetails {
+    author: Author,
+}
+
+#[derive(Debug, Deserialize)]
+struct Author {
+    user: Account,
+}
+
+#[derive(Debug, Deserialize)]
+struct Account {
+    links: AccountLinks,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountLinks {
+    avatar: Option<Link>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Link {
+    href: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitDetailsSelfHosted {
+    author: AuthorSelfHosted,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorSelfHosted {
+    avatar_url: Option<String>,
 }
 
 pub struct Bitbucket {
@@ -61,8 +104,60 @@ impl Bitbucket {
             .host_str()
             .is_some_and(|host| host != "bitbucket.org")
     }
+
+    async fn fetch_bitbucket_commit_author(
+        &self,
+        repo_owner: &str,
+        repo: &str,
+        commit: &str,
+        client: &Arc<dyn HttpClient>,
+    ) -> Result<Option<String>> {
+        let Some(host) = self.base_url.host_str() else {
+            bail!("failed to get host from bitbucket base url");
+        };
+        let is_self_hosted = self.is_self_hosted();
+        let url = if is_self_hosted {
+            format!(
+                "https://{host}/rest/api/latest/projects/{repo_owner}/repos/{repo}/commits/{commit}?avatarSize=128"
+            )
+        } else {
+            format!("https://api.{host}/2.0/repositories/{repo_owner}/{repo}/commit/{commit}")
+        };
+
+        let request = Request::get(&url)
+            .header("Content-Type", "application/json")
+            .follow_redirects(http_client::RedirectPolicy::FollowAll);
+
+        let mut response = client
+            .send(request.body(AsyncBody::default())?)
+            .await
+            .with_context(|| format!("error fetching BitBucket commit details at {:?}", url))?;
+
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+
+        if response.status().is_client_error() {
+            let text = String::from_utf8_lossy(body.as_slice());
+            bail!(
+                "status error {}, response: {text:?}",
+                response.status().as_u16()
+            );
+        }
+
+        let body_str = std::str::from_utf8(&body)?;
+
+        if is_self_hosted {
+            serde_json::from_str::<CommitDetailsSelfHosted>(body_str)
+                .map(|commit| commit.author.avatar_url)
+        } else {
+            serde_json::from_str::<CommitDetails>(body_str)
+                .map(|commit| commit.author.user.links.avatar.map(|link| link.href))
+        }
+        .context("failed to deserialize BitBucket commit details")
+    }
 }
 
+#[async_trait]
 impl GitHostingProvider for Bitbucket {
     fn name(&self) -> String {
         self.name.clone()
@@ -73,7 +168,7 @@ impl GitHostingProvider for Bitbucket {
     }
 
     fn supports_avatars(&self) -> bool {
-        false
+        true
     }
 
     fn format_line_number(&self, line: u32) -> String {
@@ -98,9 +193,16 @@ impl GitHostingProvider for Bitbucket {
             return None;
         }
 
-        let mut path_segments = url.path_segments()?;
-        let owner = path_segments.next()?;
-        let repo = path_segments.next()?.trim_end_matches(".git");
+        let mut path_segments = url.path_segments()?.collect::<Vec<_>>();
+        let repo = path_segments.pop()?.trim_end_matches(".git");
+        let owner = if path_segments.get(0).is_some_and(|v| *v == "scm") && path_segments.len() > 1
+        {
+            // Skip the "scm" segment if it's not the only segment
+            // https://github.com/gitkraken/vscode-gitlens/blob/a6e3c6fbb255116507eaabaa9940c192ed7bb0e1/src/git/remotes/bitbucket-server.ts#L72-L74
+            path_segments.into_iter().skip(1).join("/")
+        } else {
+            path_segments.into_iter().join("/")
+        };
 
         Some(ParsedGitRemote {
             owner: owner.into(),
@@ -154,6 +256,33 @@ impl GitHostingProvider for Bitbucket {
         permalink
     }
 
+    fn build_create_pull_request_url(
+        &self,
+        remote: &ParsedGitRemote,
+        source_branch: &str,
+    ) -> Option<Url> {
+        let ParsedGitRemote { owner, repo } = remote;
+
+        if self.is_self_hosted() {
+            let mut url = self
+                .base_url()
+                .join(&format!("projects/{owner}/repos/{repo}/compare/commits"))
+                .ok()?;
+            let source_ref = format!("refs/heads/{source_branch}");
+            let encoded_ref = encode(&source_ref);
+            url.set_query(Some(&format!("sourceBranch={encoded_ref}")));
+            Some(url)
+        } else {
+            let mut url = self
+                .base_url()
+                .join(&format!("{owner}/{repo}/pull-requests/new"))
+                .ok()?;
+            let encoded_branch = encode(source_branch);
+            url.set_query(Some(&format!("source={encoded_branch}")));
+            Some(url)
+        }
+    }
+
     fn extract_pull_request(&self, remote: &ParsedGitRemote, message: &str) -> Option<PullRequest> {
         // Check first line of commit message for PR references
         let first_line = message.lines().next()?;
@@ -175,6 +304,23 @@ impl GitHostingProvider for Bitbucket {
         url.set_path(&path);
 
         Some(PullRequest { number, url })
+    }
+
+    async fn commit_author_avatar_url(
+        &self,
+        repo_owner: &str,
+        repo: &str,
+        commit: SharedString,
+        _author_email: Option<SharedString>,
+        http_client: Arc<dyn HttpClient>,
+    ) -> Result<Option<Url>> {
+        let commit = commit.to_string();
+        let avatar_url = self
+            .fetch_bitbucket_commit_author(repo_owner, repo, &commit, &http_client)
+            .await?
+            .map(|avatar_url| Url::parse(&avatar_url))
+            .transpose()?;
+        Ok(avatar_url)
     }
 }
 
@@ -261,6 +407,38 @@ mod tests {
             parsed_remote,
             ParsedGitRemote {
                 owner: "zed-industries".into(),
+                repo: "zed".into(),
+            }
+        );
+
+        // Test with "scm" in the path
+        let remote_url = "https://bitbucket.company.com/scm/zed-industries/zed.git";
+
+        let parsed_remote = Bitbucket::from_remote_url(remote_url)
+            .unwrap()
+            .parse_remote_url(remote_url)
+            .unwrap();
+
+        assert_eq!(
+            parsed_remote,
+            ParsedGitRemote {
+                owner: "zed-industries".into(),
+                repo: "zed".into(),
+            }
+        );
+
+        // Test with only "scm" as owner
+        let remote_url = "https://bitbucket.company.com/scm/zed.git";
+
+        let parsed_remote = Bitbucket::from_remote_url(remote_url)
+            .unwrap()
+            .parse_remote_url(remote_url)
+            .unwrap();
+
+        assert_eq!(
+            parsed_remote,
+            ParsedGitRemote {
+                owner: "scm".into(),
                 repo: "zed".into(),
             }
         );
@@ -376,6 +554,42 @@ mod tests {
 
         let expected_url = "https://bitbucket.company.com/projects/zed-industries/repos/zed/browse/main.rs?at=f00b4r#24-48";
         assert_eq!(permalink.to_string(), expected_url.to_string())
+    }
+
+    #[test]
+    fn test_build_bitbucket_create_pr_url() {
+        let remote = ParsedGitRemote {
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
+        };
+
+        let url = Bitbucket::public_instance()
+            .build_create_pull_request_url(&remote, "feature/my-branch")
+            .expect("url should be constructed");
+
+        assert_eq!(
+            url.as_str(),
+            "https://bitbucket.org/zed-industries/zed/pull-requests/new?source=feature%2Fmy-branch"
+        );
+    }
+
+    #[test]
+    fn test_build_bitbucket_self_hosted_create_pr_url() {
+        let remote = ParsedGitRemote {
+            owner: "zed-industries".into(),
+            repo: "zed".into(),
+        };
+
+        let url =
+            Bitbucket::from_remote_url("https://bitbucket.company.com/zed-industries/zed.git")
+                .unwrap()
+                .build_create_pull_request_url(&remote, "feature/my-branch")
+                .expect("url should be constructed");
+
+        assert_eq!(
+            url.as_str(),
+            "https://bitbucket.company.com/projects/zed-industries/repos/zed/compare/commits?sourceBranch=refs%2Fheads%2Ffeature%2Fmy-branch"
+        );
     }
 
     #[test]

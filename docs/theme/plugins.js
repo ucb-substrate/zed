@@ -21,124 +21,122 @@ function detectOS() {
   return "Unknown";
 }
 
-// Usage
 var os = detectOS();
 console.log("Operating System:", os);
 
-(function updateKeybindings() {
+// Defer keybinding processing to avoid blocking initial render
+function updateKeybindings() {
   const os = detectOS();
   const isMac = os === "Mac" || os === "iOS";
 
   function processKeybinding(element) {
-    const [macKeybinding, linuxKeybinding] = element.textContent.split("|");
+    const [macKeybinding, linuxKeybinding = macKeybinding] =
+      element.textContent.split("|");
+
     element.textContent = isMac ? macKeybinding : linuxKeybinding;
     element.classList.add("keybinding");
   }
 
-  function walkDOM(node) {
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      if (node.tagName.toLowerCase() === "kbd") {
-        processKeybinding(node);
-      } else {
-        Array.from(node.children).forEach(walkDOM);
-      }
-    }
-  }
+  // Process all kbd elements at once (more efficient than walking entire DOM)
+  const kbdElements = document.querySelectorAll("kbd");
+  kbdElements.forEach(processKeybinding);
+}
 
-  // Start the process from the body
-  walkDOM(document.body);
-})();
+// Use requestIdleCallback if available, otherwise requestAnimationFrame
+if (typeof requestIdleCallback === "function") {
+  requestIdleCallback(updateKeybindings);
+} else {
+  requestAnimationFrame(updateKeybindings);
+}
 
 function darkModeToggle() {
   var html = document.documentElement;
-  var themeToggleButton = document.getElementById("theme-toggle");
-  var themePopup = document.getElementById("theme-list");
-  var themePopupButtons = themePopup.querySelectorAll("button");
+  var themeColorMetaTag = document.querySelector('meta[name="theme-color"]');
+  var themeToggleButton = document.getElementById("color-scheme-toggle");
+  var themeToggleIcon = themeToggleButton
+    ? themeToggleButton.querySelector(".fa")
+    : null;
 
-  function setTheme(theme) {
+  function getStoredTheme() {
+    try {
+      return localStorage.getItem("mdbook-theme");
+    } catch {
+      return null;
+    }
+  }
+
+  function persistTheme(theme) {
+    try {
+      localStorage.setItem("mdbook-theme", theme);
+    } catch {}
+  }
+
+  function setTheme(theme, persist) {
     html.setAttribute("data-theme", theme);
     html.setAttribute("data-color-scheme", theme);
     html.className = theme;
-    localStorage.setItem("mdbook-theme", theme);
 
-    // Force a repaint to ensure the changes take effect in the client immediately
-    document.body.style.display = "none";
-    document.body.offsetHeight;
-    document.body.style.display = "";
+    if (themeColorMetaTag) {
+      setTimeout(function () {
+        themeColorMetaTag.content = getComputedStyle(html).backgroundColor;
+      }, 0);
+    }
+
+    if (persist) {
+      persistTheme(theme);
+    }
+
+    if (themeToggleButton) {
+      var nextTheme = theme === "dark" ? "light" : "dark";
+      var label =
+        nextTheme === "dark" ? "Switch to dark theme" : "Switch to light theme";
+      themeToggleButton.setAttribute("aria-label", label);
+      themeToggleButton.setAttribute("title", label);
+    }
+
+    if (themeToggleIcon) {
+      themeToggleIcon.className =
+        theme === "dark" ? "fa fa-sun-o" : "fa fa-moon-o";
+    }
   }
 
-  themeToggleButton.addEventListener("click", function (event) {
-    event.preventDefault();
-    themePopup.style.display =
-      themePopup.style.display === "block" ? "none" : "block";
-  });
-
-  themePopupButtons.forEach(function (button) {
-    button.addEventListener("click", function () {
-      setTheme(this.id);
-      themePopup.style.display = "none";
-    });
-  });
-
-  document.addEventListener("click", function (event) {
-    if (
-      !themePopup.contains(event.target) &&
-      !themeToggleButton.contains(event.target)
-    ) {
-      themePopup.style.display = "none";
-    }
-  });
-
   // Set initial theme
-  var currentTheme = localStorage.getItem("mdbook-theme");
+  var currentTheme = getStoredTheme();
   if (currentTheme) {
-    setTheme(currentTheme);
+    setTheme(currentTheme, false);
   } else {
     // If no theme is set, use the system's preference
     var systemPreference = window.matchMedia("(prefers-color-scheme: dark)")
       .matches
       ? "dark"
       : "light";
-    setTheme(systemPreference);
+    setTheme(systemPreference, false);
   }
 
   // Listen for system's preference changes
   const darkModeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
   darkModeMediaQuery.addEventListener("change", function (e) {
-    if (!localStorage.getItem("mdbook-theme")) {
-      setTheme(e.matches ? "dark" : "light");
+    if (!getStoredTheme()) {
+      setTheme(e.matches ? "dark" : "light", false);
     }
   });
+
+  if (themeToggleButton) {
+    themeToggleButton.addEventListener("click", function () {
+      setTheme(html.classList.contains("dark") ? "light" : "dark", true);
+    });
+  }
 }
 
-const copyMarkdown = () => {
-  const copyButton = document.getElementById("copy-markdown-toggle");
-  if (!copyButton) return;
+const copyPageActions = () => {
+  const headerCopyMarkdownButton = document.getElementById(
+    "copy-markdown-toggle",
+  );
 
-  // Store the original icon class, loading state, and timeout reference
-  const originalIconClass = "fa fa-copy";
+  const actionButtons = new Map();
   let isLoading = false;
-  let iconTimeoutId = null;
-
-  const getCurrentPagePath = () => {
-    const pathname = window.location.pathname;
-
-    // Handle root docs path
-    if (pathname === "/docs/" || pathname === "/docs") {
-      return "getting-started.md";
-    }
-
-    // Remove /docs/ prefix and .html suffix, then add .md
-    const cleanPath = pathname
-      .replace(/^\/docs\//, "")
-      .replace(/\.html$/, "")
-      .replace(/\/$/, "");
-
-    return cleanPath ? cleanPath + ".md" : "getting-started.md";
-  };
 
   const showToast = (message, isSuccess = true) => {
-    // Remove existing toast if any
     const existingToast = document.getElementById("copy-toast");
     existingToast?.remove();
 
@@ -149,12 +147,10 @@ const copyMarkdown = () => {
 
     document.body.appendChild(toast);
 
-    // Show toast with animation
     setTimeout(() => {
       toast.classList.add("show");
     }, 10);
 
-    // Hide and remove toast after 2 seconds
     setTimeout(() => {
       toast.classList.remove("show");
       setTimeout(() => {
@@ -163,38 +159,119 @@ const copyMarkdown = () => {
     }, 2000);
   };
 
-  const changeButtonIcon = (iconClass, duration = 1000) => {
-    const icon = copyButton.querySelector("i");
+  const registerButton = (button, originalIconClass) => {
+    if (!button) return;
+    actionButtons.set(button, {
+      originalIconClass,
+      iconTimeoutId: null,
+    });
+  };
+
+  registerButton(headerCopyMarkdownButton, "fa fa-copy");
+
+  const changeButtonIcon = (button, iconClass, duration = 1000) => {
+    const state = actionButtons.get(button);
+    if (!state) return;
+
+    const icon = button.querySelector("i");
     if (!icon) return;
 
-    // Clear any existing timeout
-    if (iconTimeoutId) {
-      clearTimeout(iconTimeoutId);
-      iconTimeoutId = null;
+    if (state.iconTimeoutId) {
+      clearTimeout(state.iconTimeoutId);
+      state.iconTimeoutId = null;
     }
 
     icon.className = iconClass;
 
     if (duration > 0) {
-      iconTimeoutId = setTimeout(() => {
-        icon.className = originalIconClass;
-        iconTimeoutId = null;
+      state.iconTimeoutId = setTimeout(() => {
+        icon.className = state.originalIconClass;
+        state.iconTimeoutId = null;
       }, duration);
     }
   };
 
-  const fetchAndCopyMarkdown = async () => {
+  const copyText = async (text) => {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("Clipboard API not supported in this browser");
+    }
+
+    await navigator.clipboard.writeText(text);
+  };
+
+  const getContentRoot = () =>
+    document.querySelector("#content main .content-wrap") ||
+    document.querySelector("#content > main");
+
+  const markdownAlternateHref = () =>
+    document
+      .querySelector('link[rel="alternate"][type="text/markdown"]')
+      ?.getAttribute("href");
+
+  const insertPageActionButtons = () => {
+    const contentRoot = getContentRoot();
+    if (
+      !contentRoot ||
+      contentRoot.querySelector(".page-actions") ||
+      !headerCopyMarkdownButton ||
+      !markdownAlternateHref()
+    ) {
+      return;
+    }
+
+    const firstHeading = contentRoot.querySelector("h1");
+    if (!firstHeading) return;
+
+    const header = document.createElement("div");
+    header.className = "page-header";
+
+    const actions = document.createElement("div");
+    actions.className = "page-actions";
+
+    firstHeading.insertAdjacentElement("beforebegin", header);
+    headerCopyMarkdownButton.classList.remove(
+      "icon-button",
+      "ib-hidden-mobile",
+    );
+    headerCopyMarkdownButton.classList.add("page-action", "page-action-icon");
+    actions.append(headerCopyMarkdownButton);
+    header.append(firstHeading, actions);
+  };
+
+  const markdownUrl = () => {
+    const alternateHref = markdownAlternateHref();
+    if (!alternateHref) return null;
+
+    const url = new URL(alternateHref, window.location.href);
+    if (
+      url.origin === window.location.origin &&
+      url.pathname.startsWith("/docs/") &&
+      !window.location.pathname.startsWith("/docs/")
+    ) {
+      return url.pathname.replace(/^\/docs/, "") || "/";
+    }
+
+    if (url.origin === window.location.origin) {
+      return `${url.pathname}${url.search}${url.hash}`;
+    }
+
+    return url.pathname;
+  };
+
+  const fetchAndCopyMarkdown = async (button) => {
     // Prevent multiple simultaneous requests
     if (isLoading) return;
 
     try {
       isLoading = true;
-      changeButtonIcon("fa fa-spinner fa-spin", 0); // Don't auto-restore spinner
+      changeButtonIcon(button, "fa fa-spinner fa-spin", 0); // Don't auto-restore spinner
 
-      const pagePath = getCurrentPagePath();
-      const rawUrl = `https://raw.githubusercontent.com/zed-industries/zed/main/docs/src/${pagePath}`;
+      const url = markdownUrl();
+      if (!url) {
+        throw new Error("Markdown alternate link not found");
+      }
 
-      const response = await fetch(rawUrl);
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error(
           `Failed to fetch markdown: ${response.status} ${response.statusText}`,
@@ -203,29 +280,154 @@ const copyMarkdown = () => {
 
       const markdownContent = await response.text();
 
-      // Copy to clipboard using modern API
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(markdownContent);
-      } else {
-        // Fallback: throw error if clipboard API isn't available
-        throw new Error("Clipboard API not supported in this browser");
-      }
+      await copyText(markdownContent);
 
-      changeButtonIcon("fa fa-check", 1000);
-      showToast("Page content copied to clipboard!");
+      changeButtonIcon(button, "fa fa-check", 1000);
+      showToast("Markdown copied to clipboard!");
     } catch (error) {
       console.error("Error copying markdown:", error);
-      changeButtonIcon("fa fa-exclamation-triangle", 2000);
+      changeButtonIcon(button, "fa fa-exclamation-triangle", 2000);
       showToast("Failed to copy markdown. Please try again.", false);
     } finally {
       isLoading = false;
     }
   };
 
-  copyButton.addEventListener("click", fetchAndCopyMarkdown);
+  headerCopyMarkdownButton?.addEventListener("click", () =>
+    fetchAndCopyMarkdown(headerCopyMarkdownButton),
+  );
+
+  insertPageActionButtons();
 };
 
-// Initialize functionality when DOM is loaded
-document.addEventListener("DOMContentLoaded", () => {
-  copyMarkdown();
+const initializePlugins = () => {
+  darkModeToggle();
+  requestAnimationFrame(copyPageActions);
+};
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initializePlugins);
+} else {
+  initializePlugins();
+}
+
+// Collapsible sidebar navigation for entire sections
+// Note: Initial collapsed state is applied in index.hbs to prevent flicker
+function initCollapsibleSidebar() {
+  var sidebar = document.getElementById("sidebar");
+  if (!sidebar) return;
+
+  var chapterList = sidebar.querySelector("ol.chapter");
+  if (!chapterList) return;
+
+  var partTitles = Array.from(chapterList.querySelectorAll("li.part-title"));
+
+  partTitles.forEach(function (partTitle) {
+    // Get all sibling elements that belong to this section
+    var sectionItems = getSectionItems(partTitle);
+
+    if (sectionItems.length > 0) {
+      setupCollapsibleSection(partTitle, sectionItems);
+    }
+  });
+}
+
+// Saves the list of collapsed section names to sessionStorage
+// This gets reset when the tab is closed and opened again
+function saveCollapsedSections() {
+  var collapsedSections = [];
+  var partTitles = document.querySelectorAll(
+    "#sidebar li.part-title.collapsible",
+  );
+
+  partTitles.forEach(function (partTitle) {
+    if (!partTitle.classList.contains("expanded")) {
+      collapsedSections.push(partTitle._sectionName);
+    }
+  });
+
+  try {
+    sessionStorage.setItem(
+      "sidebar-collapsed-sections",
+      JSON.stringify(collapsedSections),
+    );
+  } catch (e) {
+    // sessionStorage might not be available
+  }
+}
+
+function getSectionItems(partTitle) {
+  var items = [];
+  var sibling = partTitle.nextElementSibling;
+
+  while (sibling) {
+    // Stop when we hit another part-title
+    if (sibling.classList.contains("part-title")) {
+      break;
+    }
+    items.push(sibling);
+    sibling = sibling.nextElementSibling;
+  }
+
+  return items;
+}
+
+function setupCollapsibleSection(partTitle, sectionItems) {
+  partTitle.classList.add("collapsible");
+  partTitle.setAttribute("role", "button");
+  partTitle.setAttribute("tabindex", "0");
+  partTitle._sectionItems = sectionItems;
+
+  var isCurrentlyCollapsed = partTitle._isCollapsed;
+  if (isCurrentlyCollapsed) {
+    partTitle.setAttribute("aria-expanded", "false");
+  } else {
+    partTitle.classList.add("expanded");
+    partTitle.setAttribute("aria-expanded", "true");
+  }
+
+  partTitle.addEventListener("click", function (e) {
+    e.preventDefault();
+    toggleSection(partTitle);
+  });
+
+  // a11y: Add keyboard support (Enter and Space)
+  partTitle.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      toggleSection(partTitle);
+    }
+  });
+}
+
+function toggleSection(partTitle) {
+  var isExpanded = partTitle.classList.contains("expanded");
+  var sectionItems = partTitle._sectionItems;
+  var spacerAfter = partTitle._spacerAfter;
+
+  if (isExpanded) {
+    partTitle.classList.remove("expanded");
+    partTitle.setAttribute("aria-expanded", "false");
+    sectionItems.forEach(function (item) {
+      item.classList.add("section-hidden");
+    });
+    if (spacerAfter) {
+      spacerAfter.classList.add("section-hidden");
+    }
+  } else {
+    partTitle.classList.add("expanded");
+    partTitle.setAttribute("aria-expanded", "true");
+    sectionItems.forEach(function (item) {
+      item.classList.remove("section-hidden");
+    });
+    if (spacerAfter) {
+      spacerAfter.classList.remove("section-hidden");
+    }
+  }
+
+  saveCollapsedSections();
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+  initCollapsibleSidebar();
 });

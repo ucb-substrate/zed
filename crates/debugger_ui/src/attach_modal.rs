@@ -1,7 +1,7 @@
 use dap::{DapRegistry, DebugRequest};
 use futures::channel::oneshot;
 use fuzzy::{StringMatch, StringMatchCandidate};
-use gpui::{AppContext, DismissEvent, Entity, EventEmitter, Focusable, Render, Task};
+use gpui::{AppContext, DismissEvent, Entity, EventEmitter, Focusable, Render, Task, TaskExt};
 use gpui::{Subscription, WeakEntity};
 use picker::{Picker, PickerDelegate};
 use project::Project;
@@ -103,7 +103,7 @@ impl AttachModal {
                 window,
                 cx,
             )
-            .modal(modal)
+            .when(!modal, |picker| picker.embedded())
         });
         Self {
             _subscription: cx.subscribe(&picker, |_, _, _, cx| {
@@ -119,7 +119,6 @@ impl Render for AttachModal {
         v_flex()
             .key_context("AttachModal")
             .track_focus(&self.focus_handle(cx))
-            .w(rems(34.))
             .child(self.picker.clone())
     }
 }
@@ -136,6 +135,10 @@ impl ModalView for AttachModal {}
 
 impl PickerDelegate for AttachModalDelegate {
     type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "attach modal"
+    }
 
     fn match_count(&self) -> usize {
         self.matches.len()
@@ -317,7 +320,7 @@ impl PickerDelegate for AttachModalDelegate {
         let candidate = self.candidates.get(hit.candidate_id)?;
 
         Some(
-            ListItem::new(SharedString::from(format!("process-entry-{ix}")))
+            ListItem::new(format!("process-entry-{ix}"))
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
@@ -327,7 +330,7 @@ impl PickerDelegate for AttachModalDelegate {
                         .child(Label::new(format!("{} {}", candidate.name, candidate.pid)))
                         .child(
                             div()
-                                .id(SharedString::from(format!("process-entry-{ix}-command")))
+                                .id(format!("process-entry-{ix}-command"))
                                 .tooltip(Tooltip::text(
                                     candidate
                                         .command

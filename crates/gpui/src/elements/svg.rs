@@ -1,12 +1,23 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    hash::{Hash, Hasher},
+    path::Path,
+    sync::Arc,
+};
 
 use crate::{
+<<<<<<< HEAD
     App, Asset, Bounds, DefiniteLength, Element, GlobalElementId, Hitbox, InspectorElementId,
     InteractiveElement, Interactivity, IntoElement, LayoutId, Length, Pixels, Point, Radians,
     SharedString, Size, StyleRefinement, Styled, TransformationMatrix, Window,
     geometry::Negate as _, point, px, radians, size,
+=======
+    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
+    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
+    StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
+>>>>>>> upstream/main
 };
-use util::ResultExt;
+use gpui_util::ResultExt;
 
 /// An SVG element.
 pub struct Svg {
@@ -15,6 +26,8 @@ pub struct Svg {
     size: Option<Size<f32>>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
+    data: Option<Arc<[u8]>>,
+    data_path: Option<SharedString>,
 }
 
 /// Create a new SVG element.
@@ -26,6 +39,8 @@ pub fn svg() -> Svg {
         size: None,
         path: None,
         external_path: None,
+        data: None,
+        data_path: None,
     }
 }
 
@@ -40,6 +55,19 @@ impl Svg {
     /// Set the path to the SVG file for this element.
     pub fn external_path(mut self, path: impl Into<SharedString>) -> Self {
         self.external_path = Some(path.into());
+        self
+    }
+
+    /// Set the raw SVG data for this element.
+    /// The SVG will be rendered directly from the provided bytes.
+    pub fn data(mut self, data: &[u8]) -> Self {
+        // Generate a unique deterministic path based on the data hash for caching
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut hasher);
+        let hash = hasher.finish();
+        let path = SharedString::from(format!("__binary_svg__{}", hash));
+        self.data = Some(Arc::from(data));
+        self.data_path = Some(path);
         self
     }
 
@@ -151,18 +179,27 @@ impl Element for Svg {
             window,
             cx,
             |style, window, cx| {
-                if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| {
-                            transformation.into_matrix(bounds.center(), window.scale_factor())
-                        })
-                        .unwrap_or_default();
+                let transformation = self
+                    .transformation
+                    .as_ref()
+                    .map(|transformation| {
+                        transformation.into_matrix(bounds.center(), window.scale_factor())
+                    })
+                    .unwrap_or_default();
 
-                    window
-                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
-                        .log_err();
+                if let Some((data, path)) = self.data.as_ref().zip(self.data_path.as_ref()) {
+                    if let Some(color) = style.text.color {
+                        window
+                            .paint_svg(
+                                bounds,
+                                path.clone(),
+                                Some(&**data),
+                                transformation,
+                                color,
+                                cx,
+                            )
+                            .log_err();
+                    }
                 } else if let Some((path, color)) =
                     self.external_path.as_ref().zip(style.text.color)
                 {
@@ -173,14 +210,6 @@ impl Element for Svg {
                         return;
                     };
 
-                    let transformation = self
-                        .transformation
-                        .as_ref()
-                        .map(|transformation| {
-                            transformation.into_matrix(bounds.center(), window.scale_factor())
-                        })
-                        .unwrap_or_default();
-
                     window
                         .paint_svg(
                             bounds,
@@ -190,6 +219,10 @@ impl Element for Svg {
                             color,
                             cx,
                         )
+                        .log_err();
+                } else if let Some((path, color)) = self.path.as_ref().zip(style.text.color) {
+                    window
+                        .paint_svg(bounds, path.clone(), None, transformation, color, cx)
                         .log_err();
                 }
             },
@@ -288,7 +321,7 @@ impl Transformation {
             .translate(center.scale(scale_factor) + self.translate.scale(scale_factor))
             .rotate(self.rotate)
             .scale(self.scale)
-            .translate(center.scale(scale_factor).negate())
+            .translate(center.scale(-scale_factor))
     }
 }
 

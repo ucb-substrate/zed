@@ -2,40 +2,39 @@ use std::any::TypeId;
 
 use debugger_panel::DebugPanel;
 use editor::{Editor, MultiBufferOffsetUtf16};
-use gpui::{Action, App, DispatchPhase, EntityInputHandler, actions};
+use gpui::{Action, App, DispatchPhase, EntityInputHandler, TaskExt, actions};
 use new_process_modal::{NewProcessModal, NewProcessMode};
-use onboarding_modal::DebuggerOnboardingModal;
 use project::debugger::{self, breakpoint_store::SourceBreakpoint, session::ThreadStatus};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use session::DebugSession;
-use stack_trace_view::StackTraceView;
+
 use tasks_ui::{Spawn, TaskOverrides};
 use ui::{FluentBuilder, InteractiveElement};
 use util::maybe;
-use workspace::{ItemHandle, ShutdownDebugAdapters, Workspace};
-use zed_actions::ToggleFocus;
-use zed_actions::debugger::OpenOnboardingModal;
+use workspace::{ShutdownDebugAdapters, Workspace};
+use zed_actions::debug_panel::{Toggle, ToggleFocus};
 
 pub mod attach_modal;
 pub mod debugger_panel;
 mod dropdown_menus;
 mod new_process_modal;
-mod onboarding_modal;
 mod persistence;
 pub(crate) mod session;
-mod stack_trace_view;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod tests;
 
+// Let's see the diff-test in action.
 actions!(
     debugger,
     [
         /// Starts a new debugging session.
         Start,
-        /// Continues execution until the next breakpoint.
+        /// Continues all threads until the next breakpoint.
         Continue,
+        /// Continues the selected thread until the next breakpoint.
+        ContinueThread,
         /// Detaches the debugger from the running process.
         Detach,
         /// Pauses the currently running program.
@@ -72,8 +71,6 @@ actions!(
         FocusLoadedSources,
         /// Focuses on the terminal panel.
         FocusTerminal,
-        /// Shows the stack trace for the current thread.
-        ShowStackTrace,
         /// Toggles the thread picker dropdown.
         ToggleThreadPicker,
         /// Toggles the session picker dropdown.
@@ -90,11 +87,10 @@ actions!(
     ]
 );
 
-/// Extends selection down by a specified number of lines.
+/// Set a data breakpoint on the selected variable or memory region.
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = debugger)]
 #[serde(deny_unknown_fields)]
-/// Set a data breakpoint on the selected variable or memory region.
 pub struct ToggleDataBreakpoint {
     /// The type of data breakpoint
     /// Read & Write
@@ -121,6 +117,11 @@ pub fn init(cx: &mut App) {
             .register_action(|workspace, _: &ToggleFocus, window, cx| {
                 workspace.toggle_panel_focus::<DebugPanel>(window, cx);
             })
+            .register_action(|workspace, _: &Toggle, window, cx| {
+                if !workspace.toggle_panel_focus::<DebugPanel>(window, cx) {
+                    workspace.close_panel::<DebugPanel>(window, cx);
+                }
+            })
             .register_action(|workspace: &mut Workspace, _: &Start, window, cx| {
                 NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
             })
@@ -142,9 +143,6 @@ pub fn init(cx: &mut App) {
                     })
                 },
             )
-            .register_action(|workspace, _: &OpenOnboardingModal, window, cx| {
-                DebuggerOnboardingModal::toggle(workspace, window, cx)
-            })
             .register_action_renderer(|div, workspace, _, cx| {
                 let Some(debug_panel) = workspace.panel::<DebugPanel>(cx) else {
                     return div;
@@ -163,6 +161,9 @@ pub fn init(cx: &mut App) {
 
                 let caps = running_state.capabilities(cx);
                 let supports_step_back = caps.supports_step_back.unwrap_or_default();
+                let supports_single_thread_execution_requests = caps
+                    .supports_single_thread_execution_requests
+                    .unwrap_or_default();
                 let supports_detach = running_state.session().read(cx).is_attached();
                 let status = running_state.thread_status(cx);
 
@@ -204,43 +205,18 @@ pub fn init(cx: &mut App) {
                         let active_item = active_item.clone();
                         move |_: &Continue, _, cx| {
                             active_item
-                                .update(cx, |item, cx| item.continue_thread(cx))
+                                .update(cx, |item, cx| item.continue_program(cx))
                                 .ok();
                         }
                     })
-                    .on_action(cx.listener(
-                        |workspace, _: &ShowStackTrace, window, cx| {
-                            let Some(debug_panel) = workspace.panel::<DebugPanel>(cx) else {
-                                return;
-                            };
-
-                            if let Some(existing) = workspace.item_of_type::<StackTraceView>(cx) {
-                                let is_active = workspace
-                                    .active_item(cx)
-                                    .is_some_and(|item| item.item_id() == existing.item_id());
-                                workspace.activate_item(&existing, true, !is_active, window, cx);
-                            } else {
-                                let Some(active_session) = debug_panel.read(cx).active_session()
-                                else {
-                                    return;
-                                };
-
-                                let project = workspace.project();
-
-                                let stack_trace_view = active_session.update(cx, |session, cx| {
-                                    session.stack_trace_view(project, window, cx).clone()
-                                });
-
-                                workspace.add_item_to_active_pane(
-                                    Box::new(stack_trace_view),
-                                    None,
-                                    true,
-                                    window,
-                                    cx,
-                                );
-                            }
-                        },
-                    ))
+                    .when(supports_single_thread_execution_requests, |div| {
+                        let active_item = active_item.clone();
+                        div.on_action(move |_: &ContinueThread, _, cx| {
+                            active_item
+                                .update(cx, |item, cx| item.continue_thread(cx))
+                                .ok();
+                        })
+                    })
                 })
                 .when(supports_detach, |div| {
                     let active_item = active_item.clone();
@@ -336,7 +312,7 @@ pub fn init(cx: &mut App) {
                                     return;
                                 }
                                 maybe!({
-                                    let (buffer, position, _) = editor
+                                    let (buffer, position) = editor
                                         .update(cx, |editor, cx| {
                                             let cursor_point: language::Point = editor
                                                 .selections
@@ -387,7 +363,7 @@ pub fn init(cx: &mut App) {
                     window.on_action(
                         TypeId::of::<editor::actions::EvaluateSelectedText>(),
                         move |_, _, window, cx| {
-                            maybe!({
+                            let status = maybe!({
                                 let text = editor
                                     .update(cx, |editor, cx| {
                                         let range = editor
@@ -411,7 +387,13 @@ pub fn init(cx: &mut App) {
 
                                         state.session().update(cx, |session, cx| {
                                             session
-                                                .evaluate(text, None, stack_id, None, cx)
+                                                .evaluate(
+                                                    text,
+                                                    Some(dap::EvaluateArgumentsContext::Repl),
+                                                    stack_id,
+                                                    None,
+                                                    cx,
+                                                )
                                                 .detach();
                                         });
                                     });
@@ -419,6 +401,9 @@ pub fn init(cx: &mut App) {
 
                                 Some(())
                             });
+                            if status.is_some() {
+                                cx.stop_propagation();
+                            }
                         },
                     );
                 })

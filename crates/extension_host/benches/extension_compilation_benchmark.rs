@@ -4,14 +4,14 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use extension::{
     ExtensionCapability, ExtensionHostProxy, ExtensionLibraryKind, ExtensionManifest,
     LanguageServerManifestEntry, LibManifestEntry, SchemaVersion,
-    extension_builder::{CompileExtensionOptions, ExtensionBuilder},
+    extension_builder::{CompilationConcurrency, CompileExtensionOptions, ExtensionBuilder},
 };
 use extension_host::wasm_host::WasmHost;
-use fs::RealFs;
+use fs::{Fs, RealFs};
 use gpui::{TestAppContext, TestDispatcher};
 use http_client::{FakeHttpClient, Response};
 use node_runtime::NodeRuntime;
-use rand::{SeedableRng, rngs::StdRng};
+
 use reqwest_client::ReqwestClient;
 use serde_json::json;
 use settings::SettingsStore;
@@ -24,7 +24,7 @@ fn extension_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("load");
 
     let mut manifest = manifest();
-    let wasm_bytes = wasm_bytes(&cx, &mut manifest);
+    let wasm_bytes = wasm_bytes(&cx, &mut manifest, RealFs::new(None, cx.executor()));
     let manifest = Arc::new(manifest);
     let extensions_dir = TempTree::new(json!({
         "installed": {},
@@ -37,8 +37,8 @@ fn extension_benchmarks(c: &mut Criterion) {
             || wasm_bytes.clone(),
             |wasm_bytes| {
                 let _extension = cx
-                    .executor()
-                    .block(wasm_host.load_extension(wasm_bytes, &manifest, &cx.to_async()))
+                    .foreground_executor()
+                    .block_on(wasm_host.load_extension(wasm_bytes, &manifest, &cx.to_async()))
                     .unwrap();
             },
             BatchSize::SmallInput,
@@ -48,7 +48,7 @@ fn extension_benchmarks(c: &mut Criterion) {
 
 fn init() -> TestAppContext {
     const SEED: u64 = 9999;
-    let dispatcher = TestDispatcher::new(StdRng::seed_from_u64(SEED));
+    let dispatcher = TestDispatcher::new(SEED);
     let cx = TestAppContext::build(dispatcher, None);
     cx.executor().allow_parking();
     cx.update(|cx| {
@@ -60,7 +60,7 @@ fn init() -> TestAppContext {
     cx
 }
 
-fn wasm_bytes(cx: &TestAppContext, manifest: &mut ExtensionManifest) -> Vec<u8> {
+fn wasm_bytes(cx: &TestAppContext, manifest: &mut ExtensionManifest, fs: Arc<dyn Fs>) -> Vec<u8> {
     let extension_builder = extension_builder();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -68,11 +68,15 @@ fn wasm_bytes(cx: &TestAppContext, manifest: &mut ExtensionManifest) -> Vec<u8> 
         .parent()
         .unwrap()
         .join("extensions/test-extension");
-    cx.executor()
-        .block(extension_builder.compile_extension(
+    cx.foreground_executor()
+        .block_on(extension_builder.compile_extension(
             &path,
             manifest,
-            CompileExtensionOptions { release: true },
+            CompileExtensionOptions {
+                release: true,
+                max_concurrency: CompilationConcurrency::Unbounded,
+            },
+            fs,
         ))
         .unwrap();
     std::fs::read(path.join("extension.wasm")).unwrap()
@@ -97,7 +101,7 @@ fn wasm_host(cx: &TestAppContext, extensions_dir: &TempTree) -> Arc<WasmHost> {
     });
     let extensions_dir = extensions_dir.path().canonicalize().unwrap();
     let work_dir = extensions_dir.join("work");
-    let fs = Arc::new(RealFs::new(None, cx.executor()));
+    let fs = RealFs::new(None, cx.executor());
 
     cx.update(|cx| {
         WasmHost::new(
@@ -132,7 +136,6 @@ fn manifest() -> ExtensionManifest {
             .into_iter()
             .collect(),
         context_servers: BTreeMap::default(),
-        agent_servers: BTreeMap::default(),
         slash_commands: BTreeMap::default(),
         snippets: None,
         capabilities: vec![ExtensionCapability::ProcessExec(
@@ -143,6 +146,7 @@ fn manifest() -> ExtensionManifest {
         )],
         debug_adapters: Default::default(),
         debug_locators: Default::default(),
+        language_model_providers: BTreeMap::default(),
     }
 }
 

@@ -77,7 +77,7 @@ impl SpinnerLabel {
         let duration = variant.duration();
 
         SpinnerLabel {
-            base: Label::new(frames[0]),
+            base: Label::new(frames[0]).color(Color::Muted),
             variant,
             frames,
             duration,
@@ -164,7 +164,7 @@ impl RenderOnce for SpinnerLabel {
         let frames = self.frames.clone();
         let duration = self.duration;
 
-        self.base.color(Color::Muted).with_animation(
+        self.base.with_animation(
             self.variant.animation_id(),
             Animation::new(duration).repeat(),
             move |mut label, delta| {
@@ -190,7 +190,12 @@ impl Component for SpinnerLabel {
         "Spinner Label"
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+    fn description() -> &'static str {
+        "A text-based loading indicator that animates through a sequence of \
+        unicode glyphs to show ongoing or indeterminate work."
+    }
+
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         let examples = vec![
             single_example("Default", SpinnerLabel::new().into_any_element()),
             single_example(
@@ -200,6 +205,6 @@ impl Component for SpinnerLabel {
             single_example("Sand Variant", SpinnerLabel::sand().into_any_element()),
         ];
 
-        Some(example_group(examples).vertical().into_any_element())
+        example_group(examples).vertical().into_any_element()
     }
 }

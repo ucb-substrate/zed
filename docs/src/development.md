@@ -1,3 +1,8 @@
+---
+title: Developing Zed
+description: "Guide to building and developing Zed from source."
+---
+
 # Developing Zed
 
 See the platform-specific instructions for building Zed from source:
@@ -6,9 +11,25 @@ See the platform-specific instructions for building Zed from source:
 - [Linux](./development/linux.md)
 - [Windows](./development/windows.md)
 
-If you'd like to develop collaboration features, additionally see:
+## Bird's-eye view of Zed {#birds-eye-view-of-zed}
 
-- [Local Collaboration](./development/local-collaboration.md)
+Keep the [Zed glossary](./development/glossary.md) handy when starting out. It explains structures and terms you'll see throughout the codebase.
+
+Zed is made up of several smaller crates. Here are the ones you're most likely to work with:
+
+- [`gpui`](https://github.com/zed-industries/zed/tree/main/crates/gpui) is a GPU-accelerated UI framework which provides all of the building blocks for Zed. **We recommend familiarizing yourself with the root level GPUI documentation.**
+- [`editor`](https://github.com/zed-industries/zed/tree/main/crates/editor) contains the core `Editor` type that drives both the code editor and all various input fields within Zed. It also handles a display layer for LSP features such as Inlay Hints or code completions.
+- [`project`](https://github.com/zed-industries/zed/tree/main/crates/project) manages files and navigation within the filetree. It is also Zed's side of communication with LSP.
+- [`workspace`](https://github.com/zed-industries/zed/tree/main/crates/workspace) handles local state serialization and groups projects together.
+- [`vim`](https://github.com/zed-industries/zed/tree/main/crates/vim) is a thin implementation of Vim workflow over `editor`.
+- [`lsp`](https://github.com/zed-industries/zed/tree/main/crates/lsp) handles communication with external LSP server.
+- [`language`](https://github.com/zed-industries/zed/tree/main/crates/language) drives `editor`'s understanding of language - from providing a list of symbols to the syntax map.
+- [`collab`](https://github.com/zed-industries/zed/tree/main/crates/collab) is the collaboration server itself, driving the collaboration features such as project sharing.
+- [`rpc`](https://github.com/zed-industries/zed/tree/main/crates/rpc) defines messages to be exchanged with collaboration server.
+- [`theme`](https://github.com/zed-industries/zed/tree/main/crates/theme) defines the theme system and provides a default theme.
+- [`ui`](https://github.com/zed-industries/zed/tree/main/crates/ui) is a collection of UI components and common patterns used throughout Zed.
+- [`cli`](https://github.com/zed-industries/zed/tree/main/crates/cli) is the CLI crate which invokes the Zed binary.
+- [`zed`](https://github.com/zed-industries/zed/tree/main/crates/zed) is where all things come together, and the `main` entry point for Zed.
 
 ## Keychain access
 
@@ -25,9 +46,9 @@ your password again the next time something changes in the binary.
 This quickly becomes annoying and impedes development speed.
 
 That is why, by default, when running a development build of Zed an alternative
-credential provider is used in order to bypass the system keychain.
+credential provider is used to bypass the system keychain.
 
-> Note: This is **only** the case for development builds. For all non-development
+> **Note:** This is **only** the case for development builds. For all non-development
 > release channels the system keychain is always used.
 
 If you need to test something out using the real system keychain in a
@@ -84,6 +105,28 @@ The `script/histogram` tool can accept as many measurement files as you like and
 For benchmarking unit tests, annotate them with the `#[perf]` attribute from the `util_macros` crate. Then run `cargo
 perf-test -p $CRATE` to benchmark them. See the rustdoc documentation on `crates/util_macros` and `tooling/perf` for
 in-depth examples and explanations.
+
+## ETW Profiling on Windows
+
+Zed supports performance profiling with Event Tracing for Windows (ETW) to capture detailed performance data, including CPU, GPU, memory, disk, and file I/O activity. Data is saved to an `.etl` file, which can be opened in standard profiling tools for analysis.
+
+ETW recordings may contain personally identifiable or security-sensitive information, such as paths to files and registry keys accessed, as well as process names. Please keep this in mind when sharing traces with others.
+
+### Recording a trace
+
+Open the command palette and run one of the following:
+
+- `zed: record etw trace`: records CPU, GPU, memory, and I/O activity
+- `zed: record etw trace with heap tracing`: includes heap allocation data for the Zed process
+
+Zed will request administrator permission. Once granted, recording will begin.
+
+### Saving or canceling
+
+While a trace is recording, open the command palette and run one of the following:
+
+- `zed: save etw trace`: stops recording and saves the trace to disk
+- `zed: cancel etw trace`: stops recording without saving
 
 ## Contributor links
 

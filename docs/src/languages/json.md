@@ -1,9 +1,22 @@
+---
+title: JSON
+description: "Configure JSON language support in Zed, including language servers, formatting, and debugging."
+---
+
 # JSON
 
 JSON support is available natively in Zed.
 
 - Tree-sitter: [tree-sitter/tree-sitter-json](https://github.com/tree-sitter/tree-sitter-json)
 - Language Server: [zed-industries/json-language-server](https://github.com/zed-industries/json-language-server)
+
+## JSON Lines Preview
+
+Open a `.jsonl` or `.ndjson` file and run {#action tabular_data::OpenPreview} to view it as a read-only table. Use {#action tabular_data::OpenPreviewToTheSide} to keep the source visible alongside the preview.
+
+Each nonblank line must contain a JSON object. Top-level keys become columns in the order they first appear in the file. Keys from the first record keep their source order, and new keys from later records are appended to the right. Missing fields appear as empty cells. Values retain their JSON representation, so `null`, `"null"`, and `""` remain distinct; nested objects and arrays appear as compact JSON.
+
+The preview updates as you edit the source. Invalid records show an error with the source line number. Sorting compares the displayed text, and changing the column names or order clears active sorting and filters.
 
 ## JSONC
 
@@ -16,7 +29,7 @@ If you use files with the `*.jsonc` extension when using `Format Document` or ha
 
 To workaround this behavior you can add the following to your `.prettierrc` configuration file:
 
-```json [settings]
+```json
 {
   "overrides": [
     {
@@ -38,9 +51,9 @@ Zed automatically out of the box supports JSON Schema validation of `package.jso
 
 To specify a schema inline with your JSON files, add a `$schema` top level key linking to your json schema file.
 
-For example to for a `.luarc.json` for use with [lua-language-server](https://github.com/LuaLS/lua-language-server/):
+For example, for a `.luarc.json` for use with [lua-language-server](https://github.com/LuaLS/lua-language-server/):
 
-```json [settings]
+```json
 {
   "$schema": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json",
   "runtime.version": "Lua 5.4"
@@ -49,9 +62,7 @@ For example to for a `.luarc.json` for use with [lua-language-server](https://gi
 
 ### Schema Specification via Settings
 
-You can alternatively associate JSON Schemas with file paths by via Zed LSP settings.
-
-To
+You can associate JSON Schemas with file paths using relative paths in your language server settings. Zed resolves paths relative to your project root:
 
 ```json [settings]
 "lsp": {
@@ -59,6 +70,14 @@ To
     "settings": {
       "json": {
         "schemas": [
+          {
+            "fileMatch": ["config/*.json"],
+            "url": "./schemas/custom-schema.json"
+          },
+          {
+            "fileMatch": ["*.config.json"],
+            "url": "~/global-schemas/shared.json"
+          },
           {
             "fileMatch": ["*/*.luarc.json"],
             "url": "https://raw.githubusercontent.com/sumneko/vscode-lua/master/setting/schema.json"
@@ -69,6 +88,8 @@ To
   }
 }
 ```
+
+Paths starting with `./` resolve relative to the worktree root. Paths starting with `~/` expand to your home directory.
 
 You can also pass any of the [supported settings](https://github.com/Microsoft/vscode/blob/main/extensions/json-language-features/server/README.md#settings) to json-language-server by specifying them in your Zed settings.json:
 

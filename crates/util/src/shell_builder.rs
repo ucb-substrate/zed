@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::shell::get_system_shell;
 use crate::shell::{Shell, ShellKind};
 
@@ -10,6 +12,7 @@ pub struct ShellBuilder {
     interactive: bool,
     /// Whether to redirect stdin to /dev/null for the spawned command as a subshell.
     redirect_stdin: bool,
+    substitute_variables: bool,
     kind: ShellKind,
 }
 
@@ -29,10 +32,16 @@ impl ShellBuilder {
             interactive: true,
             kind,
             redirect_stdin: false,
+            substitute_variables: true,
         }
     }
     pub fn non_interactive(mut self) -> Self {
         self.interactive = false;
+        self
+    }
+
+    pub fn literal_args(mut self) -> Self {
+        self.substitute_variables = false;
         self
     }
 
@@ -42,7 +51,7 @@ impl ShellBuilder {
             self.program.clone()
         } else {
             match self.kind {
-                ShellKind::PowerShell => {
+                ShellKind::PowerShell | ShellKind::Pwsh => {
                     format!("{} -C '{}'", self.program, command_to_use_in_label)
                 }
                 ShellKind::Cmd => {
@@ -78,28 +87,51 @@ impl ShellBuilder {
         task_args: &[String],
     ) -> (String, Vec<String>) {
         if let Some(task_command) = task_command {
+            let task_command = if !task_args.is_empty() {
+                match self.kind.try_quote_prefix_aware(&task_command) {
+                    Some(task_command) => task_command.into_owned(),
+                    None => task_command,
+                }
+            } else {
+                task_command
+            };
             let mut combined_command = task_args.iter().fold(task_command, |mut command, arg| {
                 command.push(' ');
-                command.push_str(&self.kind.to_shell_variable(arg));
+                let shell_variable = if self.substitute_variables {
+                    Cow::Owned(self.kind.to_shell_variable(arg))
+                } else {
+                    Cow::Borrowed(arg.as_str())
+                };
+                command.push_str(&match self.kind.try_quote(&shell_variable) {
+                    Some(shell_variable) => shell_variable,
+                    None => shell_variable,
+                });
                 command
             });
             if self.redirect_stdin {
                 match self.kind {
+                    ShellKind::Posix => {
+                        // Perform the STDIN redirection prior to the actual
+                        // command on a separate line, so that it is already
+                        // active if the command contains a syntax error.
+                        // Otherwise, with -i, dash will fall back to an
+                        // interactive shell in this case.
+                        combined_command.insert_str(0, "exec </dev/null\n");
+                    }
                     ShellKind::Fish => {
                         combined_command.insert_str(0, "begin; ");
                         combined_command.push_str("; end </dev/null");
                     }
-                    ShellKind::Posix
-                    | ShellKind::Nushell
+                    ShellKind::Nushell
                     | ShellKind::Csh
                     | ShellKind::Tcsh
                     | ShellKind::Rc
                     | ShellKind::Xonsh
                     | ShellKind::Elvish => {
                         combined_command.insert(0, '(');
-                        combined_command.push_str(") </dev/null");
+                        combined_command.push_str("\n) </dev/null");
                     }
-                    ShellKind::PowerShell => {
+                    ShellKind::PowerShell | ShellKind::Pwsh => {
                         combined_command.insert_str(0, "$null | & {");
                         combined_command.push_str("}");
                     }
@@ -114,6 +146,108 @@ impl ShellBuilder {
         }
 
         (self.program, self.args)
+    }
+
+    // This should not exist, but our task infra is broken beyond repair right now
+    #[doc(hidden)]
+    pub fn build_no_quote(
+        mut self,
+        task_command: Option<String>,
+        task_args: &[String],
+    ) -> (String, Vec<String>) {
+        if let Some(task_command) = task_command {
+            let mut combined_command = task_args.iter().fold(task_command, |mut command, arg| {
+                command.push(' ');
+                command.push_str(&self.kind.to_shell_variable(arg));
+                command
+            });
+            if self.redirect_stdin {
+                match self.kind {
+                    ShellKind::Posix => {
+                        combined_command.insert_str(0, "exec </dev/null\n");
+                    }
+                    ShellKind::Fish => {
+                        combined_command.insert_str(0, "begin; ");
+                        combined_command.push_str("; end </dev/null");
+                    }
+                    ShellKind::Nushell
+                    | ShellKind::Csh
+                    | ShellKind::Tcsh
+                    | ShellKind::Rc
+                    | ShellKind::Xonsh
+                    | ShellKind::Elvish => {
+                        combined_command.insert(0, '(');
+                        combined_command.push_str("\n) </dev/null");
+                    }
+                    ShellKind::PowerShell | ShellKind::Pwsh => {
+                        combined_command.insert_str(0, "$null | & {");
+                        combined_command.push_str("}");
+                    }
+                    ShellKind::Cmd => {
+                        combined_command.push_str("< NUL");
+                    }
+                }
+            }
+
+            self.args
+                .extend(self.kind.args_for_shell(self.interactive, combined_command));
+        }
+
+        (self.program, self.args)
+    }
+
+    /// Builds a `smol::process::Command` with the given task command and arguments.
+    ///
+    /// Prefer this over manually constructing a command with the output of `Self::build`,
+    /// as this method handles `cmd` weirdness on windows correctly.
+    pub fn build_smol_command(
+        self,
+        task_command: Option<String>,
+        task_args: &[String],
+    ) -> smol::process::Command {
+        smol::process::Command::from(self.build_std_command(task_command, task_args))
+    }
+
+    /// Builds a `std::process::Command` with the given task command and arguments.
+    ///
+    /// Prefer this over manually constructing a command with the output of `Self::build`,
+    /// as this method handles `cmd` weirdness on windows correctly.
+    pub fn build_std_command(
+        self,
+        mut task_command: Option<String>,
+        task_args: &[String],
+    ) -> std::process::Command {
+        #[cfg(windows)]
+        let kind = self.kind;
+        if task_args.is_empty() {
+            task_command = task_command
+                .as_ref()
+                .map(|cmd| self.kind.try_quote_prefix_aware(&cmd).map(Cow::into_owned))
+                .unwrap_or(task_command);
+        }
+        let (program, args) = self.build(task_command, task_args);
+
+        let mut child = crate::command::new_std_command(program);
+
+        #[cfg(windows)]
+        if kind == ShellKind::Cmd {
+            use std::os::windows::process::CommandExt;
+
+            for arg in args {
+                child.raw_arg(arg);
+            }
+        } else {
+            child.args(args);
+        }
+
+        #[cfg(not(windows))]
+        child.args(args);
+
+        child
+    }
+
+    pub fn kind(&self) -> ShellKind {
+        self.kind
     }
 }
 
@@ -144,7 +278,32 @@ mod test {
             vec![
                 "-i",
                 "-c",
-                "echo $env.hello $env.world nothing --($env.something) $ ${test"
+                "echo '$env.hello' '$env.world' nothing '--($env.something)' '$' '${test'"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_literal_args_skip_variable_substitution() {
+        let shell = Shell::Program("nu".to_owned());
+        let (program, args) = ShellBuilder::new(&shell, false)
+            .non_interactive()
+            .literal_args()
+            .build(
+                Some("ssh".into()),
+                &[
+                    "host".to_string(),
+                    "cd \"$HOME\"/project && exec \"$HOME\"/'a b' exec".to_string(),
+                    "${braced}".to_string(),
+                ],
+            );
+
+        assert_eq!(program, "nu");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "ssh host \"cd \\\"$HOME\\\"/project && exec \\\"$HOME\\\"/'a b' exec\" '${braced}'"
             ]
         );
     }
@@ -159,7 +318,7 @@ mod test {
             .build(Some("echo".into()), &["nothing".to_string()]);
 
         assert_eq!(program, "nu");
-        assert_eq!(args, vec!["-i", "-c", "(echo nothing) </dev/null"]);
+        assert_eq!(args, vec!["-i", "-c", "(echo nothing\n) </dev/null"]);
     }
 
     #[test]
@@ -173,5 +332,92 @@ mod test {
 
         assert_eq!(program, "fish");
         assert_eq!(args, vec!["-i", "-c", "begin; echo test; end </dev/null"]);
+    }
+
+    #[test]
+    fn redirect_stdin_to_dev_null_preserves_heredoc() {
+        let shell = Shell::Program("sh".to_owned());
+        let shell_builder = ShellBuilder::new(&shell, false);
+
+        let command = "cat <<EOF\nhello\nEOF";
+        let (program, args) = shell_builder
+            .redirect_stdin_to_dev_null()
+            .build(Some(command.into()), &[]);
+
+        assert_eq!(program, "sh");
+        assert_eq!(
+            args,
+            vec!["-i", "-c", "exec </dev/null\ncat <<EOF\nhello\nEOF"]
+        );
+    }
+
+    #[test]
+    fn non_interactive_omits_interactive_flag() {
+        // Headless hosts (e.g. the eval CLI) build the agent's shell command
+        // non-interactively so it works without a controlling TTY.
+        let shell = Shell::Program("sh".to_owned());
+        let shell_builder = ShellBuilder::new(&shell, false).non_interactive();
+
+        let (program, args) = shell_builder.build(Some("echo hello".into()), &[]);
+
+        assert_eq!(program, "sh");
+        assert_eq!(args, vec!["-c", "echo hello"]);
+        assert!(
+            !args.iter().any(|arg| arg == "-i"),
+            "non-interactive shell command must not include `-i`"
+        );
+    }
+
+    #[test]
+    fn does_not_quote_sole_command_only() {
+        let shell = Shell::Program("fish".to_owned());
+        let shell_builder = ShellBuilder::new(&shell, false);
+
+        let (program, args) = shell_builder.build(Some("echo".into()), &[]);
+
+        assert_eq!(program, "fish");
+        assert_eq!(args, vec!["-i", "-c", "echo"]);
+
+        let shell = Shell::Program("fish".to_owned());
+        let shell_builder = ShellBuilder::new(&shell, false);
+
+        let (program, args) = shell_builder.build(Some("echo oo".into()), &[]);
+
+        assert_eq!(program, "fish");
+        assert_eq!(args, vec!["-i", "-c", "echo oo"]);
+    }
+
+    #[test]
+    fn windows_powershell_preserves_spaced_arg_as_single_shell_argument() {
+        let worktree_root = r"C:\worktrees\Godot Projects\sample-game";
+        let shell = Shell::Program("powershell".to_owned());
+
+        let (program, args) = ShellBuilder::new(&shell, true)
+            .build(Some("echo".into()), &[worktree_root.to_string()]);
+
+        assert_eq!(program, "powershell");
+        assert_eq!(
+            args,
+            vec!["-C".to_string(), format!("echo '{worktree_root}'")]
+        );
+    }
+
+    #[test]
+    fn windows_cmd_preserves_spaced_arg_as_single_shell_argument() {
+        let worktree_root = r"C:\worktrees\Godot Projects\sample-game";
+        let shell = Shell::Program("cmd".to_owned());
+
+        let (program, args) = ShellBuilder::new(&shell, true)
+            .build(Some("echo".into()), &[worktree_root.to_string()]);
+
+        assert_eq!(program, "cmd");
+        assert_eq!(
+            args,
+            vec![
+                "/S".to_string(),
+                "/C".to_string(),
+                format!("\"echo ^\"{worktree_root}^\"\""),
+            ]
+        );
     }
 }

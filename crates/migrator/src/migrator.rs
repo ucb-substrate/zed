@@ -42,7 +42,7 @@ fn migrate(text: &str, patterns: MigrationPatterns, query: &Query) -> Result<Opt
         }
     }
 
-    edits.sort_by_key(|(range, _)| (range.start, Reverse(range.end)));
+    edits.sort_unstable_by_key(|(range, _)| (range.start, Reverse(range.end)));
     edits.dedup_by(|(range_b, _), (range_a, _)| {
         range_a.contains(&range_b.start) || range_a.contains(&range_b.end)
     });
@@ -139,6 +139,14 @@ pub fn migrate_keymap(text: &str) -> Result<Option<String>> {
             migrations::m_2025_04_15::KEYMAP_PATTERNS,
             &KEYMAP_QUERY_2025_04_15,
         ),
+        MigrationType::TreeSitter(
+            migrations::m_2025_12_08::KEYMAP_PATTERNS,
+            &KEYMAP_QUERY_2025_12_08,
+        ),
+        MigrationType::TreeSitter(
+            migrations::m_2026_03_23::KEYMAP_PATTERNS,
+            &KEYMAP_QUERY_2026_03_23,
+        ),
     ];
     run_migrations(text, migrations)
 }
@@ -187,14 +195,6 @@ pub fn migrate_settings(text: &str) -> Result<Option<String>> {
             &SETTINGS_QUERY_2025_05_08,
         ),
         MigrationType::TreeSitter(
-            migrations::m_2025_05_29::SETTINGS_PATTERNS,
-            &SETTINGS_QUERY_2025_05_29,
-        ),
-        MigrationType::TreeSitter(
-            migrations::m_2025_06_16::SETTINGS_PATTERNS,
-            &SETTINGS_QUERY_2025_06_16,
-        ),
-        MigrationType::TreeSitter(
             migrations::m_2025_06_25::SETTINGS_PATTERNS,
             &SETTINGS_QUERY_2025_06_25,
         ),
@@ -220,9 +220,44 @@ pub fn migrate_settings(text: &str) -> Result<Option<String>> {
             &SETTINGS_QUERY_2025_11_12,
         ),
         MigrationType::TreeSitter(
+            migrations::m_2025_12_01::SETTINGS_PATTERNS,
+            &SETTINGS_QUERY_2025_12_01,
+        ),
+        MigrationType::TreeSitter(
             migrations::m_2025_11_20::SETTINGS_PATTERNS,
             &SETTINGS_QUERY_2025_11_20,
         ),
+        MigrationType::Json(migrations::m_2025_11_25::remove_context_server_source),
+        MigrationType::TreeSitter(
+            migrations::m_2025_12_15::SETTINGS_PATTERNS,
+            &SETTINGS_QUERY_2025_12_15,
+        ),
+        MigrationType::Json(migrations::m_2025_01_27::make_auto_indent_an_enum),
+        MigrationType::Json(
+            migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+        ),
+        MigrationType::Json(migrations::m_2026_02_03::migrate_experimental_sweep_mercury),
+        MigrationType::Json(migrations::m_2026_02_04::migrate_tool_permission_defaults),
+        MigrationType::Json(migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry),
+        MigrationType::TreeSitter(
+            migrations::m_2026_03_16::SETTINGS_PATTERNS,
+            &SETTINGS_QUERY_2026_03_16,
+        ),
+        MigrationType::Json(migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum),
+        MigrationType::Json(migrations::m_2026_04_01::restructure_profiles_with_settings_key),
+        MigrationType::Json(migrations::m_2026_04_10::rename_web_search_to_search_web),
+        MigrationType::Json(
+            migrations::m_2026_04_17::promote_show_branch_icon_true_to_show_branch_status_icon,
+        ),
+        MigrationType::TreeSitter(
+            migrations::m_2026_05_04::SETTINGS_PATTERNS,
+            &SETTINGS_QUERY_2026_05_04,
+        ),
+        MigrationType::Json(migrations::m_2026_08_17::make_git_gutter_width_an_enum),
+        MigrationType::Json(migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator),
+        MigrationType::Json(migrations::m_2026_08_30::nest_markdown_preview_settings),
+        MigrationType::Json(migrations::m_2026_09_16::nest_agent_threads_sidebar_settings),
+        MigrationType::Json(migrations::m_2026_09_29::move_copilot_enterprise_uri),
     ];
     run_migrations(text, migrations)
 }
@@ -318,14 +353,6 @@ define_query!(
     migrations::m_2025_05_08::SETTINGS_PATTERNS
 );
 define_query!(
-    SETTINGS_QUERY_2025_05_29,
-    migrations::m_2025_05_29::SETTINGS_PATTERNS
-);
-define_query!(
-    SETTINGS_QUERY_2025_06_16,
-    migrations::m_2025_06_16::SETTINGS_PATTERNS
-);
-define_query!(
     SETTINGS_QUERY_2025_06_25,
     migrations::m_2025_06_25::SETTINGS_PATTERNS
 );
@@ -346,8 +373,32 @@ define_query!(
     migrations::m_2025_11_12::SETTINGS_PATTERNS
 );
 define_query!(
+    SETTINGS_QUERY_2025_12_01,
+    migrations::m_2025_12_01::SETTINGS_PATTERNS
+);
+define_query!(
     SETTINGS_QUERY_2025_11_20,
     migrations::m_2025_11_20::SETTINGS_PATTERNS
+);
+define_query!(
+    KEYMAP_QUERY_2025_12_08,
+    migrations::m_2025_12_08::KEYMAP_PATTERNS
+);
+define_query!(
+    SETTINGS_QUERY_2025_12_15,
+    migrations::m_2025_12_15::SETTINGS_PATTERNS
+);
+define_query!(
+    SETTINGS_QUERY_2026_03_16,
+    migrations::m_2026_03_16::SETTINGS_PATTERNS
+);
+define_query!(
+    KEYMAP_QUERY_2026_03_23,
+    migrations::m_2026_03_23::KEYMAP_PATTERNS
+);
+define_query!(
+    SETTINGS_QUERY_2026_05_04,
+    migrations::m_2026_05_04::SETTINGS_PATTERNS
 );
 
 // custom query
@@ -362,7 +413,7 @@ static EDIT_PREDICTION_SETTINGS_MIGRATION_QUERY: LazyLock<Query> = LazyLock::new
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unindent::Unindent as _;
+    use indoc::indoc;
 
     #[track_caller]
     fn assert_migrated_correctly(migrated: Option<String>, expected: Option<&str>) {
@@ -376,6 +427,7 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn assert_migrate_keymap(input: &str, output: Option<&str>) {
         let migrated = migrate_keymap(input).unwrap();
         pretty_assertions::assert_eq!(migrated.as_deref(), output);
@@ -394,7 +446,7 @@ mod tests {
     }
 
     #[track_caller]
-    fn assert_migrate_settings_with_migrations(
+    fn assert_migrate_with_migrations(
         migrations: &[MigrationType],
         input: &str,
         output: Option<&str>,
@@ -412,6 +464,37 @@ mod tests {
     #[test]
     fn test_empty_content() {
         assert_migrate_settings("", None)
+    }
+
+    #[test]
+    fn test_copilot_enterprise_uri_migration_does_not_restore_deleted_destination() {
+        let input = r#"{
+            // Keep this comment.
+            "edit_predictions": { "copilot": { "enterprise_uri": "https://enterprise.example" } }
+        }"#;
+        let migrated = migrate_settings(input)
+            .expect("migration should succeed")
+            .expect("settings should change");
+        assert!(migrated.contains("// Keep this comment."));
+        let value: serde_json_lenient::Value =
+            parse_json_with_comments(&migrated).expect("migrated settings should parse");
+        let value = serde_json::to_value(value).expect("settings should convert to JSON");
+        assert_eq!(
+            value["copilot"]["enterprise_uri"],
+            "https://enterprise.example"
+        );
+        assert!(value.get("edit_predictions").is_none());
+
+        let mut value = value;
+        value
+            .as_object_mut()
+            .expect("settings should be an object")
+            .remove("copilot");
+        let without_destination = serde_json::to_string(&value).expect("settings should serialize");
+        assert_eq!(
+            migrate_settings(&without_destination).expect("migration should succeed"),
+            None
+        );
     }
 
     #[test]
@@ -633,22 +716,20 @@ mod tests {
     #[test]
     fn test_nested_string_replace_for_settings() {
         assert_migrate_settings(
-            r#"
+            indoc! {r#"
                 {
                     "features": {
                         "inline_completion_provider": "zed"
                     },
                 }
-            "#,
-            Some(
-                r#"
+            "#},
+            Some(indoc! {r#"
                 {
-                    "features": {
-                        "edit_prediction_provider": "zed"
-                    },
+                    "edit_predictions": {
+                        "provider": "zed"
+                    }
                 }
-            "#,
-            ),
+            "#}),
         )
     }
 
@@ -939,270 +1020,8 @@ mod tests {
     }
 
     #[test]
-    fn test_preferred_completion_mode_migration() {
-        assert_migrate_settings(
-            r#"{
-                "agent": {
-                    "preferred_completion_mode": "max",
-                    "enabled": true
-                }
-            }"#,
-            Some(
-                r#"{
-                "agent": {
-                    "preferred_completion_mode": "burn",
-                    "enabled": true
-                }
-            }"#,
-            ),
-        );
-
-        assert_migrate_settings(
-            r#"{
-                "agent": {
-                    "preferred_completion_mode": "normal",
-                    "enabled": true
-                }
-            }"#,
-            None,
-        );
-
-        assert_migrate_settings(
-            r#"{
-                "agent": {
-                    "preferred_completion_mode": "burn",
-                    "enabled": true
-                }
-            }"#,
-            None,
-        );
-
-        assert_migrate_settings(
-            r#"{
-                "other_section": {
-                    "preferred_completion_mode": "max"
-                },
-                "agent": {
-                    "preferred_completion_mode": "max"
-                }
-            }"#,
-            Some(
-                r#"{
-                "other_section": {
-                    "preferred_completion_mode": "max"
-                },
-                "agent": {
-                    "preferred_completion_mode": "burn"
-                }
-            }"#,
-            ),
-        );
-    }
-
-    #[test]
-    fn test_mcp_settings_migration() {
-        assert_migrate_settings_with_migrations(
-            &[MigrationType::TreeSitter(
-                migrations::m_2025_06_16::SETTINGS_PATTERNS,
-                &SETTINGS_QUERY_2025_06_16,
-            )],
-            r#"{
-    "context_servers": {
-        "empty_server": {},
-        "extension_server": {
-            "settings": {
-                "foo": "bar"
-            }
-        },
-        "custom_server": {
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            }
-        },
-        "invalid_server": {
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "settings": {
-                "foo": "bar"
-            }
-        },
-        "empty_server2": {},
-        "extension_server2": {
-            "foo": "bar",
-            "settings": {
-                "foo": "bar"
-            },
-            "bar": "foo"
-        },
-        "custom_server2": {
-            "foo": "bar",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "bar": "foo"
-        },
-        "invalid_server2": {
-            "foo": "bar",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "bar": "foo",
-            "settings": {
-                "foo": "bar"
-            }
-        }
-    }
-}"#,
-            Some(
-                r#"{
-    "context_servers": {
-        "empty_server": {
-            "source": "extension",
-            "settings": {}
-        },
-        "extension_server": {
-            "source": "extension",
-            "settings": {
-                "foo": "bar"
-            }
-        },
-        "custom_server": {
-            "source": "custom",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            }
-        },
-        "invalid_server": {
-            "source": "custom",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "settings": {
-                "foo": "bar"
-            }
-        },
-        "empty_server2": {
-            "source": "extension",
-            "settings": {}
-        },
-        "extension_server2": {
-            "source": "extension",
-            "foo": "bar",
-            "settings": {
-                "foo": "bar"
-            },
-            "bar": "foo"
-        },
-        "custom_server2": {
-            "source": "custom",
-            "foo": "bar",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "bar": "foo"
-        },
-        "invalid_server2": {
-            "source": "custom",
-            "foo": "bar",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "bar": "foo",
-            "settings": {
-                "foo": "bar"
-            }
-        }
-    }
-}"#,
-            ),
-        );
-    }
-
-    #[test]
-    fn test_mcp_settings_migration_doesnt_change_valid_settings() {
-        let settings = r#"{
-    "context_servers": {
-        "empty_server": {
-            "source": "extension",
-            "settings": {}
-        },
-        "extension_server": {
-            "source": "extension",
-            "settings": {
-                "foo": "bar"
-            }
-        },
-        "custom_server": {
-            "source": "custom",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            }
-        },
-        "invalid_server": {
-            "source": "custom",
-            "command": {
-                "path": "foo",
-                "args": ["bar"],
-                "env": {
-                    "FOO": "BAR"
-                }
-            },
-            "settings": {
-                "foo": "bar"
-            }
-        }
-    }
-}"#;
-        assert_migrate_settings_with_migrations(
-            &[MigrationType::TreeSitter(
-                migrations::m_2025_06_16::SETTINGS_PATTERNS,
-                &SETTINGS_QUERY_2025_06_16,
-            )],
-            settings,
-            None,
-        );
-    }
-
-    #[test]
     fn test_custom_agent_server_settings_migration() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::TreeSitter(
                 migrations::m_2025_11_20::SETTINGS_PATTERNS,
                 &SETTINGS_QUERY_2025_11_20,
@@ -1274,7 +1093,6 @@ mod tests {
     "agent": {
         "version": "2",
         "enabled": true,
-        "preferred_completion_mode": "normal",
         "button": true,
         "dock": "right",
         "default_width": 640,
@@ -1297,7 +1115,6 @@ mod tests {
     },
     "agent": {
         "enabled": true,
-        "preferred_completion_mode": "normal",
         "button": true,
         "dock": "right",
         "default_width": 640,
@@ -1329,12 +1146,49 @@ mod tests {
     }
 
     #[test]
+    fn test_flatten_context_server_command_alongside_source() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "context_servers": {
+                        "custom_server": {
+                            "source": "custom",
+                            "command": {
+                                "path": "npx",
+                                "args": ["-y", "some-mcp-server"]
+                            }
+                        },
+                        "hand_edited_server": {
+                            "source": "extension",
+                            "command": {
+                                "path": "other-server"
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "context_servers": {
+                        "custom_server": {
+                            "command": "npx",
+                            "args": ["-y", "some-mcp-server"]
+                        },
+                        "hand_edited_server": {
+                            "command": "other-server"
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
     fn test_flatten_context_server_command() {
         assert_migrate_settings(
             r#"{
     "context_servers": {
         "some-mcp-server": {
-            "source": "custom",
             "command": {
                 "path": "npx",
                 "args": [
@@ -1354,7 +1208,6 @@ mod tests {
                 r#"{
     "context_servers": {
         "some-mcp-server": {
-            "source": "custom",
             "command": "npx",
             "args": [
                 "-y",
@@ -1376,7 +1229,6 @@ mod tests {
             r#"{
     "context_servers": {
         "server-with-extras": {
-            "source": "custom",
             "command": {
                 "path": "/usr/bin/node",
                 "args": ["server.js"]
@@ -1389,7 +1241,6 @@ mod tests {
                 r#"{
     "context_servers": {
         "server-with-extras": {
-            "source": "custom",
             "command": "/usr/bin/node",
             "args": ["server.js"],
             "settings": {}
@@ -1404,7 +1255,6 @@ mod tests {
             r#"{
     "context_servers": {
         "simple-server": {
-            "source": "custom",
             "command": {
                 "path": "simple-mcp-server"
             }
@@ -1415,7 +1265,6 @@ mod tests {
                 r#"{
     "context_servers": {
         "simple-server": {
-            "source": "custom",
             "command": "simple-mcp-server"
         }
     }
@@ -1426,56 +1275,24 @@ mod tests {
 
     #[test]
     fn test_flatten_code_action_formatters_basic_array() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_01::flatten_code_actions_formatters,
             )],
-            &r#"{
-        "formatter": [
-          {
-            "code_actions": {
-              "included-1": true,
-              "included-2": true,
-              "excluded": false,
-            }
-          }
-        ]
-      }"#
-            .unindent(),
-            Some(
-                &r#"{
-        "formatter": [
-          {
-            "code_action": "included-1"
-          },
-          {
-            "code_action": "included-2"
-          }
-        ]
-      }"#
-                .unindent(),
-            ),
-        );
-    }
-
-    #[test]
-    fn test_flatten_code_action_formatters_basic_object() {
-        assert_migrate_settings_with_migrations(
-            &[MigrationType::Json(
-                migrations::m_2025_10_01::flatten_code_actions_formatters,
-            )],
-            &r#"{
-        "formatter": {
-          "code_actions": {
-            "included-1": true,
-            "excluded": false,
-            "included-2": true
-          }
-        }
-      }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                  "formatter": [
+                    {
+                      "code_actions": {
+                        "included-1": true,
+                        "included-2": true,
+                        "excluded": false,
+                      }
+                    }
+                  ]
+                }"#},
+            Some(indoc! {r#"
+                {
                   "formatter": [
                     {
                       "code_action": "included-1"
@@ -1484,482 +1301,499 @@ mod tests {
                       "code_action": "included-2"
                     }
                   ]
-                }"#
-                .unindent(),
-            ),
+                }"#}),
+        );
+    }
+
+    #[test]
+    fn test_flatten_code_action_formatters_basic_object() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_01::flatten_code_actions_formatters,
+            )],
+            indoc! {r#"
+                {
+                  "formatter": {
+                    "code_actions": {
+                      "included-1": true,
+                      "excluded": false,
+                      "included-2": true
+                    }
+                  }
+                }"#},
+            Some(indoc! {r#"
+                {
+                  "formatter": [
+                    {
+                      "code_action": "included-1"
+                    },
+                    {
+                      "code_action": "included-2"
+                    }
+                  ]
+                }"#}),
         );
     }
 
     #[test]
     fn test_flatten_code_action_formatters_array_with_multiple_action_blocks() {
         assert_migrate_settings(
-            &r#"{
-          "formatter": [
-            {
-               "code_actions": {
-                  "included-1": true,
-                  "included-2": true,
-                  "excluded": false,
-               }
-            },
-            {
-              "language_server": "ruff"
-            },
-            {
-               "code_actions": {
-                  "excluded": false,
-                  "excluded-2": false,
-               }
-            }
-            // some comment
-            ,
-            {
-               "code_actions": {
-                "excluded": false,
-                "included-3": true,
-                "included-4": true,
-               }
-            },
-          ]
-        }"#
-            .unindent(),
-            Some(
-                &r#"{
-        "formatter": [
-          {
-            "code_action": "included-1"
-          },
-          {
-            "code_action": "included-2"
-          },
-          {
-            "language_server": "ruff"
-          },
-          {
-            "code_action": "included-3"
-          },
-          {
-            "code_action": "included-4"
-          }
-        ]
-      }"#
-                .unindent(),
-            ),
+            indoc! {r#"
+                {
+                  "formatter": [
+                    {
+                       "code_actions": {
+                          "included-1": true,
+                          "included-2": true,
+                          "excluded": false,
+                       }
+                    },
+                    {
+                      "language_server": "ruff"
+                    },
+                    {
+                       "code_actions": {
+                          "excluded": false,
+                          "excluded-2": false,
+                       }
+                    }
+                    // some comment
+                    ,
+                    {
+                       "code_actions": {
+                        "excluded": false,
+                        "included-3": true,
+                        "included-4": true,
+                       }
+                    },
+                  ]
+                }"#},
+            Some(indoc! {r#"
+                {
+                  "formatter": [
+                    {
+                      "code_action": "included-1"
+                    },
+                    {
+                      "code_action": "included-2"
+                    },
+                    {
+                      "language_server": "ruff"
+                    },
+                    {
+                      "code_action": "included-3"
+                    },
+                    {
+                      "code_action": "included-4"
+                    }
+                  ]
+                }"#}),
         );
     }
 
     #[test]
     fn test_flatten_code_action_formatters_array_with_multiple_action_blocks_in_languages() {
         assert_migrate_settings(
-            &r#"{
-        "languages": {
-          "Rust": {
-            "formatter": [
-              {
-                "code_actions": {
-                  "included-1": true,
-                  "included-2": true,
-                  "excluded": false,
-                }
-              },
-              {
-                "language_server": "ruff"
-              },
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "excluded-2": false,
-                }
-              }
-              // some comment
-              ,
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "included-3": true,
-                  "included-4": true,
-                }
-              },
-            ]
-          }
-        }
-      }"#
-            .unindent(),
-            Some(
-                &r#"{
-          "languages": {
-            "Rust": {
-              "formatter": [
+            indoc! {r#"
                 {
-                  "code_action": "included-1"
-                },
+                  "languages": {
+                    "Rust": {
+                      "formatter": [
+                        {
+                          "code_actions": {
+                            "included-1": true,
+                            "included-2": true,
+                            "excluded": false,
+                          }
+                        },
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "excluded-2": false,
+                          }
+                        }
+                        // some comment
+                        ,
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "included-3": true,
+                            "included-4": true,
+                          }
+                        },
+                      ]
+                    }
+                  }
+                }"#},
+            Some(indoc! {r#"
                 {
-                  "code_action": "included-2"
-                },
-                {
-                  "language_server": "ruff"
-                },
-                {
-                  "code_action": "included-3"
-                },
-                {
-                  "code_action": "included-4"
-                }
-              ]
-            }
-          }
-        }"#
-                .unindent(),
-            ),
+                  "languages": {
+                    "Rust": {
+                      "formatter": [
+                        {
+                          "code_action": "included-1"
+                        },
+                        {
+                          "code_action": "included-2"
+                        },
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_action": "included-3"
+                        },
+                        {
+                          "code_action": "included-4"
+                        }
+                      ]
+                    }
+                  }
+                }"#}),
         );
     }
 
     #[test]
     fn test_flatten_code_action_formatters_array_with_multiple_action_blocks_in_defaults_and_multiple_languages()
      {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_01::flatten_code_actions_formatters,
             )],
-            &r#"{
-        "formatter": {
-          "code_actions": {
-            "default-1": true,
-            "default-2": true,
-            "default-3": true,
-            "default-4": true,
-          }
-        },
-        "languages": {
-          "Rust": {
-            "formatter": [
-              {
-                "code_actions": {
-                  "included-1": true,
-                  "included-2": true,
-                  "excluded": false,
-                }
-              },
-              {
-                "language_server": "ruff"
-              },
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "excluded-2": false,
-                }
-              }
-              // some comment
-              ,
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "included-3": true,
-                  "included-4": true,
-                }
-              },
-            ]
-          },
-          "Python": {
-            "formatter": [
-              {
-                "language_server": "ruff"
-              },
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "excluded-2": false,
-                }
-              }
-              // some comment
-              ,
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "included-3": true,
-                  "included-4": true,
-                }
-              },
-            ]
-          }
-        }
-      }"#
-            .unindent(),
-            Some(
-                &r#"{
-          "formatter": [
-            {
-              "code_action": "default-1"
-            },
-            {
-              "code_action": "default-2"
-            },
-            {
-              "code_action": "default-3"
-            },
-            {
-              "code_action": "default-4"
-            }
-          ],
-          "languages": {
-            "Rust": {
-              "formatter": [
+            indoc! {r#"
                 {
-                  "code_action": "included-1"
-                },
+                  "formatter": {
+                    "code_actions": {
+                      "default-1": true,
+                      "default-2": true,
+                      "default-3": true,
+                      "default-4": true,
+                    }
+                  },
+                  "languages": {
+                    "Rust": {
+                      "formatter": [
+                        {
+                          "code_actions": {
+                            "included-1": true,
+                            "included-2": true,
+                            "excluded": false,
+                          }
+                        },
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "excluded-2": false,
+                          }
+                        }
+                        // some comment
+                        ,
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "included-3": true,
+                            "included-4": true,
+                          }
+                        },
+                      ]
+                    },
+                    "Python": {
+                      "formatter": [
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "excluded-2": false,
+                          }
+                        }
+                        // some comment
+                        ,
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "included-3": true,
+                            "included-4": true,
+                          }
+                        },
+                      ]
+                    }
+                  }
+                }"#},
+            Some(indoc! {r#"
                 {
-                  "code_action": "included-2"
-                },
-                {
-                  "language_server": "ruff"
-                },
-                {
-                  "code_action": "included-3"
-                },
-                {
-                  "code_action": "included-4"
-                }
-              ]
-            },
-            "Python": {
-              "formatter": [
-                {
-                  "language_server": "ruff"
-                },
-                {
-                  "code_action": "included-3"
-                },
-                {
-                  "code_action": "included-4"
-                }
-              ]
-            }
-          }
-        }"#
-                .unindent(),
-            ),
+                  "formatter": [
+                    {
+                      "code_action": "default-1"
+                    },
+                    {
+                      "code_action": "default-2"
+                    },
+                    {
+                      "code_action": "default-3"
+                    },
+                    {
+                      "code_action": "default-4"
+                    }
+                  ],
+                  "languages": {
+                    "Rust": {
+                      "formatter": [
+                        {
+                          "code_action": "included-1"
+                        },
+                        {
+                          "code_action": "included-2"
+                        },
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_action": "included-3"
+                        },
+                        {
+                          "code_action": "included-4"
+                        }
+                      ]
+                    },
+                    "Python": {
+                      "formatter": [
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_action": "included-3"
+                        },
+                        {
+                          "code_action": "included-4"
+                        }
+                      ]
+                    }
+                  }
+                }"#}),
         );
     }
 
     #[test]
     fn test_flatten_code_action_formatters_array_with_format_on_save_and_multiple_languages() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_01::flatten_code_actions_formatters,
             )],
-            &r#"{
-        "formatter": {
-          "code_actions": {
-            "default-1": true,
-            "default-2": true,
-            "default-3": true,
-            "default-4": true,
-          }
-        },
-        "format_on_save": [
-          {
-            "code_actions": {
-              "included-1": true,
-              "included-2": true,
-              "excluded": false,
-            }
-          },
-          {
-            "language_server": "ruff"
-          },
-          {
-            "code_actions": {
-              "excluded": false,
-              "excluded-2": false,
-            }
-          }
-          // some comment
-          ,
-          {
-            "code_actions": {
-              "excluded": false,
-              "included-3": true,
-              "included-4": true,
-            }
-          },
-        ],
-        "languages": {
-          "Rust": {
-            "format_on_save": "prettier",
-            "formatter": [
-              {
-                "code_actions": {
-                  "included-1": true,
-                  "included-2": true,
-                  "excluded": false,
-                }
-              },
-              {
-                "language_server": "ruff"
-              },
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "excluded-2": false,
-                }
-              }
-              // some comment
-              ,
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "included-3": true,
-                  "included-4": true,
-                }
-              },
-            ]
-          },
-          "Python": {
-            "format_on_save": {
-              "code_actions": {
-                "on-save-1": true,
-                "on-save-2": true,
-              }
-            },
-            "formatter": [
-              {
-                "language_server": "ruff"
-              },
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "excluded-2": false,
-                }
-              }
-              // some comment
-              ,
-              {
-                "code_actions": {
-                  "excluded": false,
-                  "included-3": true,
-                  "included-4": true,
-                }
-              },
-            ]
-          }
-        }
-      }"#
-            .unindent(),
-            Some(
-                &r#"
-        {
-          "formatter": [
-            {
-              "code_action": "default-1"
-            },
-            {
-              "code_action": "default-2"
-            },
-            {
-              "code_action": "default-3"
-            },
-            {
-              "code_action": "default-4"
-            }
-          ],
-          "format_on_save": [
-            {
-              "code_action": "included-1"
-            },
-            {
-              "code_action": "included-2"
-            },
-            {
-              "language_server": "ruff"
-            },
-            {
-              "code_action": "included-3"
-            },
-            {
-              "code_action": "included-4"
-            }
-          ],
-          "languages": {
-            "Rust": {
-              "format_on_save": "prettier",
-              "formatter": [
+            indoc! {r#"
                 {
-                  "code_action": "included-1"
-                },
+                  "formatter": {
+                    "code_actions": {
+                      "default-1": true,
+                      "default-2": true,
+                      "default-3": true,
+                      "default-4": true,
+                    }
+                  },
+                  "format_on_save": [
+                    {
+                      "code_actions": {
+                        "included-1": true,
+                        "included-2": true,
+                        "excluded": false,
+                      }
+                    },
+                    {
+                      "language_server": "ruff"
+                    },
+                    {
+                      "code_actions": {
+                        "excluded": false,
+                        "excluded-2": false,
+                      }
+                    }
+                    // some comment
+                    ,
+                    {
+                      "code_actions": {
+                        "excluded": false,
+                        "included-3": true,
+                        "included-4": true,
+                      }
+                    },
+                  ],
+                  "languages": {
+                    "Rust": {
+                      "format_on_save": "prettier",
+                      "formatter": [
+                        {
+                          "code_actions": {
+                            "included-1": true,
+                            "included-2": true,
+                            "excluded": false,
+                          }
+                        },
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "excluded-2": false,
+                          }
+                        }
+                        // some comment
+                        ,
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "included-3": true,
+                            "included-4": true,
+                          }
+                        },
+                      ]
+                    },
+                    "Python": {
+                      "format_on_save": {
+                        "code_actions": {
+                          "on-save-1": true,
+                          "on-save-2": true,
+                        }
+                      },
+                      "formatter": [
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "excluded-2": false,
+                          }
+                        }
+                        // some comment
+                        ,
+                        {
+                          "code_actions": {
+                            "excluded": false,
+                            "included-3": true,
+                            "included-4": true,
+                          }
+                        },
+                      ]
+                    }
+                  }
+                }"#},
+            Some(indoc! {r#"
                 {
-                  "code_action": "included-2"
-                },
-                {
-                  "language_server": "ruff"
-                },
-                {
-                  "code_action": "included-3"
-                },
-                {
-                  "code_action": "included-4"
-                }
-              ]
-            },
-            "Python": {
-              "format_on_save": [
-                {
-                  "code_action": "on-save-1"
-                },
-                {
-                  "code_action": "on-save-2"
-                }
-              ],
-              "formatter": [
-                {
-                  "language_server": "ruff"
-                },
-                {
-                  "code_action": "included-3"
-                },
-                {
-                  "code_action": "included-4"
-                }
-              ]
-            }
-          }
-        }"#
-                .unindent(),
-            ),
+                  "formatter": [
+                    {
+                      "code_action": "default-1"
+                    },
+                    {
+                      "code_action": "default-2"
+                    },
+                    {
+                      "code_action": "default-3"
+                    },
+                    {
+                      "code_action": "default-4"
+                    }
+                  ],
+                  "format_on_save": [
+                    {
+                      "code_action": "included-1"
+                    },
+                    {
+                      "code_action": "included-2"
+                    },
+                    {
+                      "language_server": "ruff"
+                    },
+                    {
+                      "code_action": "included-3"
+                    },
+                    {
+                      "code_action": "included-4"
+                    }
+                  ],
+                  "languages": {
+                    "Rust": {
+                      "format_on_save": "prettier",
+                      "formatter": [
+                        {
+                          "code_action": "included-1"
+                        },
+                        {
+                          "code_action": "included-2"
+                        },
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_action": "included-3"
+                        },
+                        {
+                          "code_action": "included-4"
+                        }
+                      ]
+                    },
+                    "Python": {
+                      "format_on_save": [
+                        {
+                          "code_action": "on-save-1"
+                        },
+                        {
+                          "code_action": "on-save-2"
+                        }
+                      ],
+                      "formatter": [
+                        {
+                          "language_server": "ruff"
+                        },
+                        {
+                          "code_action": "included-3"
+                        },
+                        {
+                          "code_action": "included-4"
+                        }
+                      ]
+                    }
+                  }
+                }"#}),
         );
     }
 
     #[test]
     fn test_format_on_save_formatter_migration_basic() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                  "format_on_save": "prettier"
-              }"#
-            .unindent(),
-            Some(
-                &r#"{
-                      "formatter": "prettier",
-                      "format_on_save": "on"
-                  }"#
-                .unindent(),
-            ),
+            indoc! {r#"
+                {
+                    "format_on_save": "prettier"
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "formatter": "prettier",
+                    "format_on_save": "on"
+                }"#}),
         );
     }
 
     #[test]
     fn test_format_on_save_formatter_migration_array() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                "format_on_save": ["prettier", {"language_server": "eslint"}]
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "format_on_save": ["prettier", {"language_server": "eslint"}]
+                }"#},
+            Some(indoc! {r#"
+                {
                     "formatter": [
                         "prettier",
                         {
@@ -1967,56 +1801,54 @@ mod tests {
                         }
                     ],
                     "format_on_save": "on"
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
     }
 
     #[test]
     fn test_format_on_save_on_off_unchanged() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                "format_on_save": "on"
-            }"#
-            .unindent(),
+            indoc! {r#"
+                {
+                    "format_on_save": "on"
+                }"#},
             None,
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                "format_on_save": "off"
-            }"#
-            .unindent(),
+            indoc! {r#"
+                {
+                    "format_on_save": "off"
+                }"#},
             None,
         );
     }
 
     #[test]
     fn test_format_on_save_formatter_migration_in_languages() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                "languages": {
-                    "Rust": {
-                        "format_on_save": "rust-analyzer"
-                    },
-                    "Python": {
-                        "format_on_save": ["ruff", "black"]
+            indoc! {r#"
+                {
+                    "languages": {
+                        "Rust": {
+                            "format_on_save": "rust-analyzer"
+                        },
+                        "Python": {
+                            "format_on_save": ["ruff", "black"]
+                        }
                     }
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+                }"#},
+            Some(indoc! {r#"
+                {
                     "languages": {
                         "Rust": {
                             "formatter": "rust-analyzer",
@@ -2030,32 +1862,30 @@ mod tests {
                             "format_on_save": "on"
                         }
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
     }
 
     #[test]
     fn test_format_on_save_formatter_migration_mixed_global_and_languages() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                "format_on_save": "prettier",
-                "languages": {
-                    "Rust": {
-                        "format_on_save": "rust-analyzer"
-                    },
-                    "Python": {
-                        "format_on_save": "on"
+            indoc! {r#"
+                {
+                    "format_on_save": "prettier",
+                    "languages": {
+                        "Rust": {
+                            "format_on_save": "rust-analyzer"
+                        },
+                        "Python": {
+                            "format_on_save": "on"
+                        }
                     }
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+                }"#},
+            Some(indoc! {r#"
+                {
                     "formatter": "prettier",
                     "format_on_save": "on",
                     "languages": {
@@ -2067,107 +1897,101 @@ mod tests {
                             "format_on_save": "on"
                         }
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
     }
 
     #[test]
     fn test_format_on_save_no_migration_when_no_format_on_save() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_02::remove_formatters_on_save,
             )],
-            &r#"{
-                "formatter": ["prettier"]
-            }"#
-            .unindent(),
+            indoc! {r#"
+                {
+                    "formatter": ["prettier"]
+                }"#},
             None,
         );
     }
 
     #[test]
     fn test_restore_code_actions_on_format() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_16::restore_code_actions_on_format,
             )],
-            &r#"{
-                "formatter": {
-                    "code_action": "foo"
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "formatter": {
+                        "code_action": "foo"
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
                     "code_actions_on_format": {
                         "foo": true
                     },
                     "formatter": []
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_16::restore_code_actions_on_format,
             )],
-            &r#"{
-                "formatter": [
-                    { "code_action": "foo" },
-                    "auto"
-                ]
-            }"#
-            .unindent(),
+            indoc! {r#"
+                {
+                    "formatter": [
+                        { "code_action": "foo" },
+                        "auto"
+                    ]
+                }"#},
             None,
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_16::restore_code_actions_on_format,
             )],
-            &r#"{
-                "formatter": {
-                    "code_action": "foo"
-                },
-                "code_actions_on_format": {
-                    "bar": true,
-                    "baz": false
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "formatter": {
+                        "code_action": "foo"
+                    },
+                    "code_actions_on_format": {
+                        "bar": true,
+                        "baz": false
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
                     "formatter": [],
                     "code_actions_on_format": {
                         "foo": true,
                         "bar": true,
                         "baz": false
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_16::restore_code_actions_on_format,
             )],
-            &r#"{
-                "formatter": [
-                    { "code_action": "foo" },
-                    { "code_action": "qux" },
-                ],
-                "code_actions_on_format": {
-                    "bar": true,
-                    "baz": false
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "formatter": [
+                        { "code_action": "foo" },
+                        { "code_action": "qux" },
+                    ],
+                    "code_actions_on_format": {
+                        "bar": true,
+                        "baz": false
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
                     "formatter": [],
                     "code_actions_on_format": {
                         "foo": true,
@@ -2175,140 +1999,3447 @@ mod tests {
                         "bar": true,
                         "baz": false
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_16::restore_code_actions_on_format,
             )],
-            &r#"{
-                "formatter": [],
-                "code_actions_on_format": {
-                    "bar": true,
-                    "baz": false
-                }
-            }"#
-            .unindent(),
+            indoc! {r#"
+                {
+                    "formatter": [],
+                    "code_actions_on_format": {
+                        "bar": true,
+                        "baz": false
+                    }
+                }"#},
             None,
         );
     }
 
     #[test]
     fn test_make_file_finder_include_ignored_an_enum() {
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
             )],
-            &r#"{ }"#.unindent(),
+            r#"{ }"#,
             None,
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
             )],
-            &r#"{
-                "file_finder": {
-                    "include_ignored": true
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "file_finder": {
+                        "include_ignored": true
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
                     "file_finder": {
                         "include_ignored": "all"
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
             )],
-            &r#"{
-                "file_finder": {
-                    "include_ignored": false
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "file_finder": {
+                        "include_ignored": false
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
                     "file_finder": {
                         "include_ignored": "indexed"
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
         );
 
-        assert_migrate_settings_with_migrations(
+        assert_migrate_with_migrations(
             &[MigrationType::Json(
                 migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
             )],
-            &r#"{
-                "file_finder": {
-                    "include_ignored": null
-                }
-            }"#
-            .unindent(),
-            Some(
-                &r#"{
+            indoc! {r#"
+                {
+                    "file_finder": {
+                        "include_ignored": null
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
                     "file_finder": {
                         "include_ignored": "smart"
                     }
-                }"#
-                .unindent(),
-            ),
+                }"#}),
+        );
+
+        // Platform key: settings nested inside "linux" should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "linux": {
+                        "file_finder": {
+                            "include_ignored": true
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "linux": {
+                        "file_finder": {
+                            "include_ignored": "all"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Profile: settings nested inside profiles should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_17::make_file_finder_include_ignored_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "file_finder": {
+                                "include_ignored": false
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "file_finder": {
+                                "include_ignored": "indexed"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_make_relative_line_numbers_an_enum() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_21::make_relative_line_numbers_an_enum,
+            )],
+            r#"{ }"#,
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_21::make_relative_line_numbers_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "relative_line_numbers": true
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "relative_line_numbers": "enabled"
+                }"#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_21::make_relative_line_numbers_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "relative_line_numbers": false
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "relative_line_numbers": "disabled"
+                }"#}),
+        );
+
+        // Platform key: settings nested inside "macos" should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_21::make_relative_line_numbers_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "macos": {
+                        "relative_line_numbers": true
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "macos": {
+                        "relative_line_numbers": "enabled"
+                    }
+                }
+            "#}),
+        );
+
+        // Profile: settings nested inside profiles should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_10_21::make_relative_line_numbers_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "dev": {
+                            "relative_line_numbers": false
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "dev": {
+                            "relative_line_numbers": "disabled"
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_make_play_sound_when_agent_done_an_enum() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum,
+            )],
+            r#"{ }"#,
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "play_sound_when_agent_done": true
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "play_sound_when_agent_done": "always"
+                    }
+                }"#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "play_sound_when_agent_done": false
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "play_sound_when_agent_done": "never"
+                    }
+                }"#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "play_sound_when_agent_done": "when_hidden"
+                    }
+                }"#},
+            None,
+        );
+
+        // Platform key: settings nested inside "macos" should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "macos": {
+                        "agent": {
+                            "play_sound_when_agent_done": true
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "macos": {
+                        "agent": {
+                            "play_sound_when_agent_done": "always"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Profile: settings nested inside profiles should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_03_30::make_play_sound_when_agent_done_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "agent": {
+                                "play_sound_when_agent_done": false
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "agent": {
+                                "play_sound_when_agent_done": "never"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_remove_context_server_source() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "context_servers": {
+                        "extension_server": {
+                            "source": "extension",
+                            "settings": {
+                                "foo": "bar"
+                            }
+                        },
+                        "custom_server": {
+                            "source": "custom",
+                            "command": "foo",
+                            "args": ["bar"],
+                            "env": {
+                                "FOO": "BAR"
+                            }
+                        },
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "context_servers": {
+                        "extension_server": {
+                            "settings": {
+                                "foo": "bar"
+                            }
+                        },
+                        "custom_server": {
+                            "command": "foo",
+                            "args": ["bar"],
+                            "env": {
+                                "FOO": "BAR"
+                            }
+                        },
+                    }
+                }
+            "#}),
+        );
+
+        // Platform key: settings nested inside "linux" should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_11_25::remove_context_server_source,
+            )],
+            indoc! {r#"
+                {
+                    "linux": {
+                        "context_servers": {
+                            "my_server": {
+                                "source": "extension",
+                                "settings": {
+                                    "key": "value"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "linux": {
+                        "context_servers": {
+                            "my_server": {
+                                "settings": {
+                                    "key": "value"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Profile: settings nested inside profiles should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_11_25::remove_context_server_source,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "context_servers": {
+                                "my_server": {
+                                    "source": "custom",
+                                    "command": "foo",
+                                    "args": ["bar"]
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "context_servers": {
+                                "my_server": {
+                                    "command": "foo",
+                                    "args": ["bar"]
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
         );
     }
 
     #[test]
     fn test_project_panel_open_file_on_paste_migration() {
         assert_migrate_settings(
-            &r#"
-            {
-                "project_panel": {
-                    "open_file_on_paste": true
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "open_file_on_paste": true
+                    }
                 }
-            }
-            "#
-            .unindent(),
-            Some(
-                &r#"
+            "#},
+            Some(indoc! {r#"
                 {
                     "project_panel": {
                         "auto_open": { "on_paste": true }
                     }
                 }
-                "#
-                .unindent(),
-            ),
+            "#}),
         );
 
         assert_migrate_settings(
-            &r#"
-            {
-                "project_panel": {
-                    "open_file_on_paste": false
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "open_file_on_paste": false
+                    }
                 }
-            }
-            "#
-            .unindent(),
-            Some(
-                &r#"
+            "#},
+            Some(indoc! {r#"
                 {
                     "project_panel": {
                         "auto_open": { "on_paste": false }
                     }
                 }
-                "#
-                .unindent(),
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_enable_preview_from_code_navigation_migration() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "other_setting_1": 1,
+                    "preview_tabs": {
+                        "other_setting_2": 2,
+                        "enable_preview_from_code_navigation": false
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "other_setting_1": 1,
+                    "preview_tabs": {
+                        "other_setting_2": 2,
+                        "enable_keep_preview_on_code_navigation": false
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "other_setting_1": 1,
+                    "preview_tabs": {
+                        "other_setting_2": 2,
+                        "enable_preview_from_code_navigation": true
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "other_setting_1": 1,
+                    "preview_tabs": {
+                        "other_setting_2": 2,
+                        "enable_keep_preview_on_code_navigation": true
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_make_auto_indent_an_enum() {
+        // Empty settings should not change
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_01_27::make_auto_indent_an_enum,
+            )],
+            r#"{ }"#,
+            None,
+        );
+
+        // true should become "syntax_aware"
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_01_27::make_auto_indent_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "auto_indent": true
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "auto_indent": "syntax_aware"
+                }"#}),
+        );
+
+        // false should become "none"
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_01_27::make_auto_indent_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "auto_indent": false
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "auto_indent": "none"
+                }"#}),
+        );
+
+        // Already valid enum values should not change
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_01_27::make_auto_indent_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "auto_indent": "preserve_indent"
+                }"#},
+            None,
+        );
+
+        // Should also work inside languages
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2025_01_27::make_auto_indent_an_enum,
+            )],
+            indoc! {r#"
+                {
+                    "auto_indent": true,
+                    "languages": {
+                        "Python": {
+                            "auto_indent": false
+                        }
+                    }
+                }"#},
+            Some(indoc! {r#"
+                {
+                    "auto_indent": "syntax_aware",
+                    "languages": {
+                        "Python": {
+                            "auto_indent": "none"
+                        }
+                    }
+                }"#}),
+        );
+    }
+
+    #[test]
+    fn test_move_edit_prediction_provider_to_edit_predictions() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            r#"{ }"#,
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": "copilot"
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "copilot"
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": "zed"
+                    },
+                    "edit_predictions": {
+                        "mode": "eager"
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "zed",
+                        "mode": "eager"
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": "supermaven"
+                    },
+                    "edit_predictions": {
+                        "provider": "copilot"
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "copilot"
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "zed"
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // Non-object edit_predictions (e.g. true) should gracefully skip
+        // instead of bail!-ing and aborting the entire migration chain.
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": "copilot"
+                    },
+                    "edit_predictions": true
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": true
+                }
+            "#}),
+        );
+
+        // Platform key: settings nested inside "macos" should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "macos": {
+                        "features": {
+                            "edit_prediction_provider": "copilot"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "macos": {
+                        "edit_predictions": {
+                            "provider": "copilot"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Profile: settings nested inside profiles should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "features": {
+                                "edit_prediction_provider": "copilot"
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "edit_predictions": {
+                                "provider": "copilot"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Combined: root + platform + profile should all be migrated simultaneously
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_02::move_edit_prediction_provider_to_edit_predictions,
+            )],
+            indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": "copilot"
+                    },
+                    "macos": {
+                        "features": {
+                            "edit_prediction_provider": "zed"
+                        }
+                    },
+                    "profiles": {
+                        "work": {
+                            "features": {
+                                "edit_prediction_provider": "supermaven"
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "copilot"
+                    },
+                    "macos": {
+                        "edit_predictions": {
+                            "provider": "zed"
+                        }
+                    },
+                    "profiles": {
+                        "work": {
+                            "edit_predictions": {
+                                "provider": "supermaven"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_migrate_experimental_sweep_mercury() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            r#"{ }"#,
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": {
+                            "experimental": "sweep"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "sweep"
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": {
+                            "experimental": "mercury"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "mercury"
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": {
+                            "experimental": "sweep"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "features": {
+                        "edit_prediction_provider": "sweep"
+                    }
+                }
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "zed"
+                    }
+                }
+            "#},
+            None,
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": {
+                            "experimental": "zeta2"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "zed"
+                    }
+                }
+            "#}),
+        );
+
+        // Platform key: settings nested inside "linux" should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "linux": {
+                        "edit_predictions": {
+                            "provider": {
+                                "experimental": "sweep"
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "linux": {
+                        "edit_predictions": {
+                            "provider": "sweep"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Profile: settings nested inside profiles should be migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "dev": {
+                            "edit_predictions": {
+                                "provider": {
+                                    "experimental": "mercury"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "dev": {
+                            "edit_predictions": {
+                                "provider": "mercury"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Combined: root + platform + profile should all be migrated simultaneously
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_03::migrate_experimental_sweep_mercury,
+            )],
+            indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": {
+                            "experimental": "sweep"
+                        }
+                    },
+                    "linux": {
+                        "edit_predictions": {
+                            "provider": {
+                                "experimental": "mercury"
+                            }
+                        }
+                    },
+                    "profiles": {
+                        "dev": {
+                            "edit_predictions": {
+                                "provider": {
+                                    "experimental": "sweep"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "edit_predictions": {
+                        "provider": "sweep"
+                    },
+                    "linux": {
+                        "edit_predictions": {
+                            "provider": "mercury"
+                        }
+                    },
+                    "profiles": {
+                        "dev": {
+                            "edit_predictions": {
+                                "provider": "sweep"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_migrate_always_allow_tool_actions_to_default() {
+        // No agent settings - no change
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            r#"{ }"#,
+            None,
+        );
+
+        // always_allow_tool_actions: true -> tool_permissions.default: "allow"
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // always_allow_tool_actions: false -> just remove it
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": false
+                    }
+                }
+            "#},
+            Some(
+                // The blank line has spaces because the migration preserves the original indentation
+                "{\n    \"agent\": {\n        \n    }\n}\n",
             ),
+        );
+
+        // Preserve existing tool_permissions.tools when migrating
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true,
+                        "tool_permissions": {
+                            "tools": {
+                                "terminal": {
+                                    "always_deny": [{ "pattern": "rm\\s+-rf" }]
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow",
+                            "tools": {
+                                "terminal": {
+                                    "always_deny": [{ "pattern": "rm\\s+-rf" }]
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Don't override existing default (and migrate default_mode to default)
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true,
+                        "tool_permissions": {
+                            "default_mode": "confirm"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "confirm"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Migrate existing default_mode to default (no always_allow_tool_actions)
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default_mode": "allow"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // No migration needed if already using new format with "default"
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // Migrate default_mode to default in tool-specific rules
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default_mode": "confirm",
+                            "tools": {
+                                "terminal": {
+                                    "default_mode": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "confirm",
+                            "tools": {
+                                "terminal": {
+                                    "default": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // When tool_permissions is null, replace it so always_allow is preserved
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true,
+                        "tool_permissions": null
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Platform-specific agent migration
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "linux": {
+                        "agent": {
+                            "always_allow_tool_actions": true
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "linux": {
+                        "agent": {
+                            "tool_permissions": {
+                                "default": "allow"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Channel-specific agent migration
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true
+                    },
+                    "nightly": {
+                        "agent": {
+                            "tool_permissions": {
+                                "default_mode": "confirm"
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    },
+                    "nightly": {
+                        "agent": {
+                            "tool_permissions": {
+                                "default": "confirm"
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Profile-level migration
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "profiles": {
+                            "custom": {
+                                "always_allow_tool_actions": true,
+                                "tool_permissions": {
+                                    "default_mode": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "profiles": {
+                            "custom": {
+                                "tool_permissions": {
+                                    "default": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Platform-specific agent with profiles
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "macos": {
+                        "agent": {
+                            "always_allow_tool_actions": true,
+                            "profiles": {
+                                "strict": {
+                                    "tool_permissions": {
+                                        "default_mode": "deny"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "macos": {
+                        "agent": {
+                            "tool_permissions": {
+                                "default": "allow"
+                            },
+                            "profiles": {
+                                "strict": {
+                                    "tool_permissions": {
+                                        "default": "deny"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Root-level profile with always_allow_tool_actions
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "agent": {
+                                "always_allow_tool_actions": true
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "agent": {
+                                "tool_permissions": {
+                                    "default": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Root-level profile with default_mode
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "agent": {
+                                "tool_permissions": {
+                                    "default_mode": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "agent": {
+                                "tool_permissions": {
+                                    "default": "allow"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Root-level profile + root-level agent both migrated
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true
+                    },
+                    "profiles": {
+                        "strict": {
+                            "agent": {
+                                "tool_permissions": {
+                                    "default_mode": "deny"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    },
+                    "profiles": {
+                        "strict": {
+                            "agent": {
+                                "tool_permissions": {
+                                    "default": "deny"
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Non-boolean always_allow_tool_actions (string "true") is left in place
+        // so the schema validator can report it, rather than silently dropping user data.
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": "true"
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // null always_allow_tool_actions is removed (treated as false)
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": null
+                    }
+                }
+            "#},
+            Some(&"{\n    \"agent\": {\n        \n    }\n}\n"),
+        );
+
+        // Project-local settings (.zed/settings.json) with always_allow_tool_actions
+        // These files have no platform/channel overrides or root-level profiles.
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true,
+                        "tool_permissions": {
+                            "tools": {
+                                "terminal": {
+                                    "default_mode": "confirm",
+                                    "always_deny": [{ "pattern": "rm\\s+-rf" }]
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow",
+                            "tools": {
+                                "terminal": {
+                                    "default": "confirm",
+                                    "always_deny": [{ "pattern": "rm\\s+-rf" }]
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Project-local settings with only default_mode (no always_allow_tool_actions)
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default_mode": "deny"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "deny"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Project-local settings with no agent section at all - no change
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "tab_size": 4,
+                    "format_on_save": "on"
+                }
+            "#},
+            None,
+        );
+
+        // Existing agent_servers are left untouched
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true
+                    },
+                    "agent_servers": {
+                        "claude": {
+                            "default_mode": "plan"
+                        },
+                        "codex": {
+                            "default_mode": "read-only"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    },
+                    "agent_servers": {
+                        "claude": {
+                            "default_mode": "plan"
+                        },
+                        "codex": {
+                            "default_mode": "read-only"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // Existing agent_servers are left untouched even with partial entries
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": true
+                    },
+                    "agent_servers": {
+                        "claude": {
+                            "default_mode": "plan"
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "default": "allow"
+                        }
+                    },
+                    "agent_servers": {
+                        "claude": {
+                            "default_mode": "plan"
+                        }
+                    }
+                }
+            "#}),
+        );
+
+        // always_allow_tool_actions: false leaves agent_servers untouched
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_04::migrate_tool_permission_defaults,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "always_allow_tool_actions": false
+                    },
+                    "agent_servers": {
+                        "claude": {}
+                    }
+                }
+            "#},
+            Some(
+                "{\n    \"agent\": {\n        \n    },\n    \"agent_servers\": {\n        \"claude\": {}\n    }\n}\n",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_to_registry_simple() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {
+            "default_model": "gemini-2.0-flash"
+        },
+        "claude": {
+            "default_mode": "plan"
+        },
+        "codex": {
+            "default_model": "o4-mini"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "codex-acp": {
+            "type": "registry",
+            "default_model": "o4-mini"
+        },
+        "claude-acp": {
+            "type": "registry",
+            "default_mode": "plan"
+        },
+        "gemini": {
+            "type": "registry",
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_empty_entries() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {},
+        "claude": {},
+        "codex": {}
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "codex-acp": {
+            "type": "registry"
+        },
+        "claude-acp": {
+            "type": "registry"
+        },
+        "gemini": {
+            "type": "registry"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_with_command() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "claude": {
+            "command": "/usr/local/bin/claude",
+            "args": ["--verbose"],
+            "env": {"CLAUDE_KEY": "abc123"},
+            "default_mode": "plan",
+            "default_model": "claude-sonnet-4"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "claude-acp-custom": {
+            "type": "custom",
+            "command": "/usr/local/bin/claude",
+            "args": [
+                "--verbose"
+            ],
+            "env": {
+                "CLAUDE_KEY": "abc123"
+            },
+            "default_mode": "plan",
+            "default_model": "claude-sonnet-4"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_gemini_with_command() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {
+            "command": "/opt/gemini/bin/gemini",
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "gemini-custom": {
+            "type": "custom",
+            "command": "/opt/gemini/bin/gemini",
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_gemini_ignore_system_version_false() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {
+            "ignore_system_version": false,
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "gemini-custom": {
+            "type": "custom",
+            "command": "gemini",
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_gemini_ignore_system_version_true() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {
+            "ignore_system_version": true,
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "gemini": {
+            "type": "registry",
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_already_typed_unchanged() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {
+            "type": "registry",
+            "default_model": "gemini-2.0-flash"
+        },
+        "claude-acp": {
+            "type": "registry",
+            "default_mode": "plan"
+        }
+    }
+}"#,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_preserves_custom_entries() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "claude": {
+            "default_mode": "plan"
+        },
+        "my-custom-agent": {
+            "type": "custom",
+            "command": "/path/to/agent"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "claude-acp": {
+            "type": "registry",
+            "default_mode": "plan"
+        },
+        "my-custom-agent": {
+            "type": "custom",
+            "command": "/path/to/agent"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_target_already_exists() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "claude": {
+            "default_mode": "plan"
+        },
+        "claude-acp": {
+            "type": "registry",
+            "default_model": "claude-sonnet-4"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "claude-acp": {
+            "type": "registry",
+            "default_model": "claude-sonnet-4"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_no_agent_servers_key() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent": {
+        "enabled": true
+    }
+}"#,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_all_fields() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "codex": {
+            "env": {"OPENAI_API_KEY": "sk-123"},
+            "default_mode": "read-only",
+            "default_model": "o4-mini",
+            "favorite_models": ["o4-mini", "codex-mini-latest"],
+            "default_config_options": {"approval_mode": "auto-edit"},
+            "favorite_config_option_values": {"approval_mode": ["auto-edit", "suggest"]}
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "codex-acp": {
+            "type": "registry",
+            "env": {
+                "OPENAI_API_KEY": "sk-123"
+            },
+            "default_mode": "read-only",
+            "default_model": "o4-mini",
+            "favorite_models": [
+                "o4-mini",
+                "codex-mini-latest"
+            ],
+            "default_config_options": {
+                "approval_mode": "auto-edit"
+            },
+            "favorite_config_option_values": {
+                "approval_mode": [
+                    "auto-edit",
+                    "suggest"
+                ]
+            }
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_codex_with_command() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "codex": {
+            "command": "/usr/local/bin/codex",
+            "args": ["--full-auto"],
+            "default_model": "o4-mini"
+        }
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "codex-acp-custom": {
+            "type": "custom",
+            "command": "/usr/local/bin/codex",
+            "args": [
+                "--full-auto"
+            ],
+            "default_model": "o4-mini"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_builtin_agent_servers_mixed_migrated_and_not() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_02_25::migrate_builtin_agent_servers_to_registry,
+            )],
+            r#"{
+    "agent_servers": {
+        "gemini": {
+            "type": "registry",
+            "default_model": "gemini-2.0-flash"
+        },
+        "claude": {
+            "default_mode": "plan"
+        },
+        "codex": {}
+    }
+}"#,
+            Some(
+                r#"{
+    "agent_servers": {
+        "codex-acp": {
+            "type": "registry"
+        },
+        "claude-acp": {
+            "type": "registry",
+            "default_mode": "plan"
+        },
+        "gemini": {
+            "type": "registry",
+            "default_model": "gemini-2.0-flash"
+        }
+    }
+}"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_migrate_edit_prediction_conflict_context() {
+        assert_migrate_with_migrations(
+            &[MigrationType::TreeSitter(
+                migrations::m_2026_03_23::KEYMAP_PATTERNS,
+                &KEYMAP_QUERY_2026_03_23,
+            )],
+            indoc! {r#"
+                [
+                    {
+                        "context": "Editor && edit_prediction_conflict",
+                        "bindings": {
+                            "ctrl-enter": "editor::AcceptEditPrediction" // Example of a modified keybinding
+                        }
+                    }
+                ]
+            "#},
+            Some(indoc! {r#"
+                [
+                    {
+                        "context": "Editor && (edit_prediction && (showing_completions || in_leading_whitespace))",
+                        "bindings": {
+                            "ctrl-enter": "editor::AcceptEditPrediction" // Example of a modified keybinding
+                        }
+                    }
+                ]
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::TreeSitter(
+                migrations::m_2026_03_23::KEYMAP_PATTERNS,
+                &KEYMAP_QUERY_2026_03_23,
+            )],
+            indoc! {r#"
+                [
+                    {
+                        "context": "Editor && edit_prediction_conflict && !showing_completions",
+                        "bindings": {
+                            // Here we don't require a modifier unless there's a language server completion
+                            "tab": "editor::AcceptEditPrediction"
+                        }
+                    }
+                ]
+            "#},
+            Some(indoc! {r#"
+                [
+                    {
+                        "context": "Editor && (edit_prediction && in_leading_whitespace)",
+                        "bindings": {
+                            // Here we don't require a modifier unless there's a language server completion
+                            "tab": "editor::AcceptEditPrediction"
+                        }
+                    }
+                ]
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::TreeSitter(
+                migrations::m_2026_03_23::KEYMAP_PATTERNS,
+                &KEYMAP_QUERY_2026_03_23,
+            )],
+            indoc! {r#"
+                [
+                    {
+                        "context": "Editor && edit_prediction_conflict && showing_completions",
+                        "bindings": {
+                            "tab": "editor::AcceptEditPrediction"
+                        }
+                    }
+                ]
+            "#},
+            Some(indoc! {r#"
+                [
+                    {
+                        "context": "Editor && (edit_prediction && showing_completions)",
+                        "bindings": {
+                            "tab": "editor::AcceptEditPrediction"
+                        }
+                    }
+                ]
+            "#}),
+        );
+
+        assert_migrate_with_migrations(
+            &[MigrationType::TreeSitter(
+                migrations::m_2026_03_23::KEYMAP_PATTERNS,
+                &KEYMAP_QUERY_2026_03_23,
+            )],
+            indoc! {r#"
+                [
+                    {
+                        "context": "Editor && edit_prediction",
+                        "bindings": {
+                            "tab": "editor::AcceptEditPrediction",
+                            // Optional: This makes the default `alt-l` binding do nothing.
+                            "alt-l": null
+                        }
+                    },
+                    {
+                        "context": "Editor && edit_prediction_conflict",
+                        "bindings": {
+                            "alt-tab": "editor::AcceptEditPrediction",
+                            // Optional: This makes the default `alt-l` binding do nothing.
+                            "alt-l": null
+                        }
+                    },
+                ]
+            "#},
+            Some(indoc! {r#"
+                [
+                    {
+                        "context": "Editor && edit_prediction",
+                        "bindings": {
+                            "tab": "editor::AcceptEditPrediction",
+                            // Optional: This makes the default `alt-l` binding do nothing.
+                            "alt-l": null
+                        }
+                    },
+                    {
+                        "context": "Editor && (edit_prediction && (showing_completions || in_leading_whitespace))",
+                        "bindings": {
+                            "alt-tab": "editor::AcceptEditPrediction",
+                            // Optional: This makes the default `alt-l` binding do nothing.
+                            "alt-l": null
+                        }
+                    },
+                ]
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_restructure_profiles_with_settings_key() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "buffer_font_size": 14,
+                    "profiles": {
+                        "Presenting": {
+                            "buffer_font_size": 20,
+                            "theme": "One Light"
+                        },
+                        "Minimal": {
+                            "vim_mode": true
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "buffer_font_size": 14,
+                    "profiles": {
+                        "Presenting": {
+                            "settings": {
+                                "buffer_font_size": 20,
+                                "theme": "One Light"
+                            }
+                        },
+                        "Minimal": {
+                            "settings": {
+                                "vim_mode": true
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_restructure_profiles_with_settings_key_already_migrated() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "Presenting": {
+                            "settings": {
+                                "buffer_font_size": 20
+                            }
+                        }
+                    }
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_restructure_profiles_with_settings_key_no_profiles() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "buffer_font_size": 14
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_in_tool_permissions() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "tools": {
+                                "web_search": {
+                                    "allow": true
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "tools": {
+                                "search_web": {
+                                    "allow": true
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_in_profiles() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "profiles": {
+                            "write": {
+                                "tools": {
+                                    "web_search": false
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "profiles": {
+                            "write": {
+                                "tools": {
+                                    "search_web": false
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_no_change_when_already_migrated() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "tools": {
+                                "search_web": {
+                                    "allow": true
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_no_clobber() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "tools": {
+                                "web_search": {
+                                    "allow": false
+                                },
+                                "search_web": {
+                                    "allow": true
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "tool_permissions": {
+                            "tools": {
+                                "search_web": {
+                                    "allow": false
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_platform_override() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "linux": {
+                        "agent": {
+                            "tool_permissions": {
+                                "tools": {
+                                    "web_search": {
+                                        "allow": true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "linux": {
+                        "agent": {
+                            "tool_permissions": {
+                                "tools": {
+                                    "search_web": {
+                                        "allow": true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_release_channel_override() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "nightly": {
+                        "agent": {
+                            "tool_permissions": {
+                                "tools": {
+                                    "web_search": {
+                                        "default": "allow"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "nightly": {
+                        "agent": {
+                            "tool_permissions": {
+                                "tools": {
+                                    "search_web": {
+                                        "default": "allow"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_no_agent() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "buffer_font_size": 14
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_migration_helpers_handle_various_profile_forms() {
+        let setting = "a_setting";
+        let old_value = "old_value";
+        let new_value = "new_value";
+
+        fn language_setting_fn(value: &mut serde_json::Value, _: &[&str]) -> anyhow::Result<()> {
+            if let Some(obj) = value.as_object_mut() {
+                if let Some(v) = obj.get_mut("a_setting") {
+                    *v = serde_json::json!("new_value");
+                }
+            }
+            Ok(())
+        }
+
+        let mut settings_fn = |map: &mut serde_json::Map<String, serde_json::Value>| {
+            if let Some(v) = map.get_mut(setting) {
+                *v = serde_json::json!(new_value);
+            }
+            Ok(())
+        };
+
+        // Legacy form
+        let input = serde_json::json!({
+            "profiles": {
+                "work": {
+                    setting: old_value
+                }
+            }
+        });
+        let expected = serde_json::json!({
+            "profiles": {
+                "work": {
+                    setting: new_value
+                }
+            }
+        });
+
+        let mut value = input.clone();
+        migrations::migrate_settings(&mut value, &mut settings_fn).unwrap();
+        assert_eq!(value, expected);
+
+        let mut value = input;
+        migrations::migrate_language_setting(&mut value, language_setting_fn).unwrap();
+        assert_eq!(value, expected);
+
+        // Form after migration: `m_2026_04_01`
+        let input = serde_json::json!({
+            "profiles": {
+                "work": {
+                    "settings": {
+                        setting: old_value
+                    }
+                }
+            }
+        });
+        let expected = serde_json::json!({
+            "profiles": {
+                "work": {
+                    "settings": {
+                        setting: new_value
+                    }
+                }
+            }
+        });
+
+        let mut value = input.clone();
+        migrations::migrate_settings(&mut value, &mut settings_fn).unwrap();
+        assert_eq!(value, expected);
+
+        let mut value = input;
+        migrations::migrate_language_setting(&mut value, language_setting_fn).unwrap();
+        assert_eq!(value, expected);
+
+        // Base-only form after migration: `m_2026_04_01` (no settings to migrate)
+        let input = serde_json::json!({
+            "profiles": {
+                "work": {
+                    "base": "default"
+                }
+            }
+        });
+
+        let mut value = input.clone();
+        migrations::migrate_settings(&mut value, &mut settings_fn).unwrap();
+        assert_eq!(value, input);
+
+        let mut value = input.clone();
+        migrations::migrate_language_setting(&mut value, language_setting_fn).unwrap();
+        assert_eq!(value, input);
+    }
+
+    #[test]
+    fn test_rename_web_search_to_search_web_root_level_profile() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_04_10::rename_web_search_to_search_web,
+            )],
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "Work": {
+                            "settings": {
+                                "agent": {
+                                    "tool_permissions": {
+                                        "tools": {
+                                            "web_search": {
+                                                "default": "allow"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "Work": {
+                            "settings": {
+                                "agent": {
+                                    "tool_permissions": {
+                                        "tools": {
+                                            "search_web": {
+                                                "default": "allow"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_context_server_types_report_no_migration() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "context_servers": {
+                        "extension_server": {},
+                        "disabled_extension_server": {
+                            "enabled": false
+                        },
+                        "stdio_server": {
+                            "command": "npx",
+                            "args": ["-y", "some-server"]
+                        },
+                        "http_server": {
+                            "url": "https://example.com/mcp"
+                        },
+                        "http_server_with_headers": {
+                            "url": "https://example.com/mcp",
+                            "headers": {
+                                "Authorization": "Bearer token"
+                            }
+                        }
+                    }
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_promote_show_branch_icon_true_to_show_branch_status_icon_at_root() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_icon": true,
+                        "show_branch_name": true
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_status_icon": true,
+                        "show_branch_name": true
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_drop_show_branch_icon_false_without_setting_status_icon() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_icon": false,
+                        "show_branch_name": true
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_name": true
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_promote_show_branch_icon_true_to_show_branch_status_icon_in_platform_override() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "macos": {
+                        "title_bar": {
+                            "show_branch_icon": true,
+                            "show_branch_name": true
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "macos": {
+                        "title_bar": {
+                            "show_branch_status_icon": true,
+                            "show_branch_name": true
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_promote_show_branch_icon_true_to_show_branch_status_icon_in_release_override() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "preview": {
+                        "title_bar": {
+                            "show_branch_icon": true,
+                            "show_branch_name": true
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "preview": {
+                        "title_bar": {
+                            "show_branch_status_icon": true,
+                            "show_branch_name": true
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_promote_show_branch_icon_true_to_show_branch_status_icon_in_profiles() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "title_bar": {
+                                "show_branch_icon": true,
+                                "show_branch_name": true
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "profiles": {
+                        "work": {
+                            "settings": {
+                                "title_bar": {
+                                    "show_branch_status_icon": true,
+                                    "show_branch_name": true
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_promote_show_branch_icon_true_to_show_branch_status_icon_across_all_scopes() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_icon": true,
+                        "show_branch_name": true
+                    },
+                    "macos": {
+                        "title_bar": {
+                            "show_branch_icon": true,
+                            "show_branch_name": true
+                        }
+                    },
+                    "preview": {
+                        "title_bar": {
+                            "show_branch_icon": true,
+                            "show_branch_name": true
+                        }
+                    },
+                    "profiles": {
+                        "work": {
+                            "title_bar": {
+                                "show_branch_icon": true,
+                                "show_branch_name": true
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_status_icon": true,
+                        "show_branch_name": true
+                    },
+                    "macos": {
+                        "title_bar": {
+                            "show_branch_status_icon": true,
+                            "show_branch_name": true
+                        }
+                    },
+                    "preview": {
+                        "title_bar": {
+                            "show_branch_status_icon": true,
+                            "show_branch_name": true
+                        }
+                    },
+                    "profiles": {
+                        "work": {
+                            "settings": {
+                                "title_bar": {
+                                    "show_branch_status_icon": true,
+                                    "show_branch_name": true
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_hide_mouse_on_typing_and_movement_to_on_typing_and_action() {
+        assert_migrate_settings(
+            r#"
+                {
+                    "hide_mouse": "on_typing_and_movement"
+                }
+            "#,
+            Some(
+                r#"
+                {
+                    "hide_mouse": "on_typing_and_action"
+                }
+            "#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_chain_hide_mouse_while_typing_to_on_typing_and_action() {
+        assert_migrate_settings(
+            r#"
+                {
+                    "hide_mouse_while_typing": true
+                }
+            "#,
+            Some(
+                r#"
+                {
+                    "hide_mouse": "on_typing_and_action"
+                }
+            "#,
+            ),
+        );
+    }
+
+    #[test]
+    fn test_promote_show_branch_icon_true_to_show_branch_status_icon_no_change_when_already_migrated()
+     {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_status_icon": true,
+                        "show_branch_name": true
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // No title_bar key — should be unchanged
+        assert_migrate_settings(r#"{ "theme": "One Dark" }"#, None);
+
+        // title_bar without show_branch_icon — should be unchanged
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "title_bar": {
+                        "show_branch_name": true
+                    }
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_make_git_gutter_width_an_enum_from_number() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "gutter": {
+                        "git_gutter_width": 4.0
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "gutter": {
+                        "git_gutter_width": {
+                            "custom": 4.0
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_make_git_gutter_width_an_enum_no_change_when_already_migrated() {
+        // already "default" string — no change
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "gutter": {
+                        "git_gutter_width": "default"
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // already custom object — no change
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "gutter": {
+                        "git_gutter_width": { "custom": 4.0 }
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // no gutter key — no change
+        assert_migrate_settings(r#"{ "theme": "One Dark" }"#, None);
+    }
+
+    #[test]
+    fn test_url_only_context_servers_are_left_alone() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "context_servers": { "grep": { "url": "https://mcp.grep.app" } }
+                }
+            "#},
+            None,
+        );
+
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "context_servers": {
+                        "grep": { "url": "https://mcp.grep.app" },
+                        "local": {
+                            "source": "custom",
+                            "command": {
+                                "path": "npx",
+                                "args": ["-y", "some-mcp-server"]
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "context_servers": {
+                        "grep": { "url": "https://mcp.grep.app" },
+                        "local": {
+                            "command": "npx",
+                            "args": ["-y", "some-mcp-server"]
+                        }
+                    }
+                }
+            "#}),
+        )
+    }
+
+    #[test]
+    fn test_rename_folder_icons_to_folder_indicator_in_all_panels() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator,
+            )],
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_icons": true
+                    },
+                    "outline_panel": {
+                        "folder_icons": false
+                    },
+                    "git_panel": {
+                        "folder_icons": true
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_indicator": "icon"
+                    },
+                    "outline_panel": {
+                        "folder_indicator": "chevron"
+                    },
+                    "git_panel": {
+                        "folder_indicator": "icon"
+                    }
+                }
+            "#}),
+        );
+    }
+
+    // The shared JSON migration driver applies a rename as a delete plus an add, and
+    // added keys are written to the front of their object. Comments and sibling values
+    // survive; only the renamed key's position moves.
+    #[test]
+    fn test_rename_folder_icons_to_folder_indicator_preserves_comments_and_siblings() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator,
+            )],
+            indoc! {r#"
+                {
+                    // Keep this comment.
+                    "project_panel": {
+                        "file_icons": true,
+                        "folder_icons": false,
+                        "indent_size": 20
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    // Keep this comment.
+                    "project_panel": {
+                        "folder_indicator": "chevron",
+                        "file_icons": true,
+                        "indent_size": 20
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_folder_icons_to_folder_indicator_in_platform_overrides() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator,
+            )],
+            indoc! {r#"
+                {
+                    "macos": {
+                        "project_panel": {
+                            "folder_icons": false
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "macos": {
+                        "project_panel": {
+                            "folder_indicator": "chevron"
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_folder_icons_to_folder_indicator_does_not_clobber_new_key() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator,
+            )],
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_icons": true,
+                        "folder_indicator": "both"
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_indicator": "both"
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_rename_folder_icons_to_folder_indicator_no_change_cases() {
+        let migrations = &[MigrationType::Json(
+            migrations::m_2026_08_26::rename_folder_icons_to_folder_indicator,
+        )];
+
+        // Already migrated.
+        assert_migrate_with_migrations(
+            migrations,
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_indicator": "both"
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // A non-boolean value is already invalid; leave it rather than guess.
+        assert_migrate_with_migrations(
+            migrations,
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_icons": 3
+                    }
+                }
+            "#},
+            None,
+        );
+
+        // `folder_icons` outside the three panels is not ours to rename.
+        assert_migrate_with_migrations(
+            migrations,
+            indoc! {r#"
+                {
+                    "terminal": {
+                        "folder_icons": true
+                    }
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_rename_folder_icons_to_folder_indicator_is_registered() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_icons": false
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "project_panel": {
+                        "folder_indicator": "chevron"
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_nest_markdown_preview_settings_across_all_scopes() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_30::nest_markdown_preview_settings,
+            )],
+            indoc! {r#"
+                {
+                    "markdown_preview_font_size": 14,
+                    "macos": {
+                        "markdown_preview_font_size": 15
+                    },
+                    "preview": {
+                        "markdown_preview_font_size": 16
+                    },
+                    "profiles": {
+                        "work": {
+                            "settings": {
+                                "markdown_preview_font_size": 17
+                            }
+                        }
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "markdown_preview": {
+                        "font_size": 14
+                    },
+                    "macos": {
+                        "markdown_preview": {
+                            "font_size": 15
+                        }
+                    },
+                    "preview": {
+                        "markdown_preview": {
+                            "font_size": 16
+                        }
+                    },
+                    "profiles": {
+                        "work": {
+                            "settings": {
+                                "markdown_preview": {
+                                    "font_size": 17
+                                }
+                            }
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_nest_markdown_preview_settings_merges_without_clobbering() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_30::nest_markdown_preview_settings,
+            )],
+            indoc! {r#"
+                {
+                    "markdown_preview_font_size": 15,
+                    "markdown_preview_font_family": "Zed Sans",
+                    "markdown_preview_code_font_family": "Zed Mono",
+                    "markdown_preview_theme": "One Dark",
+                    "markdown_preview": {
+                        "font_size": 18,
+                        "limit_content_width": false,
+                        "max_width": 900
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "markdown_preview": {
+                        "theme": "One Dark",
+                        "code_font_family": "Zed Mono",
+                        "font_family": "Zed Sans",
+                        "font_size": 18,
+                        "limit_content_width": false,
+                        "max_width": 900
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_nest_markdown_preview_settings_leaves_malformed_object() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_30::nest_markdown_preview_settings,
+            )],
+            indoc! {r#"
+                {
+                    "markdown_preview_font_size": 15,
+                    "markdown_preview": false
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_nest_markdown_preview_settings_replaces_null_when_legacy_settings_exist() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_30::nest_markdown_preview_settings,
+            )],
+            indoc! {r#"
+                {
+                    "markdown_preview": null,
+                    "markdown_preview_font_size": 15,
+                    "preview": {
+                        "markdown_preview": null,
+                        "markdown_preview_theme": "One Dark"
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "markdown_preview": {
+                        "font_size": 15
+                    },
+                    "preview": {
+                        "markdown_preview": {
+                            "theme": "One Dark"
+                        }
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_nest_markdown_preview_settings_leaves_null_without_legacy_settings() {
+        assert_migrate_with_migrations(
+            &[MigrationType::Json(
+                migrations::m_2026_08_30::nest_markdown_preview_settings,
+            )],
+            indoc! {r#"
+                {
+                    "markdown_preview": null,
+                    "preview": {
+                        "markdown_preview": null
+                    }
+                }
+            "#},
+            None,
+        );
+    }
+
+    #[test]
+    fn test_nest_markdown_preview_settings_is_registered() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "markdown_preview_font_size": 15,
+                    "markdown_preview_font_family": "Zed Sans",
+                    "markdown_preview_code_font_family": "Zed Mono",
+                    "markdown_preview_theme": "One Dark"
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "markdown_preview": {
+                        "font_size": 15,
+                        "font_family": "Zed Sans",
+                        "code_font_family": "Zed Mono",
+                        "theme": "One Dark"
+                    }
+                }
+            "#}),
+        );
+    }
+
+    #[test]
+    fn test_nest_agent_threads_sidebar_settings_is_registered() {
+        assert_migrate_settings(
+            indoc! {r#"
+                {
+                    "agent": {
+                        "sidebar_side": "right",
+                        "threads_sidebar_default_width": 420
+                    }
+                }
+            "#},
+            Some(indoc! {r#"
+                {
+                    "agent": {
+                        "threads_sidebar": {
+                            "position": "right",
+                            "default_width": 420
+                        }
+                    }
+                }
+            "#}),
         );
     }
 }
