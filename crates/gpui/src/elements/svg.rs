@@ -6,16 +6,10 @@ use std::{
 };
 
 use crate::{
-<<<<<<< HEAD
     App, Asset, Bounds, DefiniteLength, Element, GlobalElementId, Hitbox, InspectorElementId,
     InteractiveElement, Interactivity, IntoElement, LayoutId, Length, Pixels, Point, Radians,
-    SharedString, Size, StyleRefinement, Styled, TransformationMatrix, Window,
-    geometry::Negate as _, point, px, radians, size,
-=======
-    App, Asset, Bounds, Element, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement,
-    Interactivity, IntoElement, LayoutId, Pixels, Point, Radians, SharedString, Size,
-    StyleRefinement, Styled, TransformationMatrix, Window, point, px, radians, size,
->>>>>>> upstream/main
+    SharedString, Size, Style, StyleRefinement, Styled, TransformationMatrix, Window, point, px,
+    radians, size,
 };
 use gpui_util::ResultExt;
 
@@ -23,7 +17,6 @@ use gpui_util::ResultExt;
 pub struct Svg {
     interactivity: Interactivity,
     transformation: Option<Transformation>,
-    size: Option<Size<f32>>,
     path: Option<SharedString>,
     external_path: Option<SharedString>,
     data: Option<Arc<[u8]>>,
@@ -36,7 +29,6 @@ pub fn svg() -> Svg {
     Svg {
         interactivity: Interactivity::new(),
         transformation: None,
-        size: None,
         path: None,
         external_path: None,
         data: None,
@@ -48,7 +40,6 @@ impl Svg {
     /// Set the path to the SVG file for this element.
     pub fn path(mut self, path: impl Into<SharedString>) -> Self {
         self.path = Some(path.into());
-
         self
     }
 
@@ -79,6 +70,55 @@ impl Svg {
     }
 }
 
+/// The intrinsic sizes of SVGs already measured, by path.
+#[derive(Default)]
+struct SvgIntrinsicSizes(std::collections::HashMap<SharedString, Option<Size<f32>>>);
+
+impl crate::Global for SvgIntrinsicSizes {}
+
+impl Svg {
+    /// The intrinsic size of the SVG at `path` or of `data`, measured once per
+    /// path.
+    fn intrinsic_size(&self, cx: &mut App) -> Option<Size<f32>> {
+        let key = self.data_path.as_ref().or(self.path.as_ref())?.clone();
+        if let Some(size) = cx.default_global::<SvgIntrinsicSizes>().0.get(&key) {
+            return *size;
+        }
+        let bytes = match &self.data {
+            Some(data) => Some(std::borrow::Cow::Borrowed(data.as_ref())),
+            None => cx.asset_source().load(&key).ok().flatten(),
+        };
+        let size = bytes
+            .and_then(|bytes| cx.svg_renderer().parse_svg(&bytes).ok())
+            .map(|svg| svg.size());
+        cx.default_global::<SvgIntrinsicSizes>().0.insert(key, size);
+        size
+    }
+}
+
+/// Fills in an auto width or height from the SVG's intrinsic size, keeping its
+/// aspect ratio.
+fn apply_intrinsic_size(style: &mut Style, intrinsic: Size<f32>, rem_size: Pixels) {
+    if intrinsic.width <= 0. || intrinsic.height <= 0. {
+        return;
+    }
+    let aspect_ratio = intrinsic.width / intrinsic.height;
+    style.aspect_ratio = Some(aspect_ratio);
+    let absolute = |length: Length| match length {
+        Length::Definite(DefiniteLength::Absolute(length)) => Some(length.to_pixels(rem_size)),
+        _ => None,
+    };
+    let (width, height) = (absolute(style.size.width), absolute(style.size.height));
+    if let Length::Auto = style.size.width {
+        style.size.width =
+            px(height.map_or(intrinsic.width, |height| f32::from(height) * aspect_ratio)).into();
+    }
+    if let Length::Auto = style.size.height {
+        style.size.height =
+            px(width.map_or(intrinsic.height, |width| f32::from(width) / aspect_ratio)).into();
+    }
+}
+
 impl Element for Svg {
     type RequestLayoutState = ();
     type PrepaintState = Option<Hitbox>;
@@ -98,40 +138,15 @@ impl Element for Svg {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let intrinsic_size = self.intrinsic_size(cx);
         let layout_id = self.interactivity.request_layout(
             global_id,
             inspector_id,
             window,
             cx,
             |mut style, window, cx| {
-                if self.size.is_none()
-                    && let Some(path) = &self.path
-                    && let Ok(Some(bytes)) = cx.asset_source().load(path)
-                    && let Ok(tree) = usvg::Tree::from_data(&bytes, &cx.svg_renderer().usvg_options)
-                {
-                    self.size = Some(Size::new(tree.size().width(), tree.size().height()));
-                }
-                if let Some(size) = self.size {
-                    let ar = size.width / size.height;
-                    style.aspect_ratio = Some(ar);
-
-                    if let Length::Auto = style.size.width {
-                        style.size.width = match style.size.height {
-                            Length::Definite(DefiniteLength::Absolute(h)) => {
-                                Length::Definite(px(ar * h.to_pixels(window.rem_size()).0).into())
-                            }
-                            _ => Length::Definite(px(size.width).into()),
-                        };
-                    }
-
-                    if let Length::Auto = style.size.height {
-                        style.size.height = match style.size.width {
-                            Length::Definite(DefiniteLength::Absolute(w)) => {
-                                Length::Definite(px(w.to_pixels(window.rem_size()).0 / ar).into())
-                            }
-                            _ => Length::Definite(px(size.height).into()),
-                        };
-                    }
+                if let Some(intrinsic_size) = intrinsic_size {
+                    apply_intrinsic_size(&mut style, intrinsic_size, window.rem_size());
                 }
                 window.request_layout(style, None, cx)
             },

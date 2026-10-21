@@ -755,41 +755,8 @@ impl Style {
                 background,
                 border_widths,
                 self.border_color.unwrap_or_default(),
-<<<<<<< HEAD
                 Edges::all(self.border_style),
-            );
-
-            window.with_content_mask(Some(ContentMask { bounds: top_bounds }), |window| {
-                window.paint_quad(quad.clone());
-            });
-            window.with_content_mask(
-                Some(ContentMask {
-                    bounds: right_bounds,
-                }),
-                |window| {
-                    window.paint_quad(quad.clone());
-                },
-            );
-            window.with_content_mask(
-                Some(ContentMask {
-                    bounds: bottom_bounds,
-                }),
-                |window| {
-                    window.paint_quad(quad.clone());
-                },
-            );
-            window.with_content_mask(
-                Some(ContentMask {
-                    bounds: left_bounds,
-                }),
-                |window| {
-                    window.paint_quad(quad);
-                },
-            );
-=======
-                self.border_style,
             ));
->>>>>>> upstream/main
         }
 
         #[cfg(debug_assertions)]

@@ -218,7 +218,8 @@ fn solid_quad(
 ) -> Quad {
     Quad {
         order: 0,
-        border_style: BorderStyle::Solid,
+        pad: 0,
+        border_styles: Edges::all(BorderStyle::Solid),
         bounds,
         content_mask: *content_mask,
         background: color.into(),
