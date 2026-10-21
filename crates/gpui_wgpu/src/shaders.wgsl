@@ -104,18 +104,18 @@ struct Bounds {
     size: vec2<f32>,
 }
 
-struct Corners {
-    top_left: f32,
-    top_right: f32,
-    bottom_right: f32,
-    bottom_left: f32,
-}
-
 struct StyleEdges {
     top: u32,
     right: u32,
     bottom: u32,
     left: u32,
+}
+
+struct Corners {
+    top_left: f32,
+    top_right: f32,
+    bottom_right: f32,
+    bottom_left: f32,
 }
 
 struct Edges {
@@ -688,13 +688,13 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         let ellipse_radii = max(vec2<f32>(0.0), corner_radius - reduced_border);
         inner_sdf = quarter_ellipse_sdf(corner_center_to_point, ellipse_radii);
     }
-    // Style of the nearest border
-    var border_style = vec2<u32>(
-        select(quad.border_styles.left, quad.border_styles.right, center_to_point.x < 0.0),
-        select(quad.border_styles.top, quad.border_styles.bottom, center_to_point.y < 0.0)
-    );
 
-    var border_style_nearest = select(border_style.x, border_style.y, corner_to_point.x > corner_to_point.y);
+    // Style of the nearest border
+    let border_style = vec2<u32>(
+        select(quad.border_styles.right, quad.border_styles.left, center_to_point.x < 0.0),
+        select(quad.border_styles.bottom, quad.border_styles.top, center_to_point.y < 0.0),
+    );
+    let border_style_nearest = select(border_style.y, border_style.x, corner_to_point.x > corner_to_point.y);
 
     // Negative when inside the border
     let border_sdf = max(inner_sdf, outer_sdf);
@@ -703,7 +703,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
     if (border_sdf < antialias_threshold) {
         var border_color = input.border_color;
 
-        // Dashed border logic when border_style == 1
+        // Dashed border logic when the nearest border is dashed
         if (border_style_nearest == 1) {
             // Position along the perimeter in "dash space", where each dash
             // period has length 1

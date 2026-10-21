@@ -1,9 +1,5 @@
 [toolchain]
-<<<<<<< HEAD
-channel = "1.91"
-=======
 channel = "1.98.1"
->>>>>>> upstream/main
 profile = "minimal"
 components = [ "rustfmt", "clippy", "rust-analyzer", "rust-src" ]
 targets = [

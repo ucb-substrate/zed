@@ -2612,10 +2612,10 @@ mod tests {
         PolychromeSprite, Quad, Shadow, Size, SubpixelSprite, Underline, linear_color_stop,
         linear_gradient,
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use gpui::{DevicePixels, PlatformHeadlessRenderer, Scene};
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn device_size(width: i32, height: i32) -> Size<DevicePixels> {
         Size {
             width: DevicePixels(width),
@@ -2623,7 +2623,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn solid_quad(x: f32, y: f32, width: f32, height: f32, color: Hsla) -> Quad {
         let bounds = Bounds {
             origin: Point {
@@ -2637,7 +2637,8 @@ mod tests {
         };
         Quad {
             order: 0,
-            border_style: BorderStyle::Solid,
+            pad: 0,
+            border_styles: Edges::all(BorderStyle::Solid),
             bounds,
             content_mask: ContentMask { bounds },
             background: color.into(),
@@ -2649,7 +2650,7 @@ mod tests {
 
     /// Channels are compared with a small tolerance so the assertions hold across
     /// drivers without pinning exact rasterizer output.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_pixel(image: &image::RgbaImage, x: u32, y: u32, expected: [u8; 4]) {
         let actual = image.get_pixel(x, y).0;
         assert!(
@@ -2661,14 +2662,46 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const RED: [u8; 4] = [255, 0, 0, 255];
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const BLUE: [u8; 4] = [0, 0, 255, 255];
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     const BLACK: [u8; 4] = [0, 0, 0, 255];
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn headless_renderer_dashes_only_the_dashed_edges() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let mut scene = Scene::default();
+        let mut quad = solid_quad(8.0, 8.0, 112.0, 112.0, gpui::red());
+        quad.background = gpui::transparent_black().into();
+        quad.border_widths = Edges::all(4.0.into());
+        quad.border_styles = Edges {
+            top: BorderStyle::Dashed,
+            right: BorderStyle::Solid,
+            bottom: BorderStyle::Solid,
+            left: BorderStyle::Solid,
+        };
+        scene.insert_primitive(quad);
+        scene.finish();
+
+        let image = renderer.render_scene_to_image(&scene, device_size(128, 128))?;
+        let is_red = |x: u32, y: u32| image.get_pixel(x, y).0 == RED;
+        let row = |y: u32| (24..104).filter(|&x| is_red(x, y)).count();
+        let column = |x: u32| (24..104).filter(|&y| is_red(x, y)).count();
+        assert!(
+            row(10) > 10 && row(10) < 70,
+            "the top edge is dashed: {}",
+            row(10)
+        );
+        assert_eq!(row(117), 80, "the bottom edge is solid");
+        assert_eq!(column(10), 80, "the left edge is solid");
+        assert_eq!(column(117), 80, "the right edge is solid");
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn headless_renderer_draws_quads_with_distinct_colors() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -2686,7 +2719,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn headless_renderer_captures_each_requested_size() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -2712,7 +2745,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn headless_renderer_reuses_target_for_same_size() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -2735,7 +2768,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn headless_renderer_rejects_invalid_sizes() -> anyhow::Result<()> {
         let mut renderer = WgpuHeadlessRenderer::new()?;
@@ -2793,7 +2826,7 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 44 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 26 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
@@ -2807,7 +2840,13 @@ mod tests {
     fn webgl_quad_layout_matches_fixed_decoder() {
         let quad = Quad {
             order: 41,
-            border_style: BorderStyle::Dashed,
+            pad: 0,
+            border_styles: Edges {
+                top: BorderStyle::Dashed,
+                right: BorderStyle::Solid,
+                bottom: BorderStyle::Dashed,
+                left: BorderStyle::Solid,
+            },
             bounds: Bounds {
                 origin: Point {
                     x: 1.0.into(),
@@ -2878,7 +2917,11 @@ mod tests {
             words,
             &[
                 41,
+                0,
                 1,
+                0,
+                1,
+                0,
                 1.0_f32.to_bits(),
                 2.0_f32.to_bits(),
                 3.0_f32.to_bits(),

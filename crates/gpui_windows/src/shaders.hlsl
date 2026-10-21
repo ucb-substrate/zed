@@ -34,13 +34,6 @@ struct Corners {
     float bottom_left;
 };
 
-struct StyleEdges {
-    uint top;
-    uint right;
-    uint bottom;
-    uint left;
-};
-
 struct Edges {
     float top;
     float right;
@@ -505,6 +498,13 @@ float quarter_ellipse_sdf(float2 pt, float2 radii) {
 **
 */
 
+struct StyleEdges {
+    uint top;
+    uint right;
+    uint bottom;
+    uint left;
+};
+
 struct Quad {
     uint order;
     uint pad;
@@ -674,7 +674,6 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
         center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right,
         center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom
     );
-
     uint border_style_nearest = corner_to_point.x > corner_to_point.y ? border_style.x : border_style.y;
 
     // Negative when inside the border
@@ -683,7 +682,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
         float4 border_color = input.border_color;
-        // Dashed border logic when border_style == 1
+        // Dashed border logic when the nearest border is dashed
         if (border_style_nearest == 1) {
             // Position along the perimeter in "dash space", where each dash
             // period has length 1

@@ -1459,7 +1459,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct QuadSnapshot {
         order: u32,
-        border_style: BorderStyle,
+        border_styles: Edges<BorderStyle>,
         bounds: Bounds<ScaledPixels>,
         content_mask: ContentMask<ScaledPixels>,
         background: Background,
@@ -1472,7 +1472,7 @@ mod tests {
         fn from(quad: &crate::Quad) -> Self {
             Self {
                 order: quad.order,
-                border_style: quad.border_style,
+                border_styles: quad.border_styles,
                 bounds: quad.bounds,
                 content_mask: quad.content_mask,
                 background: quad.background,

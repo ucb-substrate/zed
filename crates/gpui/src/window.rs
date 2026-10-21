@@ -4707,24 +4707,14 @@ impl Window {
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
             order: 0,
-<<<<<<< HEAD
             pad: 0,
-            bounds: quad.bounds.scale(scale_factor),
-            content_mask: content_mask.scale(scale_factor),
-            background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
-            corner_radii: quad.corner_radii.scale(scale_factor),
-            border_widths: quad.border_widths.scale(scale_factor),
-            border_styles: quad.border_styles,
-        });
-=======
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity),
             corner_radii: quad.corner_radii.scale(self.scale_factor()),
             border_widths: snapped_border_widths,
-            border_style: quad.border_style,
+            border_styles: quad.border_styles,
         };
 
         if !quad.background.is_transparent() {
@@ -4776,7 +4766,6 @@ impl Window {
                 });
             }
         }
->>>>>>> upstream/main
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
@@ -7827,7 +7816,7 @@ pub struct PaintQuad {
     pub border_widths: Edges<Pixels>,
     /// The color of the quad's borders.
     pub border_color: Hsla,
-    /// The style of the quad's borders.
+    /// The style of each of the quad's borders.
     pub border_styles: Edges<BorderStyle>,
 }
 

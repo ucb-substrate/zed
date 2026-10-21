@@ -210,7 +210,6 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
     center_to_point.x < 0.0 ? quad.border_styles.left : quad.border_styles.right,
     center_to_point.y < 0.0 ? quad.border_styles.top : quad.border_styles.bottom
   );
-
   uint border_style_nearest = corner_to_point.x > corner_to_point.y ? border_style.x : border_style.y;
 
   // Negative when inside the border
@@ -220,7 +219,7 @@ fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
   if (border_sdf < antialias_threshold) {
     float4 border_color = input.border_color;
 
-    // Dashed border logic when border_style == 1
+    // Dashed border logic when the nearest border is dashed
     if (border_style_nearest == 1) {
       // Position along the perimeter in "dash space", where each dash
       // period has length 1
@@ -1260,13 +1259,12 @@ float4 fill_color(Background background,
         float stripe_angle = M_PI_F / 4.0;
         float pattern_period = pattern_height * sin(stripe_angle);
         float2x2 rotation = rotate2d(stripe_angle);
-        // float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
-        float2 relative_position = position;
+        float2 relative_position = position - float2(bounds.origin.x, bounds.origin.y);
         float2 rotated_point = rotation * relative_position;
         float pattern = fmod(rotated_point.x, pattern_period);
         float distance = min(pattern, pattern_period - pattern) - pattern_period * (pattern_width / pattern_height) /  2.0f;
         color = solid_color;
-        color.a *= saturate(sign(0.5 - distance));
+        color.a *= saturate(0.5 - distance);
         break;
     }
     case 3: {
