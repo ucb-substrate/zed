@@ -388,7 +388,7 @@ impl KeystrokeInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.inner_focus_handle);
+        window.focus(&self.inner_focus_handle, cx);
         self.clear_keystrokes(&ClearKeystrokes, window, cx);
         self.previous_modifiers = window.modifiers();
         #[cfg(test)]
@@ -407,7 +407,7 @@ impl KeystrokeInput {
         if !self.is_recording(window) {
             return;
         }
-        window.focus(&self.outer_focus_handle);
+        window.focus(&self.outer_focus_handle, cx);
         if let Some(close_keystrokes_start) = self.close_keystrokes_start.take()
             && close_keystrokes_start < self.keystrokes.len()
         {
@@ -468,7 +468,7 @@ impl Render for KeystrokeInput {
         let is_focused = self.outer_focus_handle.contains_focused(window, cx);
         let is_recording = self.is_recording(window);
 
-        let width = rems_from_px(64.);
+        let width = rems_from_px(64_f32);
 
         let recording_bg_color = colors
             .editor_background
@@ -674,7 +674,7 @@ mod tests {
     use itertools::Itertools as _;
     use project::Project;
     use settings::SettingsStore;
-    use workspace::Workspace;
+    use workspace::MultiWorkspace;
 
     pub struct KeystrokeInputTestHelper {
         input: Entity<KeystrokeInput>,
@@ -839,6 +839,19 @@ mod tests {
                     .iter()
                     .map(|keystroke| keystroke.inner().clone())
                     .collect()
+            });
+            Self::expect_keystrokes_equal(&actual, expected);
+            self
+        }
+
+        #[track_caller]
+        pub fn expect_recorded_keystrokes(&mut self, expected: &[&str]) -> &mut Self {
+            let actual = self.input.read_with(&self.cx, |input, _| {
+                input
+                    .keystrokes()
+                    .iter()
+                    .map(|keystroke| keystroke.inner().clone())
+                    .collect::<Vec<_>>()
             });
             Self::expect_keystrokes_equal(&actual, expected);
             self
@@ -1115,15 +1128,91 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
         });
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
-        let workspace =
-            cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
-        let cx = VisualTestContext::from_window(*workspace, cx);
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let cx = VisualTestContext::from_window(window_handle.into(), cx);
         KeystrokeInputTestHelper::new(cx)
+    }
+
+    fn init_dispatch_test(cx: &mut TestAppContext, binding: &str) -> KeystrokeInputTestHelper {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                binding,
+                ClearKeystrokes,
+                Some(KEY_CONTEXT_VALUE),
+            )]);
+        });
+        let window = cx.add_window(|window, cx| KeystrokeInput::new(None, window, cx));
+        let input = window.root(cx).expect("keystroke input window");
+        let mut helper = KeystrokeInputTestHelper {
+            input,
+            current_modifiers: Modifiers::default(),
+            cx: VisualTestContext::from_window(window.into(), cx),
+        };
+        helper.cx.update(|window, _| window.activate_window());
+        helper.cx.run_until_parked();
+        helper.cx.update(|window, cx| window.draw(cx).clear(cx));
+        helper.start_recording();
+        helper.cx.update(|window, cx| window.draw(cx).clear(cx));
+        helper.input.read_with(&helper.cx, |input, _| {
+            assert!(input.intercept_subscription.is_some());
+        });
+        helper
+    }
+
+    fn simulate_standalone_shift(cx: &mut VisualTestContext) {
+        cx.simulate_modifiers_change(Modifiers::shift());
+        cx.simulate_modifiers_change(Modifiers::none());
+    }
+
+    fn simulate_shift_f1(cx: &mut VisualTestContext) {
+        let keystroke = Keystroke::parse("shift-f1").expect("valid keystroke");
+        cx.simulate_modifiers_change(Modifiers::shift());
+        cx.simulate_event(gpui::KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        });
+        cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        cx.simulate_modifiers_change(Modifiers::none());
+    }
+
+    #[gpui::test]
+    fn test_dispatch_records_standalone_shift_without_running_bound_action(
+        cx: &mut TestAppContext,
+    ) {
+        let mut helper = init_dispatch_test(cx, "shift");
+
+        helper.cx.simulate_modifiers_change(Modifiers::shift());
+        helper.expect_recorded_keystrokes(&[]);
+        helper.cx.simulate_modifiers_change(Modifiers::none());
+        helper.expect_recorded_keystrokes(&["shift"]);
+
+        helper.stop_recording();
+        helper.cx.update(|window, cx| window.draw(cx).clear(cx));
+        simulate_standalone_shift(&mut helper.cx);
+        helper.expect_empty();
+    }
+
+    #[gpui::test]
+    fn test_dispatch_records_shift_f1_without_extra_shift_or_bound_action(cx: &mut TestAppContext) {
+        let mut helper = init_dispatch_test(cx, "shift-f1");
+
+        simulate_shift_f1(&mut helper.cx);
+        helper.expect_recorded_keystrokes(&["shift-f1"]);
+
+        helper.stop_recording();
+        helper.cx.update(|window, cx| window.draw(cx).clear(cx));
+        simulate_shift_f1(&mut helper.cx);
+        helper.expect_empty();
     }
 
     #[gpui::test]

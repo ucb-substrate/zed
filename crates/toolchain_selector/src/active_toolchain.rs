@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    AsyncWindowContext, Context, Entity, IntoElement, ParentElement, Render, Styled, Subscription,
-    Task, WeakEntity, Window, div,
+    App, AsyncWindowContext, Context, Entity, IntoElement, ParentElement, Render, Styled,
+    Subscription, Task, WeakEntity, Window, div,
 };
 use language::{Buffer, BufferEvent, LanguageName, Toolchain, ToolchainScope};
 use project::{Project, ProjectPath, Toolchains, WorktreeId, toolchain_store::ToolchainStoreEvent};
 use ui::{Button, ButtonCommon, Clickable, LabelSize, SharedString, Tooltip};
 use util::{maybe, rel_path::RelPath};
-use workspace::{StatusItemView, Workspace, item::ItemHandle};
+use workspace::{HideStatusItem, StatusItemView, Workspace, item::ItemHandle};
 
 use crate::ToolchainSelector;
 
@@ -117,14 +117,14 @@ impl ActiveToolchain {
         cx: &mut Context<Self>,
     ) {
         let editor = editor.read(cx);
-        if let Some((_, buffer, _)) = editor.active_excerpt(cx)
+        if let Some(buffer) = editor.active_buffer(cx)
             && let Some(worktree_id) = buffer.read(cx).file().map(|file| file.worktree_id(cx))
         {
             let subscription = cx.subscribe_in(
                 &buffer,
                 window,
                 |this, _, event: &BufferEvent, window, cx| {
-                    if matches!(event, BufferEvent::LanguageChanged) {
+                    if matches!(event, BufferEvent::LanguageChanged(_)) {
                         this._update_toolchain_task = Self::spawn_tracker_task(window, cx);
                     }
                 },
@@ -198,15 +198,19 @@ impl ActiveToolchain {
                     .or_else(|| toolchains.toolchains.first())
                     .cloned();
                 if let Some(toolchain) = &default_choice {
-                    workspace::WORKSPACE_DB
-                        .set_toolchain(
-                            workspace_id,
-                            worktree_id,
-                            relative_path.clone(),
-                            toolchain.clone(),
-                        )
-                        .await
-                        .ok()?;
+                    let worktree_root_path = project.read_with(cx, |this, cx| {
+                        this.worktree_for_id(worktree_id, cx)
+                            .map(|worktree| worktree.read(cx).abs_path())
+                    })?;
+                    let db = cx.update(|_, cx| workspace::WorkspaceDb::global(cx)).ok()?;
+                    db.set_toolchain(
+                        workspace_id,
+                        worktree_root_path,
+                        relative_path.clone(),
+                        toolchain.clone(),
+                    )
+                    .await
+                    .ok()?;
                     project
                         .update(cx, |this, cx| {
                             this.activate_toolchain(
@@ -218,7 +222,6 @@ impl ActiveToolchain {
                                 cx,
                             )
                         })
-                        .ok()?
                         .await;
                 }
 
@@ -237,6 +240,7 @@ impl Render for ActiveToolchain {
         div().child(
             Button::new("change-toolchain", active_toolchain.name.clone())
                 .label_size(LabelSize::Small)
+                .tab_index(0isize)
                 .on_click(cx.listener(|this, _, window, cx| {
                     if let Some(workspace) = this.workspace.upgrade() {
                         workspace.update(cx, |workspace, cx| {
@@ -244,7 +248,7 @@ impl Render for ActiveToolchain {
                         });
                     }
                 }))
-                .tooltip(Tooltip::text(format!("Select {}", &self.term))),
+                .tooltip(Tooltip::text(format!("Select {}", self.term))),
         )
     }
 }
@@ -260,5 +264,11 @@ impl StatusItemView for ActiveToolchain {
             self.update_lister(editor, window, cx);
         }
         cx.notify();
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        // The toolchain selector only appears when the active buffer has a
+        // language with toolchain support.
+        None
     }
 }

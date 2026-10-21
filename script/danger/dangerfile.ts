@@ -1,4 +1,6 @@
-import { danger, message, warn, fail } from "danger";
+import { danger, message, fail, schedule } from "danger";
+import { releaseNotesSection, releaseNotesEntries } from "../lib/release-notes";
+
 const { prHygiene } = require("danger-plugin-pr-hygiene");
 
 prHygiene({
@@ -6,16 +8,19 @@ prHygiene({
   rules: {
     // Don't enable this rule just yet, as it can have false positives.
     useImperativeMood: "off",
+    noConventionalCommits: {
+      bannedTypes: ["feat", "fix", "style", "refactor", "perf", "test", "chore", "build", "revert"],
+    },
   },
 });
 
-const RELEASE_NOTES_PATTERN = /Release Notes:\r?\n\s+-/gm;
 const body = danger.github.pr.body;
-
-const hasReleaseNotes = RELEASE_NOTES_PATTERN.test(body);
+const releaseNotes = releaseNotesSection(body);
+const entries = releaseNotesEntries(releaseNotes);
+const hasReleaseNotes = releaseNotes !== "";
 
 if (!hasReleaseNotes) {
-  warn(
+  fail(
     [
       "This PR is missing release notes.",
       "",
@@ -33,14 +38,66 @@ if (!hasReleaseNotes) {
       "",
       "- N/A",
       "```",
+      "",
+      "If your change touches a `gpui`-related crate, you must also add an entry for the GPUI release notes:",
+      "```",
+      "Release Notes:",
+      "",
+      "- Added/Fixed/Improved ...",
+      "- [GPUI] Added/Fixed/Improved ...",
+      "```",
+      "",
+      'If the change is not user-facing for GPUI users, use "- [GPUI] N/A" for that entry.',
     ].join("\n"),
   );
+} else if (
+  entries.some((entry) => {
+    const description = entry.replace(/^-\s*(?:\[GPUI\]\s*)?/i, "").trim();
+    return description === "" || /^(?:N\/A\s+or\s+)?Added\/Fixed\/Improved\s*(?:\.{3}|…)$/i.test(description);
+  })
+) {
+  fail(
+    [
+      "This PR has no proper release notes.",
+      "",
+      'Please replace them with "N/A" or a description of the changes.',
+    ].join("\n"),
+  );
+}
+
+const GPUI_RELEASE_NOTES_PATTERN = /^- \[GPUI\]/im;
+
+const gpuiCrates = danger.git.fileMatch("crates/gpui*/**");
+
+if (gpuiCrates.edited || gpuiCrates.deleted) {
+  if (!entries.some((entry) => GPUI_RELEASE_NOTES_PATTERN.test(entry))) {
+    const { edited, deleted } = gpuiCrates.getKeyedPaths();
+    const touchedGpuiCratesStr = [...edited, ...deleted]
+      .map((file) => "`" + file.split("/")[1] + "`")
+      .filter((crate, index, self) => self.indexOf(crate) === index)
+      .join(", ");
+    fail(
+      [
+        `This PR modifies GPUI crates (${touchedGpuiCratesStr}), which requires a GPUI release notes entry.`,
+        "",
+        'Please add at least one entry prefixed with `[GPUI]` to the "Release Notes" section:',
+        "```",
+        "Release Notes:",
+        "",
+        "- Added/Fixed/Improved ...",
+        "- [GPUI] Added/Fixed/Improved ...",
+        "```",
+        "",
+        'If the change is not user-facing for GPUI users, use "- [GPUI] N/A" for that entry.',
+      ].join("\n"),
+    );
+  }
 }
 
 const ISSUE_LINK_PATTERN =
   /(?:- )?(?<!(?:Close[sd]?|Fixe[sd]|Resolve[sd]|Implement[sed]|Follow-up of|Part of):?\s+)https:\/\/github\.com\/[\w-]+\/[\w-]+\/issues\/\d+/gi;
 
-const bodyWithoutReleaseNotes = hasReleaseNotes ? body.split(/Release Notes:/)[0] : body;
+const bodyWithoutReleaseNotes = hasReleaseNotes ? body.slice(0, body.length - releaseNotes.length) : body;
 const includesIssueUrl = ISSUE_LINK_PATTERN.test(bodyWithoutReleaseNotes);
 
 if (includesIssueUrl) {
@@ -58,38 +115,72 @@ if (includesIssueUrl) {
   );
 }
 
-const PROMPT_PATHS = [
-  "assets/prompts/content_prompt.hbs",
-  "assets/prompts/terminal_assistant_prompt.hbs",
-  "crates/agent_settings/src/prompts/summarize_thread_detailed_prompt.txt",
-  "crates/agent_settings/src/prompts/summarize_thread_prompt.txt",
-  "crates/agent/src/templates/create_file_prompt.hbs",
-  "crates/agent/src/templates/edit_file_prompt_xml.hbs",
-  "crates/agent/src/templates/edit_file_prompt_diff_fenced.hbs",
-  "crates/git_ui/src/commit_message_prompt.txt",
+const SELF_REVIEW_MARKER = "Remove this line to confirm you've reviewed this PR before submitting.";
+
+const readmeModified =
+  danger.git.modified_files.includes("README.md") || danger.git.created_files.includes("README.md");
+if (readmeModified) {
+  schedule(async () => {
+    const readmeDiff = await danger.git.diffForFile("README.md");
+    if (readmeDiff && readmeDiff.added.includes(SELF_REVIEW_MARKER)) {
+      fail(
+        "Please self-review your PR before submitting — README.md contains a line that asks to be removed which you should have spotted.",
+      );
+    }
+  });
+}
+
+if (danger.git.deleted_files.includes(".rules")) {
+  fail(
+    [
+      "This PR deletes `.rules`, which contains the mandatory agent self-review rule (the `> [!IMPORTANT]` README marker rule).",
+      "If the deletion is intentional, move that rule to another rules file in the same PR.",
+    ].join("\n"),
+  );
+} else if (danger.git.modified_files.includes(".rules")) {
+  schedule(async () => {
+    const rulesDiff = await danger.git.diffForFile(".rules");
+    if (rulesDiff && rulesDiff.removed.includes(SELF_REVIEW_MARKER) && !rulesDiff.added.includes(SELF_REVIEW_MARKER)) {
+      fail(
+        [
+          "This PR removes the mandatory agent self-review rule from `.rules` (the `> [!IMPORTANT]` README marker rule).",
+          "It has been dropped by accident before and had to be restored in https://github.com/zed-industries/zed/pull/63384.",
+          "If changing it is intentional, keep an equivalent rule containing the same marker text in `.rules`.",
+        ].join("\n"),
+      );
+    }
+  });
+}
+
+const SCHEMA_CHANGE_ATTESTATION =
+  "The corresponding database schema migration has been created in the Cloud repo and applied to the production database.";
+
+const MIGRATION_SCHEMA_FILES = [
+  "crates/collab/migrations/20251208000000_test_schema.sql",
+  "crates/collab/migrations.sqlite/20221109000000_test_schema.sql",
 ];
 
-const PROMPT_CHANGE_ATTESTATION = "I have ensured the LLM Worker works with these prompt changes.";
-
-const modifiedPrompts = danger.git.modified_files.filter((file) =>
-  PROMPT_PATHS.some((promptPath) => file.includes(promptPath)),
+const modifiedSchemaFiles = danger.git.modified_files.filter((file) =>
+  MIGRATION_SCHEMA_FILES.some((schemaFilePath) => file.endsWith(schemaFilePath)),
 );
 
-for (const promptPath of modifiedPrompts) {
-  if (body.includes(PROMPT_CHANGE_ATTESTATION)) {
+if (modifiedSchemaFiles.length > 0) {
+  if (body.includes(SCHEMA_CHANGE_ATTESTATION)) {
     message(
       [
-        `This PR contains changes to "${promptPath}".`,
-        "The author has attested the LLM Worker works with the changes to this prompt.",
+        "This PR modifies database schema files.",
+        "",
+        `The author has attested that ${SCHEMA_CHANGE_ATTESTATION.substring(0, 1).toLowerCase() + SCHEMA_CHANGE_ATTESTATION.substring(1)}`,
       ].join("\n"),
     );
   } else {
+    const modifiedSchemaFilesStr = modifiedSchemaFiles.map((path) => "`" + path + "`").join(", ");
     fail(
       [
-        `Modifying the "${promptPath}" prompt may require corresponding changes in the LLM Worker.`,
-        "If you are ensure what this entails, talk to @maxdeviant or another AI team member.",
-        `Once you have made the changes—or determined that none are necessary—add "${PROMPT_CHANGE_ATTESTATION}" to the PR description.`,
-      ].join("\n"),
+        `This PR modifies database schema files (${modifiedSchemaFilesStr}), which requires creating a schema migration in the Cloud repository.`,
+        "Once the schema migration has been created and applied, please add the following attestation to your PR description: ",
+        `"${SCHEMA_CHANGE_ATTESTATION}"`,
+      ].join("\n\n"),
     );
   }
 }

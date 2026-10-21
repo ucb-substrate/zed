@@ -1,8 +1,12 @@
 //! Handles conversions of `language` items to and from the [`rpc`] protocol.
 
-use crate::{CursorShape, Diagnostic, DiagnosticSourceKind, diagnostic_set::DiagnosticEntry};
+use crate::{
+    CursorShape, Diagnostic, DiagnosticMessage, DiagnosticSourceKind,
+    diagnostic_set::DiagnosticEntry,
+};
 use anyhow::{Context as _, Result};
 use clock::ReplicaId;
+use gpui::SharedString;
 use lsp::{DiagnosticSeverity, LanguageServerId};
 use rpc::proto;
 use serde_json::Value;
@@ -173,11 +177,11 @@ pub fn serialize_selection(selection: &Selection<Anchor>) -> proto::Selection {
         id: selection.id as u64,
         start: Some(proto::EditorAnchor {
             anchor: Some(serialize_anchor(&selection.start)),
-            excerpt_id: 0,
+            excerpt_id: None,
         }),
         end: Some(proto::EditorAnchor {
             anchor: Some(serialize_anchor(&selection.end)),
-            excerpt_id: 0,
+            excerpt_id: None,
         }),
         reversed: selection.reversed,
     }
@@ -209,51 +213,67 @@ pub fn serialize_diagnostics<'a>(
 ) -> Vec<proto::Diagnostic> {
     diagnostics
         .into_iter()
-        .map(|entry| proto::Diagnostic {
-            source: entry.diagnostic.source.clone(),
-            source_kind: match entry.diagnostic.source_kind {
-                DiagnosticSourceKind::Pulled => proto::diagnostic::SourceKind::Pulled,
-                DiagnosticSourceKind::Pushed => proto::diagnostic::SourceKind::Pushed,
-                DiagnosticSourceKind::Other => proto::diagnostic::SourceKind::Other,
-            } as i32,
-            start: Some(serialize_anchor(&entry.range.start)),
-            end: Some(serialize_anchor(&entry.range.end)),
-            message: entry.diagnostic.message.clone(),
-            markdown: entry.diagnostic.markdown.clone(),
-            severity: match entry.diagnostic.severity {
-                DiagnosticSeverity::ERROR => proto::diagnostic::Severity::Error,
-                DiagnosticSeverity::WARNING => proto::diagnostic::Severity::Warning,
-                DiagnosticSeverity::INFORMATION => proto::diagnostic::Severity::Information,
-                DiagnosticSeverity::HINT => proto::diagnostic::Severity::Hint,
-                _ => proto::diagnostic::Severity::None,
-            } as i32,
-            group_id: entry.diagnostic.group_id as u64,
-            is_primary: entry.diagnostic.is_primary,
-            underline: entry.diagnostic.underline,
-            code: entry.diagnostic.code.as_ref().map(|s| s.to_string()),
-            code_description: entry
-                .diagnostic
-                .code_description
-                .as_ref()
-                .map(|s| s.to_string()),
-            is_disk_based: entry.diagnostic.is_disk_based,
-            is_unnecessary: entry.diagnostic.is_unnecessary,
-            data: entry.diagnostic.data.as_ref().map(|data| data.to_string()),
+        .map(|entry| {
+            let lsp_markup = entry.diagnostic.message.lsp_markup();
+            proto::Diagnostic {
+                source: entry.diagnostic.source.clone(),
+                source_kind: match entry.diagnostic.source_kind {
+                    DiagnosticSourceKind::Pulled => proto::diagnostic::SourceKind::Pulled,
+                    DiagnosticSourceKind::Pushed => proto::diagnostic::SourceKind::Pushed,
+                    DiagnosticSourceKind::Other => proto::diagnostic::SourceKind::Other,
+                } as i32,
+                start: Some(serialize_anchor(&entry.range.start)),
+                end: Some(serialize_anchor(&entry.range.end)),
+                message: entry.diagnostic.message.to_string(),
+                markdown: match lsp_markup {
+                    Some(_) => None,
+                    None => entry.diagnostic.message.markdown().map(ToOwned::to_owned),
+                },
+                markup_message_kind: lsp_markup.map(|(kind, _)| serialize_markup_kind(kind) as i32),
+                untrimmed_markup_message: lsp_markup.and_then(|(_, value)| {
+                    (value != entry.diagnostic.message.as_str()).then(|| value.to_string())
+                }),
+                severity: match entry.diagnostic.severity {
+                    DiagnosticSeverity::ERROR => proto::diagnostic::Severity::Error,
+                    DiagnosticSeverity::WARNING => proto::diagnostic::Severity::Warning,
+                    DiagnosticSeverity::INFORMATION => proto::diagnostic::Severity::Information,
+                    DiagnosticSeverity::HINT => proto::diagnostic::Severity::Hint,
+                    _ => proto::diagnostic::Severity::None,
+                } as i32,
+                group_id: entry.diagnostic.group_id as u64,
+                is_primary: entry.diagnostic.is_primary,
+                underline: entry.diagnostic.underline,
+                code: entry.diagnostic.code.as_ref().map(|s| s.to_string()),
+                code_description: entry
+                    .diagnostic
+                    .code_description
+                    .as_ref()
+                    .map(|s| s.to_string()),
+                is_disk_based: entry.diagnostic.is_disk_based,
+                is_unnecessary: entry.diagnostic.is_unnecessary,
+                data: entry.diagnostic.data.as_ref().map(|data| data.to_string()),
+                registration_id: entry
+                    .diagnostic
+                    .registration_id
+                    .as_ref()
+                    .map(ToString::to_string),
+            }
         })
         .collect()
 }
 
 /// Serializes an [`Anchor`] to be sent over RPC.
 pub fn serialize_anchor(anchor: &Anchor) -> proto::Anchor {
+    let timestamp = anchor.timestamp();
     proto::Anchor {
-        replica_id: anchor.timestamp.replica_id.as_u16() as u32,
-        timestamp: anchor.timestamp.value,
+        replica_id: timestamp.replica_id.as_u16() as u32,
+        timestamp: timestamp.value,
         offset: anchor.offset as u64,
         bias: match anchor.bias {
             Bias::Left => proto::Bias::Left as i32,
             Bias::Right => proto::Bias::Right as i32,
         },
-        buffer_id: anchor.buffer_id.map(Into::into),
+        buffer_id: Some(anchor.buffer_id.into()),
     }
 }
 
@@ -325,7 +345,8 @@ pub fn deserialize_operation(message: proto::Operation) -> Result<crate::Operati
                     selections: Arc::from(selections),
                     line_mode: message.line_mode,
                     cursor_shape: deserialize_cursor_shape(
-                        proto::CursorShape::from_i32(message.cursor_shape)
+                        proto::CursorShape::try_from(message.cursor_shape)
+                            .ok()
                             .context("Missing cursor shape")?,
                     ),
                 }
@@ -357,7 +378,8 @@ pub fn deserialize_operation(message: proto::Operation) -> Result<crate::Operati
                         value: message.lamport_timestamp,
                     },
                     line_ending: deserialize_line_ending(
-                        proto::LineEnding::from_i32(message.line_ending)
+                        proto::LineEnding::try_from(message.line_ending)
+                            .ok()
                             .context("missing line_ending")?,
                     ),
                 }
@@ -423,6 +445,20 @@ pub fn deserialize_selection(selection: proto::Selection) -> Option<Selection<An
     })
 }
 
+pub fn serialize_markup_kind(kind: &lsp::MarkupKind) -> proto::MarkupKind {
+    match kind {
+        lsp::MarkupKind::PlainText => proto::MarkupKind::PlainText,
+        lsp::MarkupKind::Markdown => proto::MarkupKind::Markdown,
+    }
+}
+
+pub fn deserialize_markup_kind(kind: i32) -> Option<lsp::MarkupKind> {
+    match proto::MarkupKind::try_from(kind).ok()? {
+        proto::MarkupKind::PlainText => Some(lsp::MarkupKind::PlainText),
+        proto::MarkupKind::Markdown => Some(lsp::MarkupKind::Markdown),
+    }
+}
+
 /// Deserializes a list of diagnostics from the RPC representation.
 pub fn deserialize_diagnostics(
     diagnostics: Vec<proto::Diagnostic>,
@@ -435,19 +471,35 @@ pub fn deserialize_diagnostics(
             } else {
                 None
             };
-            Some(DiagnosticEntry {
-                range: deserialize_anchor(diagnostic.start?)?..deserialize_anchor(diagnostic.end?)?,
-                diagnostic: Diagnostic {
+            let message = match diagnostic
+                .markup_message_kind
+                .and_then(deserialize_markup_kind)
+            {
+                Some(kind) => DiagnosticMessage::from_lsp_markup(&lsp::MarkupContent {
+                    kind,
+                    value: diagnostic
+                        .untrimmed_markup_message
+                        .unwrap_or(diagnostic.message),
+                }),
+                None => DiagnosticMessage::plain_with_adapter_markdown(
+                    diagnostic.message,
+                    diagnostic.markdown.map(SharedString::from),
+                ),
+            };
+            Some(DiagnosticEntry::new(
+                deserialize_anchor(diagnostic.start?)?..deserialize_anchor(diagnostic.end?)?,
+                Diagnostic {
                     source: diagnostic.source,
-                    severity: match proto::diagnostic::Severity::from_i32(diagnostic.severity)? {
+                    severity: match proto::diagnostic::Severity::try_from(diagnostic.severity)
+                        .ok()?
+                    {
                         proto::diagnostic::Severity::Error => DiagnosticSeverity::ERROR,
                         proto::diagnostic::Severity::Warning => DiagnosticSeverity::WARNING,
                         proto::diagnostic::Severity::Information => DiagnosticSeverity::INFORMATION,
                         proto::diagnostic::Severity::Hint => DiagnosticSeverity::HINT,
                         proto::diagnostic::Severity::None => return None,
                     },
-                    message: diagnostic.message,
-                    markdown: diagnostic.markdown,
+                    message,
                     group_id: diagnostic.group_id as usize,
                     code: diagnostic.code.map(lsp::NumberOrString::from_string),
                     code_description: diagnostic
@@ -457,16 +509,19 @@ pub fn deserialize_diagnostics(
                     is_disk_based: diagnostic.is_disk_based,
                     is_unnecessary: diagnostic.is_unnecessary,
                     underline: diagnostic.underline,
-                    source_kind: match proto::diagnostic::SourceKind::from_i32(
+                    registration_id: diagnostic.registration_id.map(SharedString::from),
+                    source_kind: match proto::diagnostic::SourceKind::try_from(
                         diagnostic.source_kind,
-                    )? {
+                    )
+                    .ok()?
+                    {
                         proto::diagnostic::SourceKind::Pulled => DiagnosticSourceKind::Pulled,
                         proto::diagnostic::SourceKind::Pushed => DiagnosticSourceKind::Pushed,
                         proto::diagnostic::SourceKind::Other => DiagnosticSourceKind::Other,
                     },
                     data,
                 },
-            })
+            ))
         })
         .collect()
 }
@@ -478,18 +533,20 @@ pub fn deserialize_anchor(anchor: proto::Anchor) -> Option<Anchor> {
     } else {
         None
     };
-    Some(Anchor {
-        timestamp: clock::Lamport {
-            replica_id: ReplicaId::new(anchor.replica_id as u16),
-            value: anchor.timestamp,
-        },
-        offset: anchor.offset as usize,
-        bias: match proto::Bias::from_i32(anchor.bias)? {
-            proto::Bias::Left => Bias::Left,
-            proto::Bias::Right => Bias::Right,
-        },
-        buffer_id,
-    })
+    let timestamp = clock::Lamport {
+        replica_id: ReplicaId::new(anchor.replica_id as u16),
+        value: anchor.timestamp,
+    };
+    let bias = match proto::Bias::try_from(anchor.bias).ok()? {
+        proto::Bias::Left => Bias::Left,
+        proto::Bias::Right => Bias::Right,
+    };
+    Some(Anchor::new(
+        timestamp,
+        anchor.offset as u32,
+        bias,
+        buffer_id?,
+    ))
 }
 
 /// Returns a `[clock::Lamport`] timestamp for the given [`proto::Operation`].

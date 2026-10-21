@@ -1,3 +1,8 @@
+---
+title: JavaScript
+description: "Configure JavaScript language support in Zed, including language servers, formatting, and debugging."
+---
+
 # JavaScript
 
 JavaScript support is available natively in Zed.
@@ -9,12 +14,30 @@ JavaScript support is available natively in Zed.
 
 ## Code formatting
 
-Formatting on save is enabled by default for JavaScript, using TypeScript's built-in code formatting.
-But many JavaScript projects use other command-line code-formatting tools, such as [Prettier](https://prettier.io/).
-You can use one of these tools by specifying an _external_ code formatter for JavaScript in your settings.
-See [the configuration docs](../configuring-zed.md) for more information.
+Formatting on save is disabled by default for JavaScript.
 
-For example, if you have Prettier installed and on your `PATH`, you can use it to format JavaScript files by adding the following to your `settings.json`:
+To turn `format-on-save` on, you can enable the setting globally or for `JavaScript` or `TypeScript` specifically.
+
+```json [settings]
+{
+  "languages": {
+    "JavaScript": {
+      "format_on_save": "on"
+    },
+    "TypeScript": {
+      "format_on_save": "on"
+    }
+  }
+}
+```
+
+Many JavaScript projects use command-line code-formatting tools, such as [Prettier](https://prettier.io/).
+You can use one of these tools by specifying an _external_ code formatter for JavaScript in your settings.
+See [the configuration docs](../reference/all-settings.md) for more information.
+
+For example, if you have Prettier installed and on your `PATH`, you can use it to format JavaScript files.
+
+Configure formatting in Settings ({#kb zed::OpenSettings}) under Languages > JavaScript, or add to your settings file:
 
 ```json [settings]
 {
@@ -44,7 +67,9 @@ Zed uses [tree-sitter/tree-sitter-jsdoc](https://github.com/tree-sitter/tree-sit
 
 ## ESLint
 
-You can configure Zed to format code using `eslint --fix` by running the ESLint code action when formatting:
+You can configure Zed to format code using `eslint --fix` by running the ESLint code action when formatting.
+
+Configure code actions on format in Settings ({#kb zed::OpenSettings}) under Languages > JavaScript, or add to your settings file:
 
 ```json [settings]
 {
@@ -82,12 +107,13 @@ You can also only execute a single ESLint rule when using `fixAll`:
 ```
 
 > **Note:** the other formatter you have configured will still run, after ESLint.
-> So if your language server or Prettier configuration don't format according to
+> So if your language server or Prettier configuration doesn't format according to
 > ESLint's rules, then they will overwrite what ESLint fixed and you end up with
 > errors.
 
-If you **only** want to run ESLint on save, you can configure code actions as
-the formatter:
+If you **only** want to run ESLint on save, you can configure code actions as the formatter.
+
+Configure in Settings ({#kb zed::OpenSettings}) under Languages > JavaScript, or add to your settings file:
 
 ```json [settings]
 {
@@ -175,6 +201,34 @@ You can configure ESLint's `workingDirectory` setting:
 }
 ```
 
+## Using the Tailwind CSS Language Server with JavaScript
+
+To get all the features (autocomplete, linting, etc.) from the [Tailwind CSS language server](https://github.com/tailwindlabs/tailwindcss-intellisense/tree/HEAD/packages/tailwindcss-language-server#readme) in vanilla JavaScript files (`.js`), you can customize the `classRegex` field under it in your `settings.json`:
+
+```json [settings]
+{
+  "lsp": {
+    "tailwindcss-language-server": {
+      "settings": {
+        "experimental": {
+          "classRegex": [
+            "\\.className\\s*[+]?=\\s*['\"]([^'\"]*)['\"]",
+            "\\.setAttributeNS\\(.*,\\s*['\"]class['\"],\\s*['\"]([^'\"]*)['\"]",
+            "\\.setAttribute\\(['\"]class['\"],\\s*['\"]([^'\"]*)['\"]",
+            "\\.classList\\.add\\(['\"]([^'\"]*)['\"]",
+            "\\.classList\\.remove\\(['\"]([^'\"]*)['\"]",
+            "\\.classList\\.toggle\\(['\"]([^'\"]*)['\"]",
+            "\\.classList\\.contains\\(['\"]([^'\"]*)['\"]",
+            "\\.classList\\.replace\\(\\s*['\"]([^'\"]*)['\"]",
+            "\\.classList\\.replace\\([^,)]+,\\s*['\"]([^'\"]*)['\"]"
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
 ## Debugging
 
 Zed supports debugging JavaScript code out of the box with `vscode-js-debug`.
@@ -183,10 +237,10 @@ The following can be debugged without writing additional configuration:
 - Tasks from `package.json`
 - Tests written using several popular frameworks (Jest, Mocha, Vitest, Jasmine, Bun, Node)
 
-Run {#action debugger::Start} ({#kb debugger::Start}) to see a contextual list of these predefined debug tasks.
+Run {#action debugger::Start} ({#kb debugger::Start}) to see a contextual list of these predefined [debug tasks](../debugger.md).
 
 > **Note:** Bun test is automatically detected when `@types/bun` is present in `package.json`.
->
+
 > **Note:** Node test is automatically detected when `@types/node` is present in `package.json` (requires Node.js 20+).
 
 As for all languages, configurations from `.vscode/launch.json` are also available for debugging in Zed.

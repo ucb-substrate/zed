@@ -1,3 +1,8 @@
+---
+title: Language Extensions
+description: "Overview of programming language support in Zed, including built-in and extension-based languages."
+---
+
 # Language Extensions
 
 Language support in Zed has several components:
@@ -26,7 +31,7 @@ line_comments = ["# "]
 - `line_comments` is an array of strings that are used to identify line comments in the language. This is used for the `editor::ToggleComments` keybind: {#kb editor::ToggleComments} for toggling lines of code.
 - `tab_size` defines the indentation/tab size used for this language (default is `4`).
 - `hard_tabs` whether to indent with tabs (`true`) or spaces (`false`, the default).
-- `first_line_pattern` is a regular expression, that in addition to `path_suffixes` (above) or `file_types` in settings can be used to match files which should use this language. For example Zed uses this to identify Shell Scripts by matching the [shebangs lines](https://github.com/zed-industries/zed/blob/main/crates/languages/src/bash/config.toml) in the first line of a script.
+- `first_line_pattern` is a regular expression that can be used alongside `path_suffixes` (above) or `file_types` in settings to match files that should use this language. For example, Zed uses this to identify Shell Scripts by matching [shebang lines](https://github.com/zed-industries/zed/blob/main/crates/grammars/src/bash/config.toml) in the first line of a script.
 - `debuggers` is an array of strings that are used to identify debuggers in the language. When launching a debugger's `New Process Modal`, Zed will order available debuggers by the order of entries in this array.
 
 <!--
@@ -39,7 +44,6 @@ TBD: Document `language_name/config.toml` keys
 - opt_into_language_servers
 - code_fence_block_name
 - scope_opt_in_language_servers
-- increase_indent_pattern, decrease_indent_pattern
 - collapsed_placeholder
 - auto_indent_on_paste, auto_indent_using_last_non_empty_line
 - overrides: `[overrides.element]`, `[overrides.string]`
@@ -47,7 +51,7 @@ TBD: Document `language_name/config.toml` keys
 
 ## Grammar
 
-Zed uses the [Tree-sitter](https://tree-sitter.github.io) parsing library to provide built-in language-specific features. There are grammars available for many languages, and you can also [develop your own grammar](https://tree-sitter.github.io/tree-sitter/creating-parsers#writing-the-grammar). A growing list of Zed features are built using pattern matching over syntax trees with Tree-sitter queries. As mentioned above, every language that is defined in an extension must specify the name of a Tree-sitter grammar that is used for parsing. These grammars are then registered separately in extensions' `extension.toml` file, like this:
+Zed uses the [Tree-sitter](https://tree-sitter.github.io) parsing library to provide built-in language-specific features. There are grammars available for many languages, and you can also [develop your own grammar](https://tree-sitter.github.io/tree-sitter/creating-parsers/3-writing-the-grammar.html). A growing list of Zed features are built using pattern matching over syntax trees with Tree-sitter queries. As mentioned above, every language that is defined in an extension must specify the name of a Tree-sitter grammar that is used for parsing. These grammars are then registered separately in extensions' `extension.toml` file, like this:
 
 ```toml
 [grammars.gleam]
@@ -72,7 +76,7 @@ several features:
 - Runnable code detection
 - Selecting classes, functions, etc.
 
-The following sections elaborate on how [Tree-sitter queries](https://tree-sitter.github.io/tree-sitter/using-parsers#query-syntax) enable these
+The following sections elaborate on how [Tree-sitter queries](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/index.html) enable these
 features in Zed, using [JSON syntax](https://www.json.org/json-en.html) as a guiding example.
 
 ### Syntax highlighting
@@ -90,7 +94,7 @@ Here's an example from a `highlights.scm` for JSON:
 (number) @number
 ```
 
-This query marks strings, object keys, and numbers for highlighting. The following is a comprehensive list of captures supported by themes:
+This query marks strings, object keys, and numbers for highlighting. The following is the full list of captures supported by themes:
 
 | Capture                  | Description                            |
 | ------------------------ | -------------------------------------- |
@@ -99,6 +103,7 @@ This query marks strings, object keys, and numbers for highlighting. The followi
 | @comment                 | Captures comments                      |
 | @comment.doc             | Captures documentation comments        |
 | @constant                | Captures constants                     |
+| @constant.builtin        | Captures built-in constants            |
 | @constructor             | Captures constructors                  |
 | @embedded                | Captures embedded content              |
 | @emphasis                | Captures emphasized text               |
@@ -131,9 +136,26 @@ This query marks strings, object keys, and numbers for highlighting. The followi
 | @text.literal            | Captures literal text                  |
 | @title                   | Captures titles                        |
 | @type                    | Captures types                         |
+| @type.builtin            | Captures built-in types                |
 | @variable                | Captures variables                     |
 | @variable.special        | Captures special variables             |
+| @variable.parameter      | Captures function/method parameters    |
 | @variant                 | Captures variants                      |
+
+#### Fallback captures
+
+A single Tree-sitter pattern can specify multiple captures on the same node to define fallback highlights.
+Zed resolves them right-to-left: It first tries the rightmost capture, and if the current theme has no style for it, falls back to the next capture to the left, and so on.
+
+For example:
+
+```scheme
+(type_identifier) @type @variable
+```
+
+Here Zed will first try to resolve `@variable` from the theme. If the theme defines a style for `@variable`, that style is used. Otherwise, Zed falls back to `@type`.
+
+This is useful when a language wants to provide a preferred highlight that not all themes may support, while still falling back to a more common capture that most themes define.
 
 ### Bracket matching
 
@@ -189,19 +211,96 @@ This query captures object keys for the outline structure.
 
 The `indents.scm` file defines indentation rules.
 
-Here's an example from an `indents.scm` file for JSON:
+#### Indenting and outdenting based on syntax
+
+| Capture  | Description                                                            |
+| -------- | ---------------------------------------------------------------------- |
+| @indent  | Defines an indentation range using the captured node                   |
+| @start   | Moves the start of an `@indent` range to the end of the captured node  |
+| @end     | Moves the end of an `@indent` range to the start of the captured node  |
+| @outdent | Ends the innermost indentation range at the start of the captured node |
+
+For example, to indent all of an `if_statement` node's contents:
 
 ```scheme
-(array "]" @end) @indent
-(object "}" @end) @indent
+(if_statement) @indent
 ```
 
-This query marks the end of arrays and objects for indentation purposes.
+The indentation range runs from the start of the node to its end.
 
-| Capture | Description                                        |
-| ------- | -------------------------------------------------- |
-| @end    | Captures closing brackets and braces               |
-| @indent | Captures entire arrays and objects for indentation |
+An HTML element includes its opening and closing tags. To indent only the
+content between them:
+
+```scheme
+(element
+  (start_tag) @start ; Begin indentation after the opening tag
+  (end_tag)? @end) @indent ; End indentation before the closing tag
+```
+
+A subsequent case label must outdent from the preceding case body so that
+sibling labels stay aligned:
+
+```scheme
+(compound_statement
+  (case_statement
+    ":" @start) ; Begin indenting the case body
+  "}" @end) @indent
+
+(compound_statement
+  (case_statement)
+  (case_statement) @outdent) ; Align subsequent case labels
+```
+
+#### Indenting and outdenting based on line patterns
+
+Use these `config.toml` options for indentation rules that match line contents
+instead of syntax nodes:
+
+| Option                     | Description                                                              |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `increase_indent_pattern`  | A matching line indents the following line by one level                  |
+| `decrease_indent_pattern`  | A matching line outdents by one level without considering syntax context |
+| `decrease_indent_patterns` | A matching line aligns with an allowed earlier syntax construct          |
+
+For example, to indent after a line ending in `:`:
+
+```toml
+increase_indent_pattern = ":\\s*$"
+```
+
+For example, to outdent lines beginning with `end`:
+
+```toml
+decrease_indent_pattern = "^\\s*end\\b"
+```
+
+#### Aligning clauses with related blocks
+
+Use `decrease_indent_patterns` when a line should align with a related block
+instead of always moving left by one level. In `indents.scm`, mark the block
+start with a named `@start.<name>` capture:
+
+```scheme
+(if_statement) @start.if
+```
+
+In `config.toml`, list the capture suffix in `valid_after`:
+
+```toml
+decrease_indent_patterns = [
+  { pattern = "^\\s*else\\b", valid_after = ["if"] },
+]
+```
+
+A line beginning with `else` aligns with the most recent `@start.if` at the same
+or a lower indentation level. If Zed finds no matching block, it leaves the
+indentation unchanged.
+
+Named captures such as `@start.if` mark blocks for these rules. Unlike
+`@start`, they do not change an `@indent` range.
+
+Zed checks rules in order and stops after the first matching `pattern`. Put
+more specific patterns before overlapping general patterns.
 
 ### Code injections
 
@@ -234,7 +333,7 @@ The `overrides.scm` file defines syntactic _scopes_ that can be used to override
 
 For example, there is a language-specific setting called `word_characters` that controls which non-alphabetic characters are considered part of a word, for example when you double click to select a variable. In JavaScript, "$" and "#" are considered word characters.
 
-There is also a language-specific setting called `completion_query_characters` that controls which characters trigger autocomplete suggestions. In JavaScript, when your cursor is within a _string_, "-" is should be considered a completion query character. To achieve this, the JavaScript `overrides.scm` file contains the following pattern:
+There is also a language-specific setting called `completion_query_characters` that controls which characters trigger autocomplete suggestions. In JavaScript, when your cursor is within a _string_, `-` should be considered a completion query character. To achieve this, the JavaScript `overrides.scm` file contains the following pattern:
 
 ```scheme
 [
@@ -263,7 +362,7 @@ brackets = [
 
 #### Range inclusivity
 
-By default, the ranges defined in `overrides.scm` are _exclusive_. So in the case above, if you cursor was _outside_ the quotation marks delimiting the string, the `string` scope would not take effect. Sometimes, you may want to make the range _inclusive_. You can do this by adding the `.inclusive` suffix to the capture name in the query.
+By default, the ranges defined in `overrides.scm` are _exclusive_. So in the case above, if your cursor was _outside_ the quotation marks delimiting the string, the `string` scope would not take effect. Sometimes, you may want to make the range _inclusive_. You can do this by adding the `.inclusive` suffix to the capture name in the query.
 
 For example, in JavaScript, we also disable auto-closing of single quotes within comments. And the comment scope must extend all the way to the newline after a line comment. To achieve this, the JavaScript `overrides.scm` contains the following pattern:
 
@@ -273,15 +372,15 @@ For example, in JavaScript, we also disable auto-closing of single quotes within
 
 ### Text objects
 
-The `textobjects.scm` file defines rules for navigating by text objects. This was added in Zed v0.165 and is currently used only in Vim mode.
+The `textobjects.scm` file defines rules for navigating by text objects. This was added in Zed v0.165 and is currently used only in [Vim mode](../vim.md).
 
 Vim provides two levels of granularity for navigating around files. Section-by-section with `[]` etc., and method-by-method with `]m` etc. Even languages that don't support functions and classes can work well by defining similar concepts. For example CSS defines a rule-set as a method, and a media-query as a class.
 
-For languages with closures, these typically should not count as functions in Zed. This is best-effort however, as languages like JavaScript do not syntactically differentiate syntactically between closures and top-level function declarations.
+For languages with closures, these typically should not count as functions in Zed. This is best-effort, however, because languages like JavaScript do not syntactically differentiate between closures and top-level function declarations.
 
 For languages with declarations like C, provide queries that match `@class.around` or `@function.around`. The `if` and `ic` text objects will default to these if there is no inside.
 
-If you are not sure what to put in textobjects.scm, both [nvim-treesitter-textobjects](https://github.com/nvim-treesitter/nvim-treesitter-textobjects), and the [Helix editor](https://github.com/helix-editor/helix) have queries for many languages. You can refer to the Zed [built-in languages](https://github.com/zed-industries/zed/tree/main/crates/languages/src) to see how to adapt these.
+If you are not sure what to put in textobjects.scm, both [nvim-treesitter-textobjects](https://github.com/nvim-treesitter/nvim-treesitter-textobjects), and the [Helix editor](https://github.com/helix-editor/helix) have queries for many languages. You can refer to the Zed [built-in languages](https://github.com/zed-industries/zed/tree/main/crates/grammars/src) to see how to adapt these.
 
 | Capture          | Description                                                             | Vim mode                                         |
 | ---------------- | ----------------------------------------------------------------------- | ------------------------------------------------ |
@@ -400,7 +499,139 @@ impl zed::Extension for MyExtension {
 }
 ```
 
+### Opt-In Language Servers
+
+If your extension ships a language server that users should only run when they opt in (for example, an alternative to the primary language server), list the languages it should not start for by default in `opt_in_languages`. Every language listed there must also be listed in `languages`:
+
+```toml
+[language_servers.my-alternative-server]
+name = "My Alternative LSP"
+languages = ["My Language", "My Other Language"]
+opt_in_languages = ["My Language"]
+```
+
+For the languages listed in `opt_in_languages`, the language server is not covered by the `"..."` wildcard in the [`language_servers`](../configuring-languages.md#choosing-language-servers) setting. Users enable it by naming it explicitly:
+
+```json [settings]
+{
+  "languages": {
+    "My Language": {
+      "language_servers": ["my-alternative-server", "..."]
+    }
+  }
+}
+```
+
+> **Note:** Versions of Zed that do not support `opt_in_languages` ignore it and start the language server for all of its `languages`.
+
 You can customize the handling of the language server using several optional methods in the `Extension` trait. For example, you can control how completions are styled using the `label_for_completion` method. For a complete list of methods, see the [API docs for the Zed extension API](https://docs.rs/zed_extension_api).
+
+### Syntax Highlighting with Semantic Tokens
+
+Zed supports syntax highlighting using [semantic tokens](../semantic-tokens.md) from the attached language servers. This is currently disabled by default, but can be enabled in your settings file:
+
+```json [settings]
+{
+  // Enable semantic tokens globally, backed by tree-sitter highlights for each language:
+  "semantic_tokens": "combined",
+  // Or, specify per-language:
+  "languages": {
+    "Rust": {
+      // No tree-sitter, only LSP semantic tokens:
+      "semantic_tokens": "full"
+    }
+  }
+}
+```
+
+The `semantic_tokens` setting accepts the following values:
+
+- `"off"` (default): Do not request semantic tokens from language servers.
+- `"combined"`: Use LSP semantic tokens together with tree-sitter highlighting.
+- `"full"`: Use LSP semantic tokens exclusively, replacing tree-sitter highlighting.
+
+#### Extension-Provided Semantic Token Rules
+
+Language extensions can ship default semantic token rules for their language server's custom token types. To do this, place a `semantic_token_rules.json` file in the language directory alongside `config.toml`:
+
+```
+my-extension/
+  languages/
+    my-language/
+      config.toml
+      highlights.scm
+      semantic_token_rules.json
+```
+
+The file uses the same format as the `semantic_token_rules` array in user settings — a JSON array of rule objects:
+
+```json
+[
+  {
+    "token_type": "lifetime",
+    "style": ["lifetime"]
+  },
+  {
+    "token_type": "builtinType",
+    "style": ["type"]
+  },
+  {
+    "token_type": "selfKeyword",
+    "style": ["variable.special"]
+  }
+]
+```
+
+This is useful when a language server reports custom (non-standard) semantic token types that aren't covered by Zed's built-in default rules. Extension-provided rules act as sensible defaults for that language — users can always override them via `semantic_token_rules` in their settings file, and built-in default rules are only used when neither user nor extension rules match.
+
+#### Customizing Semantic Token Styles
+
+Zed supports customizing the styles used for semantic tokens. You can define rules in your settings file, which customize how semantic tokens get mapped to styles in your theme.
+
+```json [settings]
+{
+  "global_lsp_settings": {
+    "semantic_token_rules": [
+      {
+        // Highlight macros as keywords.
+        "token_type": "macro",
+        "style": ["syntax.keyword"]
+      },
+      {
+        // Highlight unresolved references in bold red.
+        "token_type": "unresolvedReference",
+        "foreground_color": "#c93f3f",
+        "font_weight": "bold"
+      },
+      {
+        // Underline all mutable variables/references/etc.
+        "token_modifiers": ["mutable"],
+        "underline": true
+      }
+    ]
+  }
+}
+```
+
+All rules that match a given `token_type` and `token_modifiers` are applied. Earlier rules take precedence. If no rules match, the token is not highlighted.
+
+Rules are applied in the following priority order (highest to lowest):
+
+1. **User settings** — rules from `semantic_token_rules` in your settings file.
+2. **Extension rules** — rules from `semantic_token_rules.json` in extension language directories.
+3. **Default rules** — Zed's built-in rules for standard LSP token types.
+
+Each rule in the `semantic_token_rules` array is defined as follows:
+
+- `token_type`: The semantic token type as defined by the [LSP specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_semanticTokens). If omitted, the rule matches all token types.
+- `token_modifiers`: A list of semantic token modifiers to match. All modifiers must be present to match.
+- `style`: A list of styles from the current syntax theme to use. The first style found is used. Any settings below override that style.
+- `foreground_color`: The foreground color to use for the token type, in hex format (e.g., `"#ff0000"`).
+- `background_color`: The background color to use for the token type, in hex format (e.g., `"#ff0000"`).
+- `underline`: A boolean or color to underline with, in hex format. If `true`, then the token will be underlined with the text color.
+- `strikethrough`: A boolean or color to strikethrough with, in hex format. If `true`, then the token will have a strikethrough with the text color.
+- `font_weight`: One of `"normal"`, `"bold"`.
+- `font_style`: One of `"normal"`, `"italic"`.
 
 ### Multi-Language Support
 

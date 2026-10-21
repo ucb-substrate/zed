@@ -10,13 +10,15 @@ workspace = true
 
 [lib]
 path = "src/snippets_ui.rs"
+test = false
+doctest = false
 
 [dependencies]
-file_finder.workspace = true
 file_icons.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
 language.workspace = true
+open_path_prompt.workspace = true
 paths.workspace = true
 picker.workspace = true
 settings.workspace = true

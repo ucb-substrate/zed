@@ -8,8 +8,9 @@ use dap::{
 use editor::Editor;
 use gpui::{
     Action, AnyElement, ClickEvent, ClipboardItem, Context, DismissEvent, Empty, Entity,
-    FocusHandle, Focusable, Hsla, MouseDownEvent, Point, Subscription, TextStyleRefinement,
-    UniformListScrollHandle, WeakEntity, actions, anchored, deferred, uniform_list,
+    FocusHandle, Focusable, Hsla, MouseDownEvent, Point, Subscription, TaskExt,
+    TextStyleRefinement, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
+    uniform_list,
 };
 use itertools::Itertools;
 use menu::{SelectFirst, SelectLast, SelectNext, SelectPrevious};
@@ -217,6 +218,12 @@ impl VariableList {
         let _subscriptions = vec![
             cx.subscribe(&stack_frame_list, Self::handle_stack_frame_list_events),
             cx.subscribe(&session, |this, _, event, cx| match event {
+                SessionEvent::HistoricSnapshotSelected => {
+                    this.selection.take();
+                    this.edited_path.take();
+                    this.selected_stack_frame_id.take();
+                    this.build_entries(cx);
+                }
                 SessionEvent::Stopped(_) => {
                     this.selection.take();
                     this.edited_path.take();
@@ -225,7 +232,6 @@ impl VariableList {
                 SessionEvent::Variables | SessionEvent::Watchers => {
                     this.build_entries(cx);
                 }
-
                 _ => {}
             }),
             cx.on_focus_out(&focus_handle, window, |this, _, _, cx| {
@@ -292,9 +298,10 @@ impl VariableList {
                     contains_local_scope = true;
                 }
 
-                self.session.update(cx, |session, cx| {
-                    !session.variables(scope.variables_reference, cx).is_empty()
-                })
+                scope.expensive
+                    || self.session.update(cx, |session, cx| {
+                        !session.variables(scope.variables_reference, cx).is_empty()
+                    })
             })
             .map(|scope| {
                 (
@@ -341,12 +348,13 @@ impl VariableList {
                 .or_insert(EntryState {
                     depth: path.indices.len(),
                     is_expanded: dap_kind.as_scope().is_some_and(|scope| {
-                        (scopes_count == 1 && !contains_local_scope)
-                            || scope
-                                .presentation_hint
-                                .as_ref()
-                                .map(|hint| *hint == ScopePresentationHint::Locals)
-                                .unwrap_or(scope.name.to_lowercase().starts_with("local"))
+                        !scope.expensive
+                            && ((scopes_count == 1 && !contains_local_scope)
+                                || scope
+                                    .presentation_hint
+                                    .as_ref()
+                                    .map(|hint| *hint == ScopePresentationHint::Locals)
+                                    .unwrap_or(scope.name.to_lowercase().starts_with("local")))
                     }),
                     parent_reference: container_reference,
                     has_children: variables_reference != 0,
@@ -524,7 +532,7 @@ impl VariableList {
 
     fn cancel(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.edited_path.take();
-        self.focus_handle.focus(window);
+        self.focus_handle.focus(window, cx);
         cx.notify();
     }
 
@@ -881,13 +889,30 @@ impl VariableList {
             return;
         };
 
-        let variable_value = match &entry.entry {
-            DapEntry::Variable(dap) => dap.value.clone(),
-            DapEntry::Watcher(watcher) => watcher.value.to_string(),
+        match &entry.entry {
+            DapEntry::Variable(dap) => {
+                let fallback_value = dap.value.clone();
+                let expression = dap
+                    .evaluate_name
+                    .clone()
+                    .unwrap_or_else(|| dap.name.clone());
+                let frame_id = self.selected_stack_frame_id;
+                let task = self.session.update(cx, |session, cx| {
+                    session.evaluate_variable_value(expression, frame_id, cx)
+                });
+                cx.spawn(async move |_, cx| {
+                    let value = task.await.unwrap_or(fallback_value);
+                    cx.update(|cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(value));
+                    });
+                })
+                .detach();
+            }
+            DapEntry::Watcher(watcher) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(watcher.value.to_string()));
+            }
             DapEntry::Scope(_) => return,
-        };
-
-        cx.write_to_clipboard(ClipboardItem::new_string(variable_value));
+        }
     }
 
     fn edit_variable(&mut self, _: &EditVariable, window: &mut Window, cx: &mut Context<Self>) {
@@ -1062,16 +1087,23 @@ impl VariableList {
             editor.select_all(&editor::actions::SelectAll, window, cx);
             editor
         });
-        editor.focus_handle(cx).focus(window);
+        editor.focus_handle(cx).focus(window, cx);
         editor
     }
 
     fn variable_color(
         &self,
         presentation_hint: Option<&VariablePresentationHint>,
+        value: &str,
+        type_hint: Option<&str>,
         cx: &Context<Self>,
     ) -> VariableColor {
-        let syntax_color_for = |name| cx.theme().syntax().get(name).color;
+        let syntax_color_for = |name| {
+            cx.theme()
+                .syntax()
+                .style_for_name(name)
+                .and_then(|style| style.color)
+        };
         let name = if self.disabled {
             Some(Color::Disabled.color(cx))
         } else {
@@ -1091,9 +1123,43 @@ impl VariableList {
         let value = self
             .disabled
             .then(|| Color::Disabled.color(cx))
-            .or_else(|| syntax_color_for("variable.special"));
+            .or_else(|| {
+                syntax_color_for(Self::syntax_token_for_value(value, type_hint))
+                    .or_else(|| syntax_color_for("variable.special"))
+            });
 
         VariableColor { name, value }
+    }
+
+    // pattern match by variable value as types are called different things
+    fn syntax_token_for_value(value: &str, type_hint: Option<&str>) -> &'static str {
+        if let Some(hint) = type_hint {
+            match hint.trim().to_ascii_lowercase().as_str() {
+                "bool" | "boolean" => return "boolean",
+                "nonetype" | "null" | "nil" | "none" | "undefined" | "void" => return "comment",
+                "str" | "string" | "char" | "&str" | "string_view" | "std::string" => {
+                    return "string";
+                }
+                "int" | "integer" | "long" | "short" | "byte" | "float" | "double" | "number"
+                | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32"
+                | "uint64" | "usize" | "isize" | "size_t" | "f32" | "f64" => return "number",
+                _ => {}
+            }
+        }
+
+        let trimmed = value.trim();
+        let is_quoted = |quote: char| {
+            trimmed.len() >= 2 && trimmed.starts_with(quote) && trimmed.ends_with(quote)
+        };
+        if is_quoted('"') || is_quoted('\'') {
+            return "string";
+        }
+        match trimmed {
+            "true" | "false" | "True" | "False" | "TRUE" | "FALSE" => "boolean",
+            "nil" | "null" | "None" | "NULL" | "nullptr" | "undefined" | "NoneType" => "comment",
+            _ if !trimmed.is_empty() && trimmed.parse::<f64>().is_ok() => "number",
+            _ => "variable.special",
+        }
     }
 
     fn render_variable_value(
@@ -1145,14 +1211,26 @@ impl VariableList {
                                 },
                             )
                             .child(
-                                Label::new(format!("=  {}", &value))
-                                    .single_line()
-                                    .truncate()
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .when_some(variable_color.value, |this, color| {
-                                        this.color(Color::from(color))
-                                    }),
+                                h_flex()
+                                    .min_w_0()
+                                    .child(
+                                        Label::new("=  ")
+                                            .single_line()
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .flex_shrink_0(),
+                                    )
+                                    .child(
+                                        Label::new(value.clone())
+                                            .single_line()
+                                            .truncate()
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .when_some(variable_color.value, |this, color| {
+                                                this.color(Color::from(color))
+                                            })
+                                            .flex_1(),
+                                    ),
                             )
                             .tooltip(Tooltip::text(value))
                     }
@@ -1216,7 +1294,8 @@ impl VariableList {
             return div().into_any_element();
         };
 
-        let variable_color = self.variable_color(watcher.presentation_hint.as_ref(), cx);
+        let variable_color =
+            self.variable_color(watcher.presentation_hint.as_ref(), &watcher.value, None, cx);
 
         let is_selected = self
             .selection
@@ -1426,7 +1505,12 @@ impl VariableList {
             return div().into_any_element();
         };
 
-        let variable_color = self.variable_color(dap.presentation_hint.as_ref(), cx);
+        let variable_color = self.variable_color(
+            dap.presentation_hint.as_ref(),
+            &dap.value,
+            dap.type_.as_deref(),
+            cx,
+        );
 
         let var_ref = dap.variables_reference;
         let colors = get_entry_color(cx);
@@ -1557,27 +1641,27 @@ impl Render for VariableList {
                         this.render_entries(range, window, cx)
                     }),
                 )
-                .track_scroll(self.list_handle.clone())
+                .track_scroll(&self.list_handle)
                 .with_width_from_item(self.max_width_index)
                 .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
                 .with_horizontal_sizing_behavior(gpui::ListHorizontalSizingBehavior::Unconstrained)
                 .gap_1_5()
                 .size_full()
-                .flex_grow(),
+                .flex_grow_1(),
             )
             .children(self.open_context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
                         .position(*position)
-                        .anchor(gpui::Corner::TopLeft)
+                        .anchor(gpui::Anchor::TopLeft)
                         .child(menu.clone()),
                 )
                 .with_priority(1)
             }))
-            // .vertical_scrollbar_for(self.list_handle.clone(), window, cx)
+            // .vertical_scrollbar_for(&self.list_handle, window, cx)
             .custom_scrollbars(
                 ui::Scrollbars::new(ScrollAxes::Both)
-                    .tracked_scroll_handle(self.list_handle.clone())
+                    .tracked_scroll_handle(&self.list_handle)
                     .with_track_along(ScrollAxes::Both, cx.theme().colors().panel_background)
                     .tracked_entity(cx.entity_id()),
                 window,

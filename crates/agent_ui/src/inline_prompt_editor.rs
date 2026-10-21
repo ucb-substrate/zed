@@ -1,4 +1,5 @@
-use agent::HistoryStore;
+use agent::ThreadStore;
+use agent_settings::AgentSettings;
 use collections::{HashMap, VecDeque};
 use editor::actions::Paste;
 use editor::code_context_menus::CodeContextMenu;
@@ -6,44 +7,61 @@ use editor::display_map::{CreaseId, EditorMargins};
 use editor::{AnchorRangeExt as _, MultiBufferOffset, ToOffset as _};
 use editor::{
     ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode, EditorStyle, MultiBuffer,
-    actions::{MoveDown, MoveUp},
 };
 use fs::Fs;
 use gpui::{
-    AnyElement, App, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, TextStyle, WeakEntity, Window,
+    AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Subscription, TextStyle, TextStyleRefinement, WeakEntity, Window, actions,
 };
 use language_model::{LanguageModel, LanguageModelRegistry};
+use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownStyle};
 use parking_lot::Mutex;
 use project::Project;
-use prompt_store::PromptStore;
 use settings::Settings;
 use std::cmp;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
-use theme::ThemeSettings;
+use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{IconButtonShape, KeyBinding, PopoverMenuHandle, Tooltip, prelude::*};
-use workspace::Workspace;
-use zed_actions::agent::ToggleModelSelector;
+use uuid::Uuid;
+use workspace::notifications::NotificationId;
+use workspace::{Toast, Workspace};
+use zed_actions::{
+    agent::ToggleModelSelector,
+    editor::{MoveDown, MoveUp},
+};
 
 use crate::agent_model_selector::AgentModelSelector;
-use crate::buffer_codegen::BufferCodegen;
+use crate::buffer_codegen::{BufferCodegen, CodegenAlternative};
 use crate::completion_provider::{
     PromptCompletionProvider, PromptCompletionProviderDelegate, PromptContextType,
 };
 use crate::mention_set::paste_images_as_context;
 use crate::mention_set::{MentionSet, crease_for_mention};
 use crate::terminal_codegen::TerminalCodegen;
-use crate::{CycleNextInlineAssist, CyclePreviousInlineAssist, ModelUsageContext};
+use crate::{
+    CycleFavoriteModels, CycleNextInlineAssist, CyclePreviousInlineAssist, ModelUsageContext,
+};
+
+actions!(inline_assistant, [ThumbsUpResult, ThumbsDownResult]);
+
+enum CompletionState {
+    Pending,
+    Generated { completion_text: Option<String> },
+    Rated,
+}
+
+struct SessionState {
+    session_id: Uuid,
+    completion: CompletionState,
+}
 
 pub struct PromptEditor<T> {
     pub editor: Entity<Editor>,
     mode: PromptEditorMode,
     mention_set: Entity<MentionSet>,
-    history_store: Entity<HistoryStore>,
-    prompt_store: Option<Entity<PromptStore>>,
     workspace: WeakEntity<Workspace>,
     model_selector: Entity<AgentModelSelector>,
     edited_since_done: bool,
@@ -53,6 +71,7 @@ pub struct PromptEditor<T> {
     _codegen_subscription: Subscription,
     editor_subscriptions: Vec<Subscription>,
     show_rate_limit_notice: bool,
+    session_state: SessionState,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -65,7 +84,7 @@ impl<T: 'static> Render for PromptEditor<T> {
 
         const RIGHT_PADDING: Pixels = px(9.);
 
-        let (left_gutter_width, right_padding) = match &self.mode {
+        let (left_gutter_width, right_padding, explanation) = match &self.mode {
             PromptEditorMode::Buffer {
                 id: _,
                 codegen,
@@ -83,17 +102,23 @@ impl<T: 'static> Render for PromptEditor<T> {
                 let left_gutter_width = gutter.full_width() + (gutter.margin / 2.0);
                 let right_padding = editor_margins.right + RIGHT_PADDING;
 
-                (left_gutter_width, right_padding)
+                let active_alternative = codegen.active_alternative().read(cx);
+                let explanation = active_alternative
+                    .description
+                    .clone()
+                    .or_else(|| active_alternative.failure.clone());
+
+                (left_gutter_width, right_padding, explanation)
             }
             PromptEditorMode::Terminal { .. } => {
                 // Give the equivalent of the same left-padding that we're using on the right
-                (Pixels::from(40.0), Pixels::from(24.))
+                (Pixels::from(40.0), Pixels::from(24.), None)
             }
         };
 
         let bottom_padding = match &self.mode {
-            PromptEditorMode::Buffer { .. } => rems_from_px(2.0),
-            PromptEditorMode::Terminal { .. } => rems_from_px(8.0),
+            PromptEditorMode::Buffer { .. } => rems_from_px(2.0_f32),
+            PromptEditorMode::Terminal { .. } => rems_from_px(4.0_f32),
         };
 
         buttons.extend(self.render_buttons(window, cx));
@@ -111,42 +136,61 @@ impl<T: 'static> Render for PromptEditor<T> {
                 this.trigger_completion_menu(window, cx);
             }));
 
+        let markdown = window.use_state(cx, |_, cx| Markdown::new("".into(), None, None, cx));
+
+        if let Some(explanation) = &explanation {
+            markdown.update(cx, |markdown, cx| {
+                markdown.reset(SharedString::from(explanation), cx);
+            });
+        }
+
+        let explanation_label = self
+            .render_markdown(markdown, markdown_style(window, cx))
+            .into_any_element();
+
         v_flex()
-            .key_context("PromptEditor")
+            .key_context("InlineAssistant")
             .capture_action(cx.listener(Self::paste))
-            .bg(cx.theme().colors().editor_background)
             .block_mouse_except_scroll()
-            .gap_0p5()
-            .border_y_1()
-            .border_color(cx.theme().status().info_border)
             .size_full()
             .pt_0p5()
             .pb(bottom_padding)
             .pr(right_padding)
+            .gap_0p5()
+            .justify_center()
+            .border_y_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().editor_background)
             .child(
                 h_flex()
-                    .items_start()
-                    .cursor(CursorStyle::Arrow)
+                    .on_action(cx.listener(Self::confirm))
+                    .on_action(cx.listener(Self::secondary_confirm))
+                    .on_action(cx.listener(Self::cancel))
+                    .on_action(cx.listener(Self::move_up))
+                    .on_action(cx.listener(Self::move_down))
+                    .on_action(cx.listener(Self::thumbs_up))
+                    .on_action(cx.listener(Self::thumbs_down))
+                    .capture_action(cx.listener(Self::cycle_prev))
+                    .capture_action(cx.listener(Self::cycle_next))
                     .on_action(cx.listener(|this, _: &ToggleModelSelector, window, cx| {
                         this.model_selector
                             .update(cx, |model_selector, cx| model_selector.toggle(window, cx));
                     }))
-                    .on_action(cx.listener(Self::confirm))
-                    .on_action(cx.listener(Self::cancel))
-                    .on_action(cx.listener(Self::move_up))
-                    .on_action(cx.listener(Self::move_down))
-                    .capture_action(cx.listener(Self::cycle_prev))
-                    .capture_action(cx.listener(Self::cycle_next))
+                    .on_action(cx.listener(|this, _: &CycleFavoriteModels, window, cx| {
+                        this.model_selector.update(cx, |model_selector, cx| {
+                            model_selector.cycle_favorite_models(window, cx);
+                        });
+                    }))
                     .child(
                         WithRemSize::new(ui_font_size)
+                            .h_full()
+                            .w(left_gutter_width)
                             .flex()
                             .flex_row()
                             .flex_shrink_0()
                             .items_center()
-                            .h_full()
-                            .w(left_gutter_width)
                             .justify_center()
-                            .gap_2()
+                            .gap_1()
                             .child(self.render_close_button(cx))
                             .map(|el| {
                                 let CodegenStatus::Error(error) = self.codegen_status(cx) else {
@@ -177,26 +221,83 @@ impl<T: 'static> Render for PromptEditor<T> {
                                     .flex_row()
                                     .items_center()
                                     .gap_1()
+                                    .child(add_context_button)
+                                    .child(self.model_selector.clone())
                                     .children(buttons),
                             ),
                     ),
             )
-            .child(
-                WithRemSize::new(ui_font_size)
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .child(h_flex().flex_shrink_0().w(left_gutter_width))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .pl_1()
-                            .items_start()
-                            .justify_between()
-                            .child(add_context_button)
-                            .child(self.model_selector.clone()),
-                    ),
-            )
+            .when_some(explanation, |this, _| {
+                this.child(
+                    h_flex()
+                        .size_full()
+                        .justify_center()
+                        .child(div().w(left_gutter_width + px(6.)))
+                        .child(
+                            div()
+                                .size_full()
+                                .min_w_0()
+                                .pt(rems_from_px(3_f32))
+                                .pl_0p5()
+                                .flex_1()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(explanation_label),
+                        ),
+                )
+            })
+    }
+}
+
+fn markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let theme_settings = ThemeSettings::get_global(cx);
+    let colors = cx.theme().colors();
+    let mut text_style = window.text_style();
+
+    text_style.refine(&TextStyleRefinement {
+        font_family: Some(theme_settings.ui_font.family.clone()),
+        color: Some(colors.text),
+        ..Default::default()
+    });
+
+    MarkdownStyle {
+        base_text_style: text_style.clone(),
+        syntax: cx.theme().syntax().clone(),
+        selection_background_color: colors.element_selection_background,
+        heading_level_styles: Some(HeadingLevelStyles {
+            h1: Some(TextStyleRefinement {
+                font_size: Some(rems(1.15).into()),
+                ..Default::default()
+            }),
+            h2: Some(TextStyleRefinement {
+                font_size: Some(rems(1.1).into()),
+                ..Default::default()
+            }),
+            h3: Some(TextStyleRefinement {
+                font_size: Some(rems(1.05).into()),
+                ..Default::default()
+            }),
+            h4: Some(TextStyleRefinement {
+                font_size: Some(rems(1.).into()),
+                ..Default::default()
+            }),
+            h5: Some(TextStyleRefinement {
+                font_size: Some(rems(0.95).into()),
+                ..Default::default()
+            }),
+            h6: Some(TextStyleRefinement {
+                font_size: Some(rems(0.875).into()),
+                ..Default::default()
+            }),
+        }),
+        inline_code: TextStyleRefinement {
+            font_family: Some(theme_settings.buffer_font.family.clone()),
+            font_fallbacks: theme_settings.buffer_font.fallbacks.clone(),
+            font_features: Some(theme_settings.buffer_font.features.clone()),
+            background_color: Some(colors.editor_foreground.opacity(0.08)),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -231,8 +332,6 @@ impl<T: 'static> PromptEditor<T> {
                 PromptEditorCompletionProviderDelegate,
                 cx.weak_entity(),
                 self.mention_set.clone(),
-                self.history_store.clone(),
-                self.prompt_store.clone(),
                 self.workspace.clone(),
             ))));
         });
@@ -263,7 +362,7 @@ impl<T: 'static> PromptEditor<T> {
             creases = insert_message_creases(&mut editor, &existing_creases, window, cx);
 
             if focus {
-                window.focus(&editor.focus_handle(cx));
+                window.focus(&editor.focus_handle(cx), cx);
             }
             editor
         });
@@ -313,9 +412,17 @@ impl<T: 'static> PromptEditor<T> {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if inline_assistant_model_supports_images(cx)
-            && let Some(task) =
-                paste_images_as_context(self.editor.clone(), self.mention_set.clone(), window, cx)
+            && let Some(task) = paste_images_as_context(
+                self.editor.clone(),
+                self.mention_set.clone(),
+                self.workspace.clone(),
+                window,
+                cx,
+            )
         {
+            // Capture-phase actions propagate by default, so stop the editor from also
+            // pasting the clipboard's file paths as text.
+            cx.stop_propagation();
             task.detach();
         }
     }
@@ -334,7 +441,7 @@ impl<T: 'static> PromptEditor<T> {
                 self.mention_set
                     .update(cx, |mention_set, _cx| mention_set.remove_invalid(&snapshot));
 
-                if let Some(workspace) = window.root::<Workspace>().flatten() {
+                if let Some(workspace) = Workspace::for_window(window, cx) {
                     workspace.update(cx, |workspace, cx| {
                         let is_via_ssh = workspace.project().read(cx).is_via_remote_server();
 
@@ -354,6 +461,7 @@ impl<T: 'static> PromptEditor<T> {
                 }
 
                 self.edited_since_done = true;
+                self.session_state.completion = CompletionState::Pending;
                 cx.notify();
             }
             EditorEvent::Blurred => {
@@ -423,22 +531,215 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_confirm(false, cx);
+    }
+
+    fn secondary_confirm(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let execute = matches!(self.mode, PromptEditorMode::Terminal { .. });
+        self.handle_confirm(execute, cx);
+    }
+
+    fn handle_confirm(&mut self, execute: bool, cx: &mut Context<Self>) {
         match self.codegen_status(cx) {
             CodegenStatus::Idle => {
+                self.fire_started_telemetry(cx);
                 cx.emit(PromptEditorEvent::StartRequested);
             }
             CodegenStatus::Pending => {}
             CodegenStatus::Done => {
                 if self.edited_since_done {
+                    self.fire_started_telemetry(cx);
                     cx.emit(PromptEditorEvent::StartRequested);
                 } else {
-                    cx.emit(PromptEditorEvent::ConfirmRequested { execute: false });
+                    cx.emit(PromptEditorEvent::ConfirmRequested { execute });
                 }
             }
             CodegenStatus::Error(_) => {
+                self.fire_started_telemetry(cx);
                 cx.emit(PromptEditorEvent::StartRequested);
             }
         }
+    }
+
+    fn fire_started_telemetry(&self, cx: &Context<Self>) {
+        let Some(model) = LanguageModelRegistry::read_global(cx).inline_assistant_model() else {
+            return;
+        };
+
+        let model_telemetry_id = model.telemetry_id();
+        let model_provider_id = model.provider_id().to_string();
+
+        let (kind, language_name) = match &self.mode {
+            PromptEditorMode::Buffer { codegen, .. } => {
+                let codegen = codegen.read(cx);
+                (
+                    "inline",
+                    codegen.language_name(cx).map(|name| name.to_string()),
+                )
+            }
+            PromptEditorMode::Terminal { .. } => ("inline_terminal", None),
+        };
+
+        telemetry::event!(
+            "Assistant Started",
+            session_id = self.session_state.session_id.to_string(),
+            kind = kind,
+            phase = "started",
+            model = model_telemetry_id,
+            model_provider = model_provider_id,
+            language_name = language_name,
+        );
+    }
+
+    fn thumbs_up(&mut self, _: &ThumbsUpResult, _window: &mut Window, cx: &mut Context<Self>) {
+        match &self.session_state.completion {
+            CompletionState::Pending => {
+                self.toast("Can't rate, still generating...", None, cx);
+                return;
+            }
+            CompletionState::Rated => {
+                self.toast(
+                    "Already rated this completion",
+                    Some(self.session_state.session_id),
+                    cx,
+                );
+                return;
+            }
+            CompletionState::Generated { completion_text } => {
+                let model_info = self.model_selector.read(cx).active_model(cx);
+                let (model_id, use_streaming_tools) = {
+                    let Some(model) = model_info else {
+                        self.toast("No configured model", None, cx);
+                        return;
+                    };
+                    (
+                        model.telemetry_id(),
+                        CodegenAlternative::use_streaming_tools(&model, cx),
+                    )
+                };
+
+                let selected_text = match &self.mode {
+                    PromptEditorMode::Buffer { codegen, .. } => {
+                        codegen.read(cx).selected_text(cx).map(|s| s.to_string())
+                    }
+                    PromptEditorMode::Terminal { .. } => None,
+                };
+
+                let prompt = self.editor.read(cx).text(cx);
+
+                let kind = match &self.mode {
+                    PromptEditorMode::Buffer { .. } => "inline",
+                    PromptEditorMode::Terminal { .. } => "inline_terminal",
+                };
+
+                telemetry::event!(
+                    "Inline Assistant Rated",
+                    rating = "positive",
+                    session_id = self.session_state.session_id.to_string(),
+                    kind = kind,
+                    model = model_id,
+                    prompt = prompt,
+                    completion = completion_text,
+                    selected_text = selected_text,
+                    use_streaming_tools
+                );
+
+                self.session_state.completion = CompletionState::Rated;
+
+                cx.notify();
+            }
+        }
+    }
+
+    fn thumbs_down(&mut self, _: &ThumbsDownResult, _window: &mut Window, cx: &mut Context<Self>) {
+        match &self.session_state.completion {
+            CompletionState::Pending => {
+                self.toast("Can't rate, still generating...", None, cx);
+                return;
+            }
+            CompletionState::Rated => {
+                self.toast(
+                    "Already rated this completion",
+                    Some(self.session_state.session_id),
+                    cx,
+                );
+                return;
+            }
+            CompletionState::Generated { completion_text } => {
+                let model_info = self.model_selector.read(cx).active_model(cx);
+                let (model_telemetry_id, use_streaming_tools) = {
+                    let Some(model) = model_info else {
+                        self.toast("No configured model", None, cx);
+                        return;
+                    };
+                    (
+                        model.telemetry_id(),
+                        CodegenAlternative::use_streaming_tools(&model, cx),
+                    )
+                };
+
+                let selected_text = match &self.mode {
+                    PromptEditorMode::Buffer { codegen, .. } => {
+                        codegen.read(cx).selected_text(cx).map(|s| s.to_string())
+                    }
+                    PromptEditorMode::Terminal { .. } => None,
+                };
+
+                let prompt = self.editor.read(cx).text(cx);
+
+                let kind = match &self.mode {
+                    PromptEditorMode::Buffer { .. } => "inline",
+                    PromptEditorMode::Terminal { .. } => "inline_terminal",
+                };
+
+                telemetry::event!(
+                    "Inline Assistant Rated",
+                    rating = "negative",
+                    session_id = self.session_state.session_id.to_string(),
+                    kind = kind,
+                    model = model_telemetry_id,
+                    prompt = prompt,
+                    completion = completion_text,
+                    selected_text = selected_text,
+                    use_streaming_tools
+                );
+
+                self.session_state.completion = CompletionState::Rated;
+
+                cx.notify();
+            }
+        }
+    }
+
+    fn toast(&mut self, msg: &str, uuid: Option<Uuid>, cx: &mut Context<'_, PromptEditor<T>>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                enum InlinePromptRating {}
+                workspace.show_toast(
+                    {
+                        let mut toast = Toast::new(
+                            NotificationId::unique::<InlinePromptRating>(),
+                            msg.to_string(),
+                        )
+                        .autohide();
+
+                        if let Some(uuid) = uuid {
+                            toast = toast.on_click("Click to copy rating ID", move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(uuid.to_string()));
+                            });
+                        };
+
+                        toast
+                    },
+                    cx,
+                );
+            })
+            .ok();
     }
 
     fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -501,9 +802,11 @@ impl<T: 'static> PromptEditor<T> {
                 vec![
                     Button::new("start", mode.start_label())
                         .label_size(LabelSize::Small)
-                        .icon(IconName::Return)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
+                        .end_icon(
+                            Icon::new(IconName::Return)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
                         .on_click(
                             cx.listener(|_, _, _, cx| cx.emit(PromptEditorEvent::StartRequested)),
                         )
@@ -546,6 +849,8 @@ impl<T: 'static> PromptEditor<T> {
                             .into_any_element(),
                     ]
                 } else {
+                    let rated = matches!(self.session_state.completion, CompletionState::Rated);
+
                     let accept = IconButton::new("accept", IconName::Check)
                         .icon_color(Color::Info)
                         .shape(IconButtonShape::Square)
@@ -557,25 +862,106 @@ impl<T: 'static> PromptEditor<T> {
                         }))
                         .into_any_element();
 
-                    match &self.mode {
-                        PromptEditorMode::Terminal { .. } => vec![
-                            accept,
-                            IconButton::new("confirm", IconName::PlayFilled)
-                                .icon_color(Color::Info)
-                                .shape(IconButtonShape::Square)
-                                .tooltip(|_window, cx| {
-                                    Tooltip::for_action(
-                                        "Execute Generated Command",
-                                        &menu::SecondaryConfirm,
-                                        cx,
-                                    )
-                                })
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.emit(PromptEditorEvent::ConfirmRequested { execute: true });
-                                }))
+                    let mut buttons = Vec::new();
+
+                    if AgentSettings::get_global(cx).enable_feedback {
+                        buttons.push(
+                            h_flex()
+                                .pl_1()
+                                .gap_1()
+                                .border_l_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    IconButton::new("thumbs-up", IconName::ThumbsUp)
+                                        .shape(IconButtonShape::Square)
+                                        .map(|this| {
+                                            if rated {
+                                                this.disabled(true)
+                                                    .icon_color(Color::Disabled)
+                                                    .tooltip(move |_, cx| {
+                                                        Tooltip::with_meta(
+                                                            "Good Result",
+                                                            None,
+                                                            "You already rated this result",
+                                                            cx,
+                                                        )
+                                                    })
+                                            } else {
+                                                this.icon_color(Color::Muted).tooltip(
+                                                    move |_, cx| {
+                                                        Tooltip::for_action(
+                                                            "Good Result",
+                                                            &ThumbsUpResult,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )
+                                            }
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.thumbs_up(&ThumbsUpResult, window, cx);
+                                        })),
+                                )
+                                .child(
+                                    IconButton::new("thumbs-down", IconName::ThumbsDown)
+                                        .shape(IconButtonShape::Square)
+                                        .map(|this| {
+                                            if rated {
+                                                this.disabled(true)
+                                                    .icon_color(Color::Disabled)
+                                                    .tooltip(move |_, cx| {
+                                                        Tooltip::with_meta(
+                                                            "Bad Result",
+                                                            None,
+                                                            "You already rated this result",
+                                                            cx,
+                                                        )
+                                                    })
+                                            } else {
+                                                this.icon_color(Color::Muted).tooltip(
+                                                    move |_, cx| {
+                                                        Tooltip::for_action(
+                                                            "Bad Result",
+                                                            &ThumbsDownResult,
+                                                            cx,
+                                                        )
+                                                    },
+                                                )
+                                            }
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.thumbs_down(&ThumbsDownResult, window, cx);
+                                        })),
+                                )
                                 .into_any_element(),
-                        ],
-                        PromptEditorMode::Buffer { .. } => vec![accept],
+                        );
+                    }
+
+                    buttons.push(accept);
+
+                    match &self.mode {
+                        PromptEditorMode::Terminal { .. } => {
+                            buttons.push(
+                                IconButton::new("confirm", IconName::PlayFilled)
+                                    .icon_color(Color::Info)
+                                    .shape(IconButtonShape::Square)
+                                    .tooltip(|_window, cx| {
+                                        Tooltip::for_action(
+                                            "Execute Generated Command",
+                                            &menu::SecondaryConfirm,
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(PromptEditorEvent::ConfirmRequested {
+                                            execute: true,
+                                        });
+                                    }))
+                                    .into_any_element(),
+                            );
+                            buttons
+                        }
+                        PromptEditorMode::Buffer { .. } => buttons,
                     }
                 }
             }
@@ -610,10 +996,21 @@ impl<T: 'static> PromptEditor<T> {
     }
 
     fn render_close_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        let focus_handle = self.editor.focus_handle(cx);
+
         IconButton::new("cancel", IconName::Close)
             .icon_color(Color::Muted)
             .shape(IconButtonShape::Square)
-            .tooltip(Tooltip::text("Close Assistant"))
+            .tooltip({
+                move |_window, cx| {
+                    Tooltip::for_action_in(
+                        "Close Assistant",
+                        &editor::actions::Cancel,
+                        &focus_handle,
+                        cx,
+                    )
+                }
+            })
             .on_click(cx.listener(|_, _, _, cx| cx.emit(PromptEditorEvent::CancelRequested)))
             .into_any_element()
     }
@@ -622,11 +1019,11 @@ impl<T: 'static> PromptEditor<T> {
         let disabled = matches!(codegen.status(cx), CodegenStatus::Idle);
 
         let model_registry = LanguageModelRegistry::read_global(cx);
-        let default_model = model_registry.default_model().map(|default| default.model);
+        let default_model = model_registry.default_model();
         let alternative_models = model_registry.inline_alternative_models();
 
         let get_model_name = |index: usize| -> String {
-            let name = |model: &Arc<dyn LanguageModel>| model.name().0.to_string();
+            let name = |model: &LanguageModel| model.name.0.to_string();
 
             match index {
                 0 => default_model.as_ref().map_or_else(String::new, name),
@@ -727,7 +1124,6 @@ impl<T: 'static> PromptEditor<T> {
         let colors = cx.theme().colors();
 
         div()
-            .key_context("InlineAssistEditor")
             .size_full()
             .p_2()
             .pl_1()
@@ -735,14 +1131,13 @@ impl<T: 'static> PromptEditor<T> {
             .child({
                 let settings = ThemeSettings::get_global(cx);
                 let font_size = settings.buffer_font_size(cx);
-                let line_height = font_size * 1.2;
 
                 let text_style = TextStyle {
                     color: colors.editor_foreground,
                     font_family: settings.buffer_font.family.clone(),
                     font_features: settings.buffer_font.features.clone(),
                     font_size: font_size.into(),
-                    line_height: line_height.into(),
+                    line_height: relative(settings.buffer_line_height.value()),
                     ..Default::default()
                 };
 
@@ -758,6 +1153,11 @@ impl<T: 'static> PromptEditor<T> {
                 )
             })
             .into_any_element()
+    }
+
+    fn render_markdown(&self, markdown: Entity<Markdown>, style: MarkdownStyle) -> MarkdownElement {
+        MarkdownElement::new(markdown, style)
+            .image_resolver(|dest_url, _cx| crate::resolve_agent_image(dest_url, &[]))
     }
 }
 
@@ -798,7 +1198,7 @@ struct PromptEditorCompletionProviderDelegate;
 fn inline_assistant_model_supports_images(cx: &App) -> bool {
     LanguageModelRegistry::read_global(cx)
         .inline_assistant_model()
-        .map_or(false, |m| m.model.supports_images())
+        .map_or(false, |m| m.supports_images())
 }
 
 impl PromptCompletionProviderDelegate for PromptEditorCompletionProviderDelegate {
@@ -808,7 +1208,7 @@ impl PromptCompletionProviderDelegate for PromptEditorCompletionProviderDelegate
             PromptContextType::Symbol,
             PromptContextType::Thread,
             PromptContextType::Fetch,
-            PromptContextType::Rules,
+            PromptContextType::Skill,
         ]
     }
 
@@ -830,9 +1230,9 @@ impl PromptEditor<BufferCodegen> {
         prompt_history: VecDeque<String>,
         prompt_buffer: Entity<MultiBuffer>,
         codegen: Entity<BufferCodegen>,
+        session_id: Uuid,
         fs: Arc<dyn Fs>,
-        history_store: Entity<HistoryStore>,
-        prompt_store: Option<Entity<PromptStore>>,
+        thread_store: Entity<ThreadStore>,
         project: WeakEntity<Project>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -871,16 +1271,13 @@ impl PromptEditor<BufferCodegen> {
             editor
         });
 
-        let mention_set =
-            cx.new(|_cx| MentionSet::new(project, history_store.clone(), prompt_store.clone()));
+        let mention_set = cx.new(|_cx| MentionSet::new(project, Some(thread_store.clone())));
 
         let model_selector_menu_handle = PopoverMenuHandle::default();
 
         let mut this: PromptEditor<BufferCodegen> = PromptEditor {
             editor: prompt_editor.clone(),
             mention_set,
-            history_store,
-            prompt_store,
             workspace,
             model_selector: cx.new(|cx| {
                 AgentModelSelector::new(
@@ -900,6 +1297,10 @@ impl PromptEditor<BufferCodegen> {
             editor_subscriptions: Vec::new(),
             show_rate_limit_notice: false,
             mode,
+            session_state: SessionState {
+                session_id,
+                completion: CompletionState::Pending,
+            },
             _phantom: Default::default(),
         };
 
@@ -910,7 +1311,7 @@ impl PromptEditor<BufferCodegen> {
 
     fn handle_codegen_changed(
         &mut self,
-        _: Entity<BufferCodegen>,
+        codegen: Entity<BufferCodegen>,
         cx: &mut Context<PromptEditor<BufferCodegen>>,
     ) {
         match self.codegen_status(cx) {
@@ -919,10 +1320,15 @@ impl PromptEditor<BufferCodegen> {
                     .update(cx, |editor, _| editor.set_read_only(false));
             }
             CodegenStatus::Pending => {
+                self.session_state.completion = CompletionState::Pending;
                 self.editor
                     .update(cx, |editor, _| editor.set_read_only(true));
             }
             CodegenStatus::Done => {
+                let completion = codegen.read(cx).active_completion(cx);
+                self.session_state.completion = CompletionState::Generated {
+                    completion_text: completion,
+                };
                 self.edited_since_done = false;
                 self.editor
                     .update(cx, |editor, _| editor.set_read_only(false));
@@ -978,9 +1384,9 @@ impl PromptEditor<TerminalCodegen> {
         prompt_history: VecDeque<String>,
         prompt_buffer: Entity<MultiBuffer>,
         codegen: Entity<TerminalCodegen>,
+        session_id: Uuid,
         fs: Arc<dyn Fs>,
-        history_store: Entity<HistoryStore>,
-        prompt_store: Option<Entity<PromptStore>>,
+        thread_store: Entity<ThreadStore>,
         project: WeakEntity<Project>,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
@@ -1014,16 +1420,13 @@ impl PromptEditor<TerminalCodegen> {
             editor
         });
 
-        let mention_set =
-            cx.new(|_cx| MentionSet::new(project, history_store.clone(), prompt_store.clone()));
+        let mention_set = cx.new(|_cx| MentionSet::new(project, Some(thread_store.clone())));
 
         let model_selector_menu_handle = PopoverMenuHandle::default();
 
         let mut this = Self {
             editor: prompt_editor.clone(),
             mention_set,
-            history_store,
-            prompt_store,
             workspace,
             model_selector: cx.new(|cx| {
                 AgentModelSelector::new(
@@ -1043,6 +1446,10 @@ impl PromptEditor<TerminalCodegen> {
             editor_subscriptions: Vec::new(),
             mode,
             show_rate_limit_notice: false,
+            session_state: SessionState {
+                session_id,
+                completion: CompletionState::Pending,
+            },
             _phantom: Default::default(),
         };
         this.count_lines(cx);
@@ -1075,17 +1482,21 @@ impl PromptEditor<TerminalCodegen> {
         }
     }
 
-    fn handle_codegen_changed(&mut self, _: Entity<TerminalCodegen>, cx: &mut Context<Self>) {
+    fn handle_codegen_changed(&mut self, codegen: Entity<TerminalCodegen>, cx: &mut Context<Self>) {
         match &self.codegen().read(cx).status {
             CodegenStatus::Idle => {
                 self.editor
                     .update(cx, |editor, _| editor.set_read_only(false));
             }
             CodegenStatus::Pending => {
+                self.session_state.completion = CompletionState::Pending;
                 self.editor
                     .update(cx, |editor, _| editor.set_read_only(true));
             }
             CodegenStatus::Done | CodegenStatus::Error(_) => {
+                self.session_state.completion = CompletionState::Generated {
+                    completion_text: codegen.read(cx).completion(),
+                };
                 self.edited_since_done = false;
                 self.editor
                     .update(cx, |editor, _| editor.set_read_only(false));
@@ -1117,26 +1528,6 @@ pub enum CodegenStatus {
     Pending,
     Done,
     Error(anyhow::Error),
-}
-
-/// This is just CodegenStatus without the anyhow::Error, which causes a lifetime issue for rendering the Cancel button.
-#[derive(Copy, Clone)]
-pub enum CancelButtonState {
-    Idle,
-    Pending,
-    Done,
-    Error,
-}
-
-impl Into<CancelButtonState> for &CodegenStatus {
-    fn into(self) -> CancelButtonState {
-        match self {
-            CodegenStatus::Idle => CancelButtonState::Idle,
-            CodegenStatus::Pending => CancelButtonState::Pending,
-            CodegenStatus::Done => CancelButtonState::Done,
-            CodegenStatus::Error(_) => CancelButtonState::Error,
-        }
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -1220,6 +1611,9 @@ fn insert_message_creases(
             crease_for_mention(
                 crease.label.clone(),
                 crease.icon_path.clone(),
+                None,
+                None,
+                None,
                 start..end,
                 cx.weak_entity(),
             )
@@ -1228,4 +1622,305 @@ fn insert_message_creases(
     let ids = editor.insert_creases(creases.clone(), cx);
     editor.fold_creases(creases, false, window, cx);
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal_codegen::TerminalCodegen;
+    use agent::ThreadStore;
+    use collections::VecDeque;
+    use fs::FakeFs;
+    use gpui::{TestAppContext, VisualTestContext};
+    use language::Buffer;
+    use project::Project;
+    use settings::SettingsStore;
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use terminal::TerminalBuilder;
+    use terminal::terminal_settings::CursorShape;
+    use util::path;
+    use util::paths::PathStyle;
+    use uuid::Uuid;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            language_model::LanguageModelRegistry::test(cx);
+            prompt_store::init(cx);
+        });
+    }
+
+    fn build_terminal_prompt_editor(
+        workspace: &Entity<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<PromptEditor<TerminalCodegen>> {
+        let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
+        let fs = FakeFs::new(cx.executor());
+
+        let terminal = cx.update(|_window, cx| {
+            cx.new(|cx| {
+                TerminalBuilder::new_display_only(
+                    CursorShape::default(),
+                    settings::AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    PathStyle::local(),
+                )
+                .subscribe(cx)
+            })
+        });
+
+        let session_id = Uuid::new_v4();
+        let codegen =
+            cx.update(|_window, cx| cx.new(|_| TerminalCodegen::new(terminal, session_id)));
+
+        let prompt_buffer = cx.update(|_window, cx| {
+            cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local("", cx)), cx))
+        });
+
+        let project = workspace.update(cx, |workspace, _cx| workspace.project().downgrade());
+
+        cx.update(|window, cx| {
+            cx.new(|cx| {
+                PromptEditor::new_terminal(
+                    TerminalInlineAssistId::default(),
+                    VecDeque::new(),
+                    prompt_buffer,
+                    codegen,
+                    session_id,
+                    fs,
+                    thread_store,
+                    project,
+                    workspace.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+        })
+    }
+
+    #[gpui::test]
+    async fn test_secondary_confirm_emits_execute_true_in_terminal_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({"file": ""}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let prompt_editor = build_terminal_prompt_editor(&workspace, cx);
+
+        // Set the codegen status to Done so that confirm logic emits ConfirmRequested.
+        prompt_editor.update(cx, |editor, cx| {
+            editor.codegen().update(cx, |codegen, _| {
+                codegen.status = CodegenStatus::Done;
+            });
+            editor.edited_since_done = false;
+        });
+
+        let events: Rc<RefCell<Vec<PromptEditorEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = events.clone();
+        cx.update(|_window, cx| {
+            cx.subscribe(&prompt_editor, move |_, event: &PromptEditorEvent, _cx| {
+                events_clone.borrow_mut().push(match event {
+                    PromptEditorEvent::ConfirmRequested { execute } => {
+                        PromptEditorEvent::ConfirmRequested { execute: *execute }
+                    }
+                    PromptEditorEvent::StartRequested => PromptEditorEvent::StartRequested,
+                    PromptEditorEvent::StopRequested => PromptEditorEvent::StopRequested,
+                    PromptEditorEvent::CancelRequested => PromptEditorEvent::CancelRequested,
+                    PromptEditorEvent::Resized { height_in_lines } => PromptEditorEvent::Resized {
+                        height_in_lines: *height_in_lines,
+                    },
+                });
+            })
+            .detach();
+        });
+
+        // Dispatch menu::SecondaryConfirm (cmd-enter).
+        prompt_editor.update(cx, |editor, cx| {
+            editor.handle_confirm(true, cx);
+        });
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1, "Expected exactly one event");
+        assert!(
+            matches!(
+                events[0],
+                PromptEditorEvent::ConfirmRequested { execute: true }
+            ),
+            "Expected ConfirmRequested with execute: true, got {:?}",
+            match &events[0] {
+                PromptEditorEvent::ConfirmRequested { execute } =>
+                    format!("ConfirmRequested {{ execute: {} }}", execute),
+                _ => "other event".to_string(),
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_confirm_emits_execute_false_in_terminal_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({"file": ""}))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let prompt_editor = build_terminal_prompt_editor(&workspace, cx);
+
+        prompt_editor.update(cx, |editor, cx| {
+            editor.codegen().update(cx, |codegen, _| {
+                codegen.status = CodegenStatus::Done;
+            });
+            editor.edited_since_done = false;
+        });
+
+        let events: Rc<RefCell<Vec<PromptEditorEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let events_clone = events.clone();
+        cx.update(|_window, cx| {
+            cx.subscribe(&prompt_editor, move |_, event: &PromptEditorEvent, _cx| {
+                events_clone.borrow_mut().push(match event {
+                    PromptEditorEvent::ConfirmRequested { execute } => {
+                        PromptEditorEvent::ConfirmRequested { execute: *execute }
+                    }
+                    PromptEditorEvent::StartRequested => PromptEditorEvent::StartRequested,
+                    PromptEditorEvent::StopRequested => PromptEditorEvent::StopRequested,
+                    PromptEditorEvent::CancelRequested => PromptEditorEvent::CancelRequested,
+                    PromptEditorEvent::Resized { height_in_lines } => PromptEditorEvent::Resized {
+                        height_in_lines: *height_in_lines,
+                    },
+                });
+            })
+            .detach();
+        });
+
+        // Dispatch menu::Confirm (enter) — should emit execute: false even in terminal mode.
+        prompt_editor.update(cx, |editor, cx| {
+            editor.handle_confirm(false, cx);
+        });
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 1, "Expected exactly one event");
+        assert!(
+            matches!(
+                events[0],
+                PromptEditorEvent::ConfirmRequested { execute: false }
+            ),
+            "Expected ConfirmRequested with execute: false"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_paste_image_does_not_paste_file_paths_as_text(cx: &mut TestAppContext) {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode png");
+        let prompt = paste_into_prompt_editor(
+            vec![
+                gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    png.into_inner(),
+                )),
+                gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                    vec![PathBuf::from(path!("/tmp/screenshot.png"))].into(),
+                )),
+            ],
+            cx,
+        )
+        .await;
+
+        let image_uri = acp_thread::MentionUri::PastedImage {
+            name: "Image".into(),
+        };
+        assert_eq!(prompt, format!("{} ", image_uri.as_link()));
+    }
+
+    #[gpui::test]
+    async fn test_paste_non_image_file_pastes_path_as_text(cx: &mut TestAppContext) {
+        let path = PathBuf::from(path!("/tmp/notes.txt"));
+        let prompt = paste_into_prompt_editor(
+            vec![gpui::ClipboardEntry::ExternalPaths(gpui::ExternalPaths(
+                vec![path.clone()].into(),
+            ))],
+            cx,
+        )
+        .await;
+
+        assert_eq!(prompt, path.display().to_string());
+    }
+
+    async fn paste_into_prompt_editor(
+        entries: Vec<gpui::ClipboardEntry>,
+        cx: &mut TestAppContext,
+    ) -> String {
+        init_test(cx);
+        cx.update(|cx| {
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                let mut model = registry.default_model().expect("fake default model");
+                model.supports_images = true;
+                registry.set_inline_assistant_model(Some(model), cx);
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({"file": ""}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let (workspace, _) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let workspace = workspace.downgrade();
+        let (prompt_editor, cx) = cx.add_window_view(|window, cx| {
+            let terminal = cx.new(|cx| {
+                TerminalBuilder::new_display_only(
+                    CursorShape::default(),
+                    settings::AlternateScroll::On,
+                    None,
+                    0,
+                    cx.background_executor(),
+                    PathStyle::local(),
+                )
+                .subscribe(cx)
+            });
+            let session_id = Uuid::new_v4();
+            let codegen = cx.new(|_| TerminalCodegen::new(terminal, session_id));
+            let prompt_buffer =
+                cx.new(|cx| MultiBuffer::singleton(cx.new(|cx| Buffer::local("", cx)), cx));
+            PromptEditor::new_terminal(
+                TerminalInlineAssistId::default(),
+                VecDeque::new(),
+                prompt_buffer,
+                codegen,
+                session_id,
+                fs,
+                cx.new(|cx| ThreadStore::new(cx)),
+                project.downgrade(),
+                workspace,
+                window,
+                cx,
+            )
+        });
+
+        cx.write_to_clipboard(ClipboardItem { entries });
+        prompt_editor.update_in(cx, |prompt_editor, window, cx| {
+            prompt_editor.editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.dispatch_action(Paste);
+        cx.run_until_parked();
+
+        prompt_editor.read_with(cx, |prompt_editor, cx| prompt_editor.prompt(cx))
+    }
 }

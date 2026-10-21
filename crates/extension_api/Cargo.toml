@@ -1,12 +1,13 @@
 [package]
 name = "zed_extension_api"
-version = "0.7.0"
+version = "0.8.0"
 description = "APIs for creating Zed extensions in Rust"
 repository = "https://github.com/zed-industries/zed"
 documentation = "https://docs.rs/zed_extension_api"
 keywords = ["zed", "extension"]
 edition.workspace = true
-publish = true
+# Change back to `true` when we're ready to publish v0.8.0.
+publish = false
 license = "Apache-2.0"
 
 [lints]
@@ -14,6 +15,8 @@ workspace = true
 
 [lib]
 path = "src/extension_api.rs"
+test = false
+doctest = false
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -22,3 +25,6 @@ wit-bindgen = "0.41"
 
 [package.metadata.component]
 target = { path = "wit" }
+
+[package.metadata.cargo-shear]
+ignored-paths = ["wit/since_v*/settings.rs"]

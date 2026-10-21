@@ -1,44 +1,56 @@
 use anyhow::{Context as _, Result, anyhow};
+use client::ProjectId;
+use collections::HashMap;
+use collections::HashSet;
+use gpui::TasksIncluded;
 use language::File;
 use lsp::LanguageServerId;
 
 use extension::ExtensionHostProxy;
 use extension_host::headless_host::HeadlessExtensionStore;
 use fs::Fs;
-use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel};
+use futures::{channel::oneshot, stream::StreamExt as _};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, PromptLevel, Task, TaskExt};
 use http_client::HttpClient;
 use language::{Buffer, BufferEvent, LanguageRegistry, proto::serialize_operation};
 use node_runtime::NodeRuntime;
 use project::{
-    LspStore, LspStoreEvent, ManifestTree, PrettierStore, ProjectEnvironment, ProjectPath,
-    ToolchainStore, WorktreeId,
+    AgentRegistryStore, LspStore, LspStoreEvent, ManifestTree, PrettierStore, ProjectEnvironment,
+    ProjectPath, ToolchainStore, WorktreeId,
     agent_server_store::AgentServerStore,
     buffer_store::{BufferStore, BufferStoreEvent},
+    context_server_store::ContextServerStore,
     debugger::{breakpoint_store::BreakpointStore, dap_store::DapStore},
     git_store::GitStore,
     image_store::ImageId,
-    lsp_store::log_store::{self, GlobalLogStore, LanguageServerKind},
+    lsp_store::log_store::{
+        self, GlobalLogStore, LanguageServerKind, LanguageServerLogKey, LogKind,
+    },
     project_settings::SettingsObserver,
     search::SearchQuery,
     task_store::TaskStore,
-    worktree_store::WorktreeStore,
+    trusted_worktrees::{PathTrust, RemoteHostLocation, TrustedWorktrees},
+    worktree_store::{WorktreeIdCounter, WorktreeStore},
 };
 use rpc::{
     AnyProtoClient, TypedEnvelope,
     proto::{self, REMOTE_SERVER_PEER_ID, REMOTE_SERVER_PROJECT_ID},
 };
+use smol::process::Child;
 
-use settings::initial_server_settings_content;
-use smol::stream::StreamExt;
+use settings::{Settings as _, SettingsLocation, initial_server_settings_content};
 use std::{
+    mem,
     num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+use terminal::terminal_settings::TerminalSettings;
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
 
@@ -50,16 +62,22 @@ pub struct HeadlessProject {
     pub lsp_store: Entity<LspStore>,
     pub task_store: Entity<TaskStore>,
     pub dap_store: Entity<DapStore>,
+    pub breakpoint_store: Entity<BreakpointStore>,
     pub agent_server_store: Entity<AgentServerStore>,
+    pub context_server_store: Entity<ContextServerStore>,
     pub settings_observer: Entity<SettingsObserver>,
     pub next_entry_id: Arc<AtomicUsize>,
     pub languages: Arc<LanguageRegistry>,
     pub extensions: Entity<HeadlessExtensionStore>,
     pub git_store: Entity<GitStore>,
     pub environment: Entity<ProjectEnvironment>,
+    pub profiling_collector: gpui::ProfilingCollector,
     // Used mostly to keep alive the toolchain store for RPC handlers.
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
+    pub kernels: HashMap<String, Child>,
+    search_buffer_batches: async_channel::Sender<SearchBufferBatch>,
+    _search_buffer_sender: Task<()>,
 }
 
 pub struct HeadlessAppState {
@@ -69,6 +87,18 @@ pub struct HeadlessAppState {
     pub node_runtime: NodeRuntime,
     pub languages: Arc<LanguageRegistry>,
     pub extension_host_proxy: Arc<ExtensionHostProxy>,
+    pub startup_time: Instant,
+}
+
+const MAX_SEARCH_CANDIDATES_PER_BATCH: usize = 64;
+const MAX_UNACKNOWLEDGED_SEARCH_BYTES: usize = 1024 * 1024;
+
+struct SearchBufferBatch {
+    buffers: Vec<Entity<Buffer>>,
+    handle: u64,
+    peer_id: proto::PeerId,
+    project_id: u64,
+    completion: oneshot::Sender<Result<()>>,
 }
 
 impl HeadlessProject {
@@ -85,17 +115,29 @@ impl HeadlessProject {
             node_runtime,
             languages,
             extension_host_proxy: proxy,
+            startup_time,
         }: HeadlessAppState,
+        init_worktree_trust: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         debug_adapter_extension::init(proxy.clone(), cx);
         languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
 
         let worktree_store = cx.new(|cx| {
-            let mut store = WorktreeStore::local(true, fs.clone());
+            let mut store = WorktreeStore::local(true, fs.clone(), WorktreeIdCounter::get(cx));
             store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
             store
         });
+
+        if init_worktree_trust {
+            project::trusted_worktrees::track_worktree_trust(
+                worktree_store.clone(),
+                None::<RemoteHostLocation>,
+                Some((session.clone(), ProjectId(REMOTE_SERVER_PROJECT_ID))),
+                None,
+                cx,
+            );
+        }
 
         let environment =
             cx.new(|cx| ProjectEnvironment::new(None, worktree_store.downgrade(), None, true, cx));
@@ -106,7 +148,6 @@ impl HeadlessProject {
                 worktree_store.clone(),
                 environment.clone(),
                 manifest_tree.clone(),
-                fs.clone(),
                 cx,
             )
         });
@@ -117,8 +158,13 @@ impl HeadlessProject {
             buffer_store
         });
 
-        let breakpoint_store =
-            cx.new(|_| BreakpointStore::local(worktree_store.clone(), buffer_store.clone()));
+        let breakpoint_store = cx.new(|_| {
+            let mut breakpoint_store =
+                BreakpointStore::local(worktree_store.clone(), buffer_store.clone());
+            breakpoint_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone());
+
+            breakpoint_store
+        });
 
         let dap_store = cx.new(|cx| {
             let mut dap_store = DapStore::new_local(
@@ -164,6 +210,7 @@ impl HeadlessProject {
                 worktree_store.clone(),
                 toolchain_store.read(cx).as_language_toolchain_store(),
                 environment.clone(),
+                git_store.clone(),
                 cx,
             );
             task_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
@@ -174,6 +221,7 @@ impl HeadlessProject {
                 fs.clone(),
                 worktree_store.clone(),
                 task_store.clone(),
+                true,
                 cx,
             );
             observer.shared(REMOTE_SERVER_PROJECT_ID, session.clone(), cx);
@@ -201,6 +249,8 @@ impl HeadlessProject {
             lsp_store
         });
 
+        AgentRegistryStore::init_global(cx, fs.clone(), http_client.clone());
+
         let agent_server_store = cx.new(|cx| {
             let mut agent_server_store = AgentServerStore::local(
                 node_runtime.clone(),
@@ -213,9 +263,16 @@ impl HeadlessProject {
             agent_server_store
         });
 
+        let context_server_store = cx.new(|cx| {
+            let mut context_server_store =
+                ContextServerStore::local(worktree_store.clone(), None, true, cx);
+            context_server_store.shared(REMOTE_SERVER_PROJECT_ID, session.clone());
+            context_server_store
+        });
+
         cx.subscribe(&lsp_store, Self::on_lsp_store_event).detach();
         language_extension::init(
-            language_extension::LspAccess::ViaLspStore(lsp_store.clone()),
+            language_extension::LspAccess::ViaLspStore(lsp_store.downgrade()),
             proxy.clone(),
             languages.clone(),
         );
@@ -244,15 +301,18 @@ impl HeadlessProject {
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &task_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &toolchain_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &dap_store);
+        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &breakpoint_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &settings_observer);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &git_store);
         session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &agent_server_store);
+        session.subscribe_to_entity(REMOTE_SERVER_PROJECT_ID, &context_server_store);
 
         session.add_request_handler(cx.weak_entity(), Self::handle_list_remote_directory);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_path_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_shutdown_remote_server);
         session.add_request_handler(cx.weak_entity(), Self::handle_ping);
         session.add_request_handler(cx.weak_entity(), Self::handle_get_processes);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_remote_profiling_data);
 
         session.add_entity_request_handler(Self::handle_add_worktree);
         session.add_request_handler(cx.weak_entity(), Self::handle_remove_worktree);
@@ -262,9 +322,14 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_find_search_candidates);
         session.add_entity_request_handler(Self::handle_open_server_settings);
         session.add_entity_request_handler(Self::handle_get_directory_environment);
+        session.add_entity_request_handler(Self::handle_get_terminal_shell);
         session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
         session.add_entity_request_handler(Self::handle_open_image_by_path);
+        session.add_entity_request_handler(Self::handle_trust_worktrees);
+        session.add_entity_request_handler(Self::handle_restrict_worktrees);
+        session.add_entity_request_handler(Self::handle_download_file_by_path);
 
+        session.add_entity_message_handler(Self::handle_find_search_candidates_cancel);
         session.add_entity_request_handler(BufferStore::handle_update_buffer);
         session.add_entity_message_handler(BufferStore::handle_close_buffer);
 
@@ -277,6 +342,9 @@ impl HeadlessProject {
             HeadlessExtensionStore::handle_install_extension,
         );
 
+        session.add_request_handler(cx.weak_entity(), Self::handle_spawn_kernel);
+        session.add_request_handler(cx.weak_entity(), Self::handle_kill_kernel);
+
         BufferStore::init(&session);
         WorktreeStore::init(&session);
         SettingsObserver::init(&session);
@@ -285,9 +353,63 @@ impl HeadlessProject {
         ToolchainStore::init(&session);
         DapStore::init(&session, cx);
         // todo(debugger): Re init breakpoint store when we set it up for collab
-        // BreakpointStore::init(&client);
+        BreakpointStore::init(&session);
         GitStore::init(&session);
         AgentServerStore::init_headless(&session);
+        ContextServerStore::init_headless(&session);
+
+        let (search_buffer_batches, batches) = async_channel::bounded::<SearchBufferBatch>(1);
+        let search_buffer_sender = cx.spawn({
+            let buffer_store = buffer_store.clone();
+            let client = session.clone();
+            async move |_, cx| {
+                while let Ok(batch) = batches.recv().await {
+                    let result = async {
+                        let mut buffer_ids = Vec::new();
+                        let mut unacknowledged_bytes = 0;
+                        for buffer in &batch.buffers {
+                            if batch.completion.is_canceled() {
+                                break;
+                            }
+                            let (buffer_id, transferred_bytes, transfer) =
+                                buffer_store.update(cx, |store, cx| {
+                                    let buffer_id = buffer.read(cx).remote_id();
+                                    let transferred_bytes = if store.is_shared(buffer_id, cx) {
+                                        0
+                                    } else {
+                                        buffer.read(cx).len()
+                                    };
+                                    let transfer = store.create_buffer_for_peer(
+                                        buffer,
+                                        REMOTE_SERVER_PEER_ID,
+                                        cx,
+                                    );
+                                    (buffer_id, transferred_bytes, transfer)
+                                });
+                            transfer.await?;
+                            buffer_ids.push(buffer_id.to_proto());
+                            unacknowledged_bytes += transferred_bytes;
+                            if unacknowledged_bytes >= MAX_UNACKNOWLEDGED_SEARCH_BYTES {
+                                Self::send_search_candidates(
+                                    &client,
+                                    &batch,
+                                    mem::take(&mut buffer_ids),
+                                )
+                                .await?;
+                                unacknowledged_bytes = 0;
+                            }
+                        }
+                        if !buffer_ids.is_empty() {
+                            Self::send_search_candidates(&client, &batch, buffer_ids).await?;
+                        }
+                        anyhow::Ok(())
+                    }
+                    .await;
+
+                    batch.completion.send(result).ok();
+                }
+            }
+        });
 
         HeadlessProject {
             next_entry_id: Default::default(),
@@ -299,12 +421,18 @@ impl HeadlessProject {
             lsp_store,
             task_store,
             dap_store,
+            breakpoint_store,
             agent_server_store,
+            context_server_store,
             languages,
             extensions,
             git_store,
             environment,
+            profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
+            kernels: Default::default(),
+            search_buffer_batches,
+            _search_buffer_sender: search_buffer_sender,
         }
     }
 
@@ -354,16 +482,56 @@ impl HeadlessProject {
                     });
                 }
             }
-            LspStoreEvent::LanguageServerRemoved(id) => {
+            LspStoreEvent::SupplementaryLanguageServerAdded(id, name) => {
                 let log_store = cx
                     .try_global::<GlobalLogStore>()
                     .map(|lsp_logs| lsp_logs.0.clone());
                 if let Some(log_store) = log_store {
                     log_store.update(cx, |log_store, cx| {
-                        log_store.remove_language_server(*id, cx);
+                        log_store.add_language_server(
+                            LanguageServerKind::LocalSsh {
+                                lsp_store: self.lsp_store.downgrade(),
+                            },
+                            *id,
+                            Some(name.clone()),
+                            None,
+                            lsp_store.read(cx).language_server_for_id(*id),
+                            cx,
+                        );
                     });
                 }
             }
+            LspStoreEvent::LanguageServerRemoved(id)
+            | LspStoreEvent::SupplementaryLanguageServerRemoved(id) => {
+                let log_store = cx
+                    .try_global::<GlobalLogStore>()
+                    .map(|lsp_logs| lsp_logs.0.clone());
+                if let Some(log_store) = log_store {
+                    let server_key = LanguageServerLogKey::new(
+                        LanguageServerKind::LocalSsh {
+                            lsp_store: self.lsp_store.downgrade(),
+                        },
+                        *id,
+                    );
+                    log_store.update(cx, |log_store, cx| {
+                        log_store.remove_language_server(&server_key, cx);
+                    });
+                }
+                self.session
+                    .send(proto::UpdateLanguageServer {
+                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        server_name: None,
+                        language_server_id: id.to_proto(),
+                        variant: Some(proto::update_language_server::Variant::Removed(
+                            proto::ServerRemoved {},
+                        )),
+                    })
+                    .log_err();
+            }
+            LspStoreEvent::LanguageServerUpdate {
+                message: proto::update_language_server::Variant::MetadataUpdated(_),
+                ..
+            } => {}
             LspStoreEvent::LanguageServerUpdate {
                 language_server_id,
                 name,
@@ -386,6 +554,33 @@ impl HeadlessProject {
                         message: message.clone(),
                     })
                     .log_err();
+            }
+            LspStoreEvent::LanguageServerShowDocument(show_document_request) => {
+                let request = self
+                    .session
+                    .request(proto::LanguageServerShowDocumentRequest {
+                        project_id: REMOTE_SERVER_PROJECT_ID,
+                        uri: show_document_request.uri.as_str().to_owned(),
+                        external: show_document_request.external,
+                        take_focus: show_document_request.take_focus,
+                        selection_start: show_document_request.selection.map(|selection| {
+                            proto::PointUtf16 {
+                                row: selection.start.line,
+                                column: selection.start.character,
+                            }
+                        }),
+                        selection_end: show_document_request.selection.map(|selection| {
+                            proto::PointUtf16 {
+                                row: selection.end.line,
+                                column: selection.end.character,
+                            }
+                        }),
+                    });
+                let show_document_request = show_document_request.clone();
+                cx.background_spawn(async move {
+                    show_document_request.respond(request.await.is_ok());
+                })
+                .detach();
             }
             LspStoreEvent::LanguageServerPrompt(prompt) => {
                 let request = self.session.request(proto::LanguageServerPromptRequest {
@@ -419,7 +614,7 @@ impl HeadlessProject {
         mut cx: AsyncApp,
     ) -> Result<proto::AddWorktreeResponse> {
         use client::ErrorCodeExt;
-        let fs = this.read_with(&cx, |this, _| this.fs.clone())?;
+        let fs = this.read_with(&cx, |this, _| this.fs.clone());
         let path = PathBuf::from(shellexpand::tilde(&message.payload.path).to_string());
 
         let canonicalized = match fs.canonicalize(&path).await {
@@ -438,10 +633,19 @@ impl HeadlessProject {
                             .with_tag("path", path.to_string_lossy().as_ref())
                     )
                 })?;
-                parent.join(path.file_name().unwrap())
+                if let Some(file_name) = path.file_name() {
+                    parent.join(file_name)
+                } else {
+                    parent
+                }
             }
         };
-
+        let next_worktree_id = this
+            .update(&mut cx, |this, cx| {
+                this.worktree_store
+                    .update(cx, |worktree_store, _| worktree_store.next_worktree_id())
+            })
+            .await?;
         let worktree = this
             .read_with(&cx.clone(), |this, _| {
                 Worktree::local(
@@ -449,9 +653,11 @@ impl HeadlessProject {
                     message.payload.visible,
                     this.fs.clone(),
                     this.next_entry_id.clone(),
+                    true,
+                    next_worktree_id,
                     &mut cx,
                 )
-            })?
+            })
             .await?;
 
         let response = this.read_with(&cx, |_, cx| {
@@ -459,8 +665,12 @@ impl HeadlessProject {
             proto::AddWorktreeResponse {
                 worktree_id: worktree.id().to_proto(),
                 canonicalized_path: canonicalized.to_string_lossy().into_owned(),
+                root_repo_common_dir: worktree
+                    .root_repo_common_dir()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                root_repo_is_linked_worktree: worktree.root_repo_is_linked_worktree(),
             }
-        })?;
+        });
 
         // We spawn this asynchronously, so that we can send the response back
         // *before* `worktree_store.add()` can send out UpdateProject requests
@@ -479,8 +689,7 @@ impl HeadlessProject {
                 this.worktree_store.update(cx, |worktree_store, cx| {
                     worktree_store.add(&worktree, cx);
                 });
-            })
-            .log_err();
+            });
         })
         .detach();
 
@@ -497,7 +706,7 @@ impl HeadlessProject {
             this.worktree_store.update(cx, |worktree_store, cx| {
                 worktree_store.remove_worktree(worktree_id, cx);
             });
-        })?;
+        });
         Ok(proto::Ack {})
     }
 
@@ -507,22 +716,22 @@ impl HeadlessProject {
         mut cx: AsyncApp,
     ) -> Result<proto::OpenBufferResponse> {
         let worktree_id = WorktreeId::from_proto(message.payload.worktree_id);
-        let path = RelPath::from_proto(&message.payload.path)?;
+        let path = RelPath::from_unix_str(&message.payload.path)?.into();
         let (buffer_store, buffer) = this.update(&mut cx, |this, cx| {
             let buffer_store = this.buffer_store.clone();
             let buffer = this.buffer_store.update(cx, |buffer_store, cx| {
                 buffer_store.open_buffer(ProjectPath { worktree_id, path }, cx)
             });
-            anyhow::Ok((buffer_store, buffer))
-        })??;
+            (buffer_store, buffer)
+        });
 
         let buffer = buffer.await?;
-        let buffer_id = buffer.read_with(&cx, |b, _| b.remote_id())?;
+        let buffer_id = buffer.read_with(&cx, |b, _| b.remote_id());
         buffer_store.update(&mut cx, |buffer_store, cx| {
             buffer_store
                 .create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
                 .detach_and_log_err(cx);
-        })?;
+        });
 
         Ok(proto::OpenBufferResponse {
             buffer_id: buffer_id.to_proto(),
@@ -536,27 +745,27 @@ impl HeadlessProject {
     ) -> Result<proto::OpenImageResponse> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let worktree_id = WorktreeId::from_proto(message.payload.worktree_id);
-        let path = RelPath::from_proto(&message.payload.path)?;
+        let path = RelPath::from_unix_str(&message.payload.path)?;
         let project_id = message.payload.project_id;
         use proto::create_image_for_peer::Variant;
 
         let (worktree_store, session) = this.read_with(&cx, |this, _| {
             (this.worktree_store.clone(), this.session.clone())
-        })?;
+        });
 
         let worktree = worktree_store
-            .read_with(&cx, |store, cx| store.worktree_for_id(worktree_id, cx))?
+            .read_with(&cx, |store, cx| store.worktree_for_id(worktree_id, cx))
             .context("worktree not found")?;
 
         let load_task = worktree.update(&mut cx, |worktree, cx| {
             worktree.load_binary_file(path.as_ref(), cx)
-        })?;
+        });
 
         let loaded_file = load_task.await?;
         let content = loaded_file.content;
         let file = loaded_file.file;
 
-        let proto_file = worktree.read_with(&cx, |_worktree, cx| file.to_proto(cx))?;
+        let proto_file = worktree.read_with(&cx, |_worktree, cx| file.to_proto(cx));
         let image_id =
             ImageId::from(NonZeroU64::new(NEXT_ID.fetch_add(1, Ordering::Relaxed)).unwrap());
 
@@ -594,6 +803,144 @@ impl HeadlessProject {
         })
     }
 
+    pub async fn handle_trust_worktrees(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::TrustWorktrees>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let trusted_worktrees = cx
+            .update(|cx| TrustedWorktrees::try_get_global(cx))
+            .context("missing trusted worktrees")?;
+        let worktree_store = this.read_with(&cx, |project, _| project.worktree_store.clone());
+        trusted_worktrees.update(&mut cx, |trusted_worktrees, cx| {
+            trusted_worktrees.trust(
+                &worktree_store,
+                envelope
+                    .payload
+                    .trusted_paths
+                    .into_iter()
+                    .filter_map(PathTrust::from_proto)
+                    .collect(),
+                cx,
+            );
+        });
+        Ok(proto::Ack {})
+    }
+
+    pub async fn handle_restrict_worktrees(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::RestrictWorktrees>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let trusted_worktrees = cx
+            .update(|cx| TrustedWorktrees::try_get_global(cx))
+            .context("missing trusted worktrees")?;
+        let worktree_store = this.read_with(&cx, |project, _| project.worktree_store.downgrade());
+        trusted_worktrees.update(&mut cx, |trusted_worktrees, cx| {
+            let restricted_paths = envelope
+                .payload
+                .worktree_ids
+                .into_iter()
+                .map(WorktreeId::from_proto)
+                .map(PathTrust::Worktree)
+                .collect::<HashSet<_>>();
+            trusted_worktrees.restrict(worktree_store, restricted_paths, cx);
+        });
+        Ok(proto::Ack {})
+    }
+
+    pub async fn handle_download_file_by_path(
+        this: Entity<Self>,
+        message: TypedEnvelope<proto::DownloadFileByPath>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::DownloadFileResponse> {
+        log::debug!(
+            "handle_download_file_by_path: received request: {:?}",
+            message.payload
+        );
+
+        let worktree_id = WorktreeId::from_proto(message.payload.worktree_id);
+        let path = RelPath::from_unix_str(&message.payload.path)?;
+        let project_id = message.payload.project_id;
+        let file_id = message.payload.file_id;
+        log::debug!(
+            "handle_download_file_by_path: worktree_id={:?}, path={:?}, file_id={}",
+            worktree_id,
+            path,
+            file_id
+        );
+        use proto::create_file_for_peer::Variant;
+
+        let (worktree_store, session): (Entity<WorktreeStore>, AnyProtoClient) = this
+            .read_with(&cx, |this, _| {
+                (this.worktree_store.clone(), this.session.clone())
+            });
+
+        let worktree = worktree_store
+            .read_with(&cx, |store, cx| store.worktree_for_id(worktree_id, cx))
+            .context("worktree not found")?;
+
+        let download_task = worktree.update(&mut cx, |worktree: &mut Worktree, cx| {
+            worktree.load_binary_file(path.as_ref(), cx)
+        });
+
+        let downloaded_file = download_task.await?;
+        let content = downloaded_file.content;
+        let file = downloaded_file.file;
+        log::debug!(
+            "handle_download_file_by_path: file loaded, content_size={}",
+            content.len()
+        );
+
+        let proto_file = worktree.read_with(&cx, |_worktree: &Worktree, cx| file.to_proto(cx));
+        log::debug!(
+            "handle_download_file_by_path: using client-provided file_id={}",
+            file_id
+        );
+
+        let state = proto::FileState {
+            id: file_id,
+            file: Some(proto_file),
+            content_size: content.len() as u64,
+        };
+
+        log::debug!("handle_download_file_by_path: sending State message");
+        session.send(proto::CreateFileForPeer {
+            project_id,
+            peer_id: Some(REMOTE_SERVER_PEER_ID),
+            variant: Some(Variant::State(state)),
+        })?;
+
+        const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+        let num_chunks = content.len().div_ceil(CHUNK_SIZE);
+        log::debug!(
+            "handle_download_file_by_path: sending {} chunks",
+            num_chunks
+        );
+        for (i, chunk) in content.chunks(CHUNK_SIZE).enumerate() {
+            log::trace!(
+                "handle_download_file_by_path: sending chunk {}/{}, size={}",
+                i + 1,
+                num_chunks,
+                chunk.len()
+            );
+            session.send(proto::CreateFileForPeer {
+                project_id,
+                peer_id: Some(REMOTE_SERVER_PEER_ID),
+                variant: Some(Variant::Chunk(proto::FileChunk {
+                    file_id,
+                    data: chunk.to_vec(),
+                })),
+            })?;
+        }
+
+        log::debug!(
+            "handle_download_file_by_path: returning file_id={}",
+            file_id
+        );
+        Ok(proto::DownloadFileResponse { file_id })
+    }
+
     pub async fn handle_open_new_buffer(
         this: Entity<Self>,
         _message: TypedEnvelope<proto::OpenNewBuffer>,
@@ -601,19 +948,19 @@ impl HeadlessProject {
     ) -> Result<proto::OpenBufferResponse> {
         let (buffer_store, buffer) = this.update(&mut cx, |this, cx| {
             let buffer_store = this.buffer_store.clone();
-            let buffer = this
-                .buffer_store
-                .update(cx, |buffer_store, cx| buffer_store.create_buffer(true, cx));
-            anyhow::Ok((buffer_store, buffer))
-        })??;
+            let buffer = this.buffer_store.update(cx, |buffer_store, cx| {
+                buffer_store.create_buffer(None, true, cx)
+            });
+            (buffer_store, buffer)
+        });
 
         let buffer = buffer.await?;
-        let buffer_id = buffer.read_with(&cx, |b, _| b.remote_id())?;
+        let buffer_id = buffer.read_with(&cx, |b, _| b.remote_id());
         buffer_store.update(&mut cx, |buffer_store, cx| {
             buffer_store
                 .create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
                 .detach_and_log_err(cx);
-        })?;
+        });
 
         Ok(proto::OpenBufferResponse {
             buffer_id: buffer_id.to_proto(),
@@ -621,28 +968,41 @@ impl HeadlessProject {
     }
 
     async fn handle_toggle_lsp_logs(
-        _: Entity<Self>,
+        this: Entity<Self>,
         envelope: TypedEnvelope<proto::ToggleLspLogs>,
-        mut cx: AsyncApp,
+        cx: AsyncApp,
     ) -> Result<()> {
+        let peer_id = envelope.original_sender_id.unwrap_or(envelope.sender_id);
         let server_id = LanguageServerId::from_proto(envelope.payload.server_id);
-        let lsp_logs = cx
-            .update(|cx| {
-                cx.try_global::<GlobalLogStore>()
-                    .map(|lsp_logs| lsp_logs.0.clone())
-            })?
-            .context("lsp logs store is missing")?;
-
-        lsp_logs.update(&mut cx, |lsp_logs, _| {
-            // RPC logs are very noisy and we need to toggle it on the headless server too.
-            // The rest of the logs for the ssh project are very important to have toggled always,
-            // to e.g. send language server error logs to the client before anything is toggled.
-            if envelope.payload.enabled {
-                lsp_logs.enable_rpc_trace_for_language_server(server_id);
-            } else {
-                lsp_logs.disable_rpc_trace_for_language_server(server_id);
-            }
+        let lsp_store = this.read_with(&cx, |this, _| this.lsp_store.downgrade());
+        cx.update(|cx| {
+            let log_store = cx
+                .try_global::<GlobalLogStore>()
+                .map(|global_log_store| global_log_store.0.clone())
+                .context("lsp logs store is missing")?;
+            let toggled_log_kind =
+                match proto::toggle_lsp_logs::LogType::try_from(envelope.payload.log_type)
+                    .ok()
+                    .context("invalid log type")?
+                {
+                    proto::toggle_lsp_logs::LogType::Log => LogKind::Logs,
+                    proto::toggle_lsp_logs::LogType::Trace => LogKind::Trace,
+                    proto::toggle_lsp_logs::LogType::Rpc => LogKind::Rpc,
+                };
+            let server_key =
+                LanguageServerLogKey::new(LanguageServerKind::LocalSsh { lsp_store }, server_id);
+            log_store.update(cx, |log_store, cx| {
+                log_store.set_downstream_log_stream(
+                    &server_key,
+                    peer_id,
+                    toggled_log_kind,
+                    envelope.payload.enabled,
+                    cx,
+                );
+            });
+            anyhow::Ok(())
         })?;
+
         Ok(())
     }
 
@@ -657,7 +1017,7 @@ impl HeadlessProject {
                 this.worktree_store.update(cx, |worktree_store, cx| {
                     worktree_store.find_or_create_worktree(settings_path, false, cx)
                 })
-            })?
+            })
             .await?;
 
         let (buffer, buffer_store) = this.update(&mut cx, |this, cx| {
@@ -665,14 +1025,14 @@ impl HeadlessProject {
                 buffer_store.open_buffer(
                     ProjectPath {
                         worktree_id: worktree.read(cx).id(),
-                        path: path,
+                        path,
                     },
                     cx,
                 )
             });
 
             (buffer, this.buffer_store.clone())
-        })?;
+        });
 
         let buffer = buffer.await?;
 
@@ -692,52 +1052,242 @@ impl HeadlessProject {
             });
 
             buffer_id
-        })?;
+        });
 
         Ok(proto::OpenBufferResponse {
             buffer_id: buffer_id.to_proto(),
         })
     }
 
+    async fn handle_spawn_kernel(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SpawnKernel>,
+        cx: AsyncApp,
+    ) -> Result<proto::SpawnKernelResponse> {
+        let fs = this.update(&mut cx.clone(), |this, _| this.fs.clone());
+
+        let mut ports = Vec::new();
+        for _ in 0..5 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            ports.push(port);
+        }
+
+        let connection_info = serde_json::json!({
+            "shell_port": ports[0],
+            "iopub_port": ports[1],
+            "stdin_port": ports[2],
+            "control_port": ports[3],
+            "hb_port": ports[4],
+            "ip": "127.0.0.1",
+            "key": uuid::Uuid::new_v4().to_string(),
+            "transport": "tcp",
+            "signature_scheme": "hmac-sha256",
+            "kernel_name": envelope.payload.kernel_name,
+        });
+
+        let connection_file_content = serde_json::to_string_pretty(&connection_info)?;
+        let kernel_id = uuid::Uuid::new_v4().to_string();
+
+        let connection_file_path = std::env::temp_dir().join(format!("kernel-{}.json", kernel_id));
+        fs.save(
+            &connection_file_path,
+            &connection_file_content.as_str().into(),
+            language::LineEnding::Unix,
+        )
+        .await?;
+
+        let working_directory = if envelope.payload.working_directory.is_empty() {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            Some(envelope.payload.working_directory)
+        };
+
+        // Spawn kernel (Assuming python for now, or we'd need to parse kernelspec logic here or pass the command)
+
+        // Spawn kernel
+        let spawn_kernel = |binary: &str, args: &[String]| {
+            let mut command = smol::process::Command::new(binary);
+
+            if !args.is_empty() {
+                for arg in args {
+                    if arg == "{connection_file}" {
+                        command.arg(&connection_file_path);
+                    } else {
+                        command.arg(arg);
+                    }
+                }
+            } else {
+                command
+                    .arg("-m")
+                    .arg("ipykernel_launcher")
+                    .arg("-f")
+                    .arg(&connection_file_path);
+            }
+
+            // This ensures subprocesses spawned from the kernel use the correct Python environment
+            let python_bin_dir = std::path::Path::new(binary).parent();
+            if let Some(bin_dir) = python_bin_dir {
+                if let Some(path_var) = std::env::var_os("PATH") {
+                    let mut paths = std::env::split_paths(&path_var).collect::<Vec<_>>();
+                    paths.insert(0, bin_dir.to_path_buf());
+                    if let Ok(new_path) = std::env::join_paths(paths) {
+                        command.env("PATH", new_path);
+                    }
+                }
+
+                if let Some(venv_root) = bin_dir.parent() {
+                    command.env("VIRTUAL_ENV", venv_root.to_string_lossy().to_string());
+                }
+            }
+
+            if let Some(wd) = &working_directory {
+                command.current_dir(wd);
+            }
+            command.spawn()
+        };
+
+        // We need to manage the child process lifecycle
+        let child = if !envelope.payload.command.is_empty() {
+            spawn_kernel(&envelope.payload.command, &envelope.payload.args).context(format!(
+                "failed to spawn kernel process (command: {})",
+                envelope.payload.command
+            ))?
+        } else if let Some(venv_python) = working_directory
+            .as_ref()
+            .and_then(|wd| find_venv_python(wd))
+        {
+            let path_str = venv_python.to_string_lossy().to_string();
+            spawn_kernel(&path_str, &[]).context(format!(
+                "failed to spawn kernel process (venv: {})",
+                path_str
+            ))?
+        } else {
+            spawn_kernel("python3", &[])
+                .or_else(|_| spawn_kernel("python", &[]))
+                .context("failed to spawn kernel process (tried python3 and python)")?
+        };
+
+        this.update(&mut cx.clone(), |this, _cx| {
+            this.kernels.insert(kernel_id.clone(), child);
+        });
+
+        Ok(proto::SpawnKernelResponse {
+            kernel_id,
+            connection_file: connection_file_content,
+        })
+    }
+
+    async fn handle_kill_kernel(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::KillKernel>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let kernel_id = envelope.payload.kernel_id;
+        let child = this.update(&mut cx, |this, _| this.kernels.remove(&kernel_id));
+        if let Some(mut child) = child {
+            child.kill().log_err();
+        }
+        Ok(proto::Ack {})
+    }
+
     async fn handle_find_search_candidates(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::FindSearchCandidates>,
         mut cx: AsyncApp,
-    ) -> Result<proto::FindSearchCandidatesResponse> {
+    ) -> Result<proto::Ack> {
+        let peer_id = envelope.original_sender_id.unwrap_or(envelope.sender_id);
         let message = envelope.payload;
         let query = SearchQuery::from_proto(
             message.query.context("missing query field")?,
             PathStyle::local(),
         )?;
-        let results = this.update(&mut cx, |this, cx| {
-            project::Search::local(
-                this.fs.clone(),
-                this.buffer_store.clone(),
-                this.worktree_store.clone(),
-                message.limit as _,
-                cx,
-            )
-            .into_handle(query, cx)
-            .matching_buffers(cx)
-        })?;
 
-        let mut response = proto::FindSearchCandidatesResponse {
-            buffer_ids: Vec::new(),
-        };
+        let project_id = message.project_id;
+        let buffer_store = this.read_with(&cx, |this, _| this.buffer_store.clone());
+        let handle = message.handle;
+        let client = this.read_with(&cx, |project, _| project.session.clone());
+        let search_buffer_batches =
+            this.read_with(&cx, |project, _| project.search_buffer_batches.clone());
+        let task = cx.spawn(async move |cx| {
+            let results = this.update(cx, |this, cx| {
+                project::Search::local(
+                    this.fs.clone(),
+                    this.buffer_store.clone(),
+                    this.worktree_store.clone(),
+                    message.limit as _,
+                    cx,
+                )
+                .into_handle(query, cx)
+                .matching_buffers(cx)
+            });
+            let mut batches = std::pin::pin!(
+                results
+                    .rx
+                    .map(|(buffer, _)| buffer)
+                    .ready_chunks(MAX_SEARCH_CANDIDATES_PER_BATCH)
+            );
+            while let Some(buffers) = batches.next().await {
+                let (completion, completed) = oneshot::channel();
+                search_buffer_batches
+                    .send(SearchBufferBatch {
+                        buffers,
+                        handle,
+                        peer_id,
+                        project_id,
+                        completion,
+                    })
+                    .await?;
+                completed.await??;
+            }
 
-        let buffer_store = this.read_with(&cx, |this, _| this.buffer_store.clone())?;
-
-        while let Ok(buffer) = results.recv().await {
-            let buffer_id = buffer.read_with(&cx, |this, _| this.remote_id())?;
-            response.buffer_ids.push(buffer_id.to_proto());
-            buffer_store
-                .update(&mut cx, |buffer_store, cx| {
-                    buffer_store.create_buffer_for_peer(&buffer, REMOTE_SERVER_PEER_ID, cx)
-                })?
+            client
+                .request(proto::FindSearchCandidatesChunk {
+                    handle,
+                    peer_id: Some(peer_id),
+                    project_id,
+                    variant: Some(proto::find_search_candidates_chunk::Variant::Done(
+                        proto::FindSearchCandidatesDone {},
+                    )),
+                })
                 .await?;
-        }
+            anyhow::Ok(())
+        });
+        buffer_store.update(&mut cx, |store, _| {
+            store.register_ongoing_project_search((peer_id, handle), task);
+        });
 
-        Ok(response)
+        Ok(proto::Ack {})
+    }
+
+    async fn send_search_candidates(
+        client: &AnyProtoClient,
+        batch: &SearchBufferBatch,
+        buffer_ids: Vec<u64>,
+    ) -> Result<()> {
+        client
+            .request(proto::FindSearchCandidatesChunk {
+                handle: batch.handle,
+                peer_id: Some(batch.peer_id),
+                project_id: batch.project_id,
+                variant: Some(proto::find_search_candidates_chunk::Variant::Matches(
+                    proto::FindSearchCandidatesMatches { buffer_ids },
+                )),
+            })
+            .await?;
+        Ok(())
+    }
+
+    // Goes from client to host.
+    async fn handle_find_search_candidates_cancel(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::FindSearchCandidatesCancelled>,
+        mut cx: AsyncApp,
+    ) -> Result<()> {
+        let buffer_store = this.read_with(&mut cx, |this, _| this.buffer_store.clone());
+        BufferStore::handle_find_search_candidates_cancel(buffer_store, envelope, cx).await
     }
 
     async fn handle_list_remote_directory(
@@ -745,7 +1295,7 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::ListRemoteDirectory>,
         cx: AsyncApp,
     ) -> Result<proto::ListRemoteDirectoryResponse> {
-        let fs = cx.read_entity(&this, |this, _| this.fs.clone())?;
+        let fs = cx.read_entity(&this, |this, _| this.fs.clone());
         let expanded = PathBuf::from(shellexpand::tilde(&envelope.payload.path).to_string());
         let check_info = envelope
             .payload
@@ -777,16 +1327,25 @@ impl HeadlessProject {
         envelope: TypedEnvelope<proto::GetPathMetadata>,
         cx: AsyncApp,
     ) -> Result<proto::GetPathMetadataResponse> {
-        let fs = cx.read_entity(&this, |this, _| this.fs.clone())?;
+        let fs = cx.read_entity(&this, |this, _| this.fs.clone());
         let expanded = PathBuf::from(shellexpand::tilde(&envelope.payload.path).to_string());
 
         let metadata = fs.metadata(&expanded).await?;
         let is_dir = metadata.map(|metadata| metadata.is_dir).unwrap_or(false);
+        let path = if envelope.payload.canonicalize && metadata.is_some() {
+            fs.canonicalize(&expanded)
+                .await?
+                .to_str()
+                .context("canonical file path is not valid UTF-8")?
+                .to_owned()
+        } else {
+            expanded.to_string_lossy().into_owned()
+        };
 
         Ok(proto::GetPathMetadataResponse {
             exists: metadata.is_some(),
             is_dir,
-            path: expanded.to_string_lossy().into_owned(),
+            path,
         })
     }
 
@@ -852,6 +1411,54 @@ impl HeadlessProject {
         Ok(proto::GetProcessesResponse { processes })
     }
 
+    async fn handle_get_remote_profiling_data(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetRemoteProfilingData>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetRemoteProfilingDataResponse> {
+        let foreground_only = envelope.payload.foreground_only;
+
+        let (deltas, now_nanos) = cx.update(|cx| {
+            let timings = if foreground_only {
+                vec![gpui::profiler::get_current_thread_timings(
+                    TasksIncluded::OnlyCompleted,
+                )]
+            } else {
+                gpui::profiler::get_all_timings(TasksIncluded::OnlyCompleted)
+            };
+            this.update(cx, |this, _cx| {
+                let deltas = this.profiling_collector.collect_unseen(timings);
+                let now_nanos = Instant::now()
+                    .duration_since(this.profiling_collector.startup_time())
+                    .as_nanos() as u64;
+                (deltas, now_nanos)
+            })
+        });
+
+        let threads = deltas
+            .into_iter()
+            .map(|delta| proto::RemoteProfilingThread {
+                thread_name: delta.thread_name,
+                thread_id: delta.thread_id,
+                timings: delta
+                    .new_timings
+                    .into_iter()
+                    .map(|t| proto::RemoteProfilingTiming {
+                        location: Some(proto::RemoteProfilingLocation {
+                            file: t.location.file.to_string(),
+                            line: t.location.line,
+                            column: t.location.column,
+                        }),
+                        start_nanos: t.start as u64,
+                        duration_nanos: t.duration as u64,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(proto::GetRemoteProfilingDataResponse { threads, now_nanos })
+    }
+
     async fn handle_get_directory_environment(
         this: Entity<Self>,
         envelope: TypedEnvelope<proto::GetDirectoryEnvironment>,
@@ -864,12 +1471,32 @@ impl HeadlessProject {
                 this.environment.update(cx, |environment, cx| {
                     environment.local_directory_environment(&shell, directory.into(), cx)
                 })
-            })?
+            })
             .await
             .context("failed to get directory environment")?
             .into_iter()
             .collect();
         Ok(proto::DirectoryEnvironment { environment })
+    }
+
+    async fn handle_get_terminal_shell(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GetTerminalShell>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetTerminalShellResponse> {
+        let worktree_id = envelope.payload.worktree_id.map(WorktreeId::from_proto);
+        let shell = cx.update(|cx| {
+            let settings_location = worktree_id.map(|worktree_id| SettingsLocation {
+                worktree_id,
+                path: RelPath::empty(),
+            });
+            TerminalSettings::get(settings_location, cx).shell.clone()
+        });
+        log::debug!("handle_get_terminal_shell: resolved remote terminal shell setting: {shell:?}");
+
+        Ok(proto::GetTerminalShellResponse {
+            shell: Some(task::shell_to_proto(shell)),
+        })
     }
 }
 
@@ -887,4 +1514,24 @@ fn prompt_to_proto(
             proto::language_server_prompt_request::Critical {},
         ),
     }
+}
+
+fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {
+    let wd = std::path::Path::new(working_directory);
+    for dir_name in &[".venv", "venv", ".env", "env"] {
+        let venv_dir = wd.join(dir_name);
+        let has_pyvenv_cfg = venv_dir.join("pyvenv.cfg").is_file();
+        let has_activate = venv_dir.join("bin").join("activate").is_file();
+        if has_pyvenv_cfg || has_activate {
+            let python = venv_dir.join("bin").join("python");
+            if python.is_file() {
+                return Some(python);
+            }
+            let python3 = venv_dir.join("bin").join("python3");
+            if python3.is_file() {
+                return Some(python3);
+            }
+        }
+    }
+    None
 }
